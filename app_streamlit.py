@@ -307,17 +307,54 @@ with tab2:
             uni = st.session_state["uni"]
             syms = uni["symbol"].dropna().astype(str).unique().tolist()
             with st.status("Descargando guardrails/fundamentales (cacheados)…", expanded=False) as status:
-                df_guard = _cached_download_guardrails(tuple(sorted(syms)), cache_tag)
+                from fundamentals import download_guardrails_batch, apply_quality_guardrails
+
+                df_guard = download_guardrails_batch(syms)  # DataFrame con columnas como profit_hits, net_issuance_1y, etc.
+
+                # Métricas VFQ (toma de la UI si existen; si no, defaults robustos)
+                value_metrics   = st.session_state.get("value_metrics",   ["inv_ev_ebitda", "fcf_yield"])
+                quality_metrics = st.session_state.get("quality_metrics", ["gross_profitability", "roic"])
+
+                # Cobertura VFQ = cuántas métricas (Value+Quality) tiene cada símbolo
+                coverage_cols = [c for c in (list(value_metrics) + list(quality_metrics)) if c in df_guard.columns]
+                df_guard["coverage_count"] = df_guard[coverage_cols].notna().sum(axis=1).astype(int) if coverage_cols else 0
+
+                # Lee sliders (o usa defaults si no están en el estado)
+                profit_hits   = int(st.session_state.get("profit_hits",   1))     # pisos EBIT/CFO/FCF
+                max_issuance  = float(st.session_state.get("max_issuance", 0.15)) # emisión neta máx. (solo positivos fallan)
+                max_assets    = float(st.session_state.get("max_assets",   0.35)) # crecimiento activos y/y máx.
+                max_accr      = float(st.session_state.get("max_accr",     0.10)) # |accruals/TA| máx. (se evalúa abs)
+                max_ndeb      = float(st.session_state.get("max_ndeb",     4.0))  # NetDebt/EBITDA máx. (negativos clip a 0)
+                min_cov       = int(st.session_state.get("min_cov",        0))    # cobertura VFQ mínima (# métricas)
+
+                # Aplica guardrails (versión robusta)
                 kept, diag = apply_quality_guardrails(
-                    df_guard,
-                    require_profit_floor=(profit_hits > 0),
-                    profit_floor_min_hits=profit_hits,
-                    max_net_issuance=max_issuance,
-                    max_asset_growth=max_assets,
-                    max_accruals_ta=max_accr,
-                    max_netdebt_ebitda=max_ndeb,
-                    min_vfq_coverage = min_cov,
+                    df_guard=df_guard,
+                    require_profit_floor=bool(profit_hits > 0),
+                    profit_floor_min_hits=int(profit_hits),
+                    max_net_issuance=float(max_issuance),
+                    max_asset_growth=float(max_assets),
+                    max_accruals_ta=float(max_accr),
+                    max_netdebt_ebitda=float(max_ndeb),
+                    min_vfq_coverage=int(min_cov),
                 )
+
+                status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
+# ↑↑↑ fin del bloque dentro del with st.status(...) ↑↑↑
+                coverage_cols = [c for c in (list(value_metrics) + list(quality_metrics)) if c in df_guard.columns]
+                df_guard["coverage_count"] = df_guard[coverage_cols].notna().sum(axis=1).astype(int) if coverage_cols else 0
+
+                kept, diag = apply_quality_guardrails(
+                    df_guard=df_guard,
+                    require_profit_floor=bool(profit_hits > 0),
+                    profit_floor_min_hits=int(profit_hits),
+                    max_net_issuance=float(max_issuance),
+                    max_asset_growth=float(max_assets),
+                    max_accruals_ta=float(max_accr),
+                    max_netdebt_ebitda=float(max_ndeb),
+                    min_vfq_coverage=int(min_cov),
+                )
+
                 status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
             st.session_state["kept"] = kept
             st.session_state["guard_diag"] = diag

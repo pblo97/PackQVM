@@ -1053,6 +1053,14 @@ def apply_quality_guardrails(
     # Si no cumple cobertura, no "falla guardrail": se excluye por cobertura, y punto.
     cov_ok = (s_cov.fillna(0) >= int(min_vfq_coverage)) if min_vfq_coverage else pd.Series(True, index=df.index)
 
+    if int(min_vfq_coverage) > 0:
+        if col_cov is not None:
+            cov_ok = (s_cov.fillna(0) >= int(min_vfq_coverage))
+        else:
+            cov_ok = pd.Series(True, index=df.index)   # sin coverage_count no filtra
+    else:
+        cov_ok = pd.Series(True, index=df.index)
+
     # --- reglas robustas ---
     # profit floor: SOLO aplica si hay dato (no NaN)
     if require_profit_floor and col_profit:
