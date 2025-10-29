@@ -942,3 +942,160 @@ def compute_qvm_scores(*args, **kwargs):
 
 def apply_megacap_rules(*args, **kwargs):
     return _fg_apply_megacap_rules(*args, **kwargs)
+# ----------------------------- Added wrappers for app compatibility -----------------------------
+def build_vfq_scores_dynamic(
+    df: pd.DataFrame,
+    value_metrics=("inv_ev_ebitda","fcf_yield"),
+    quality_metrics=("gross_profitability","roic"),
+    w_value: float = 0.5,
+    w_quality: float = 0.5,
+    method_intra: str = "z",
+    winsor_p: float = 0.01,
+    size_buckets: int = 3,
+    group_mode: str = "sector",
+) -> pd.DataFrame:
+    """
+    Calcula un puntaje VFQ simple (Value+Quality) a partir de métricas seleccionadas y
+    devuelve percentiles por sector para filtrado en la UI.
+
+    - df: DataFrame con al menos ['symbol', 'sector', 'industry'] y columnas métricas
+    - value_metrics / quality_metrics: listas de nombres de columnas a usar
+    - method_intra: 'z' (zscore) o 'pct' (rank percentil)
+    - winsor_p: winsorización de colas por métrica
+    - group_mode: actualmente usado solo para el reporte; VFQ_pct_sector usa 'sector'
+
+    Retorna columnas: ['symbol','sector','industry','VFQ','VFQ_pct_sector','coverage_count'(si existe)]
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["symbol","sector","industry","VFQ","VFQ_pct_sector"])
+
+    work = df.copy()
+    work["sector"] = work.get("sector", "Unknown").astype(str)
+    work["industry"] = work.get("industry", None)
+
+    def _prep(col):
+        s = pd.to_numeric(work.get(col, pd.Series(index=work.index, dtype=float)), errors="coerce")
+        s = _winsorize(s, p=winsor_p)
+        if method_intra.lower().startswith("z"):
+            return _zscore(s)
+        else:
+            return _rank_pct(s)
+
+    # Value score
+    v_cols = [c for c in value_metrics if c in work.columns]
+    if v_cols:
+        v_mat = pd.concat([_prep(c) for c in v_cols], axis=1)
+        v_score = v_mat.mean(axis=1, skipna=True)
+    else:
+        v_score = pd.Series(0.0, index=work.index)
+
+    # Quality score
+    q_cols = [c for c in quality_metrics if c in work.columns]
+    if q_cols:
+        q_mat = pd.concat([_prep(c) for c in q_cols], axis=1)
+        q_score = q_mat.mean(axis=1, skipna=True)
+    else:
+        q_score = pd.Series(0.0, index=work.index)
+
+    v_weight = float(w_value) if pd.notna(w_value) else 0.5
+    q_weight = float(w_quality) if pd.notna(w_quality) else 0.5
+    total_w = v_weight + q_weight if (v_weight + q_weight) != 0 else 1.0
+
+    v_weight /= total_w
+    q_weight /= total_w
+
+    VFQ = v_weight * v_score + q_weight * q_score
+    # Percentil por sector (si no hay sector, cae a global)
+    if "sector" in work.columns:
+        VFQ_pct_sector = VFQ.groupby(work["sector"]).rank(pct=True, method="average")
+    else:
+        VFQ_pct_sector = VFQ.rank(pct=True, method="average")
+
+    out_cols = ["symbol","sector","industry"]
+    out = work[out_cols].copy()
+    out["VFQ"] = VFQ
+    out["VFQ_pct_sector"] = VFQ_pct_sector
+
+    if "coverage_count" in work.columns:
+        out["coverage_count"] = pd.to_numeric(work["coverage_count"], errors="coerce")
+
+    return out
+
+
+def apply_quality_guardrails(
+    df_guard: pd.DataFrame,
+    require_profit_floor: bool = True,
+    profit_floor_min_hits: int = 2,
+    max_net_issuance: float = 0.15,
+    max_asset_growth: float = 0.35,
+    max_accruals_ta: float = 0.10,
+    max_netdebt_ebitda: float = 4.0,
+):
+    """
+    Aplica guardrails "duros" sobre un DataFrame de fundamentales precomputados.
+    Acepta nombres de columna variantes y asume 'symbol' como clave.
+    Retorna: (kept_symbols_list, diag_df_con_motivos)
+    """
+    if df_guard is None or df_guard.empty:
+        return [], pd.DataFrame(columns=["symbol","reason"])
+
+    df = df_guard.copy()
+    df["symbol"] = df["symbol"].astype(str)
+
+    # Resolver nombres de columnas con alias comunes
+    col_profit = next((c for c in ["profit_hits","profits_hits","profit_floor_hits"] if c in df.columns), None)
+    col_issu  = next((c for c in ["net_issuance_1y","net_issuance","netIssuance"] if c in df.columns), None)
+    col_asset = next((c for c in ["asset_growth_1y","asset_growth","assetGrowth"] if c in df.columns), None)
+    col_accr  = next((c for c in ["accruals_ta","acc_pct","accrualsTA"] if c in df.columns), None)
+    col_ndebt = next((c for c in ["ndebt_ebitda","netDebt_EBITDA","net_debt_ebitda"] if c in df.columns), None)
+
+    reasons = {s: [] for s in df["symbol"]}
+
+    def _gt(val, th):
+        try:
+            return float(val) > float(th)
+        except Exception:
+            return False
+
+    def _lt(val, th):
+        try:
+            return float(val) < float(th)
+        except Exception:
+            return False
+
+    # Reglas
+    if require_profit_floor and col_profit:
+        bad = df[pd.to_numeric(df[col_profit], errors="coerce").fillna(0) < int(profit_floor_min_hits)]
+        for s in bad["symbol"]:
+            reasons[s].append(f"profit_hits<{profit_floor_min_hits}")
+
+    if col_issu:
+        bad = df[pd.to_numeric(df[col_issu], errors="coerce").fillna(0) > float(max_net_issuance)]
+        for s in bad["symbol"]:
+            reasons[s].append(f"net_issuance>{max_net_issuance}")
+
+    if col_asset:
+        bad = df[pd.to_numeric(df[col_asset], errors="coerce").fillna(0) > float(max_asset_growth)]
+        for s in bad["symbol"]:
+            reasons[s].append(f"asset_growth>{max_asset_growth}")
+
+    if col_accr:
+        bad = df[pd.to_numeric(df[col_accr], errors="coerce").fillna(0) > float(max_accruals_ta)]
+        for s in bad["symbol"]:
+            reasons[s].append(f"accruals>{max_accruals_ta}")
+
+    if col_ndebt:
+        bad = df[pd.to_numeric(df[col_ndebt], errors="coerce").fillna(0) > float(max_netdebt_ebitda)]
+        for s in bad["symbol"]:
+            reasons[s].append(f"ndebt_ebitda>{max_netdebt_ebitda}")
+
+    # Construir kept y diag
+    kept = [s for s, rs in reasons.items() if len(rs) == 0]
+    rows = []
+    for s, rs in reasons.items():
+        if rs:
+            rows.append({"symbol": s, "reason": ";".join(sorted(set(rs)))})
+
+    diag = pd.DataFrame(rows).sort_values(["reason","symbol"], ascending=True) if rows else pd.DataFrame(columns=["symbol","reason"])
+    return kept, diag
+# -----------------------------------------------------------------------------------------------
