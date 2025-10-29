@@ -1000,128 +1000,122 @@ def _num_or_nan(d: pd.DataFrame, col: str) -> pd.Series:
         return pd.Series(np.nan, index=d.index)
     return pd.to_numeric(d[col], errors="coerce")
 
+# fundamentals.py
+
+
 def apply_quality_guardrails(
-    df: pd.DataFrame,
+    df_guard: pd.DataFrame,
     require_profit_floor: bool = True,
-    profit_floor_min_hits: int = 1,
-    max_net_issuance: float = 0.08,
+    profit_floor_min_hits: int = 2,
+    max_net_issuance: float = 0.15,
     max_asset_growth: float = 0.35,
-    max_accruals_ta: float = 0.15,
+    max_accruals_ta: float = 0.10,
     max_netdebt_ebitda: float = 4.0,
-    *,
-    # Anti-basura / liquidez (puedes sobreescribir desde la UI)
-    min_price: float = 5.0,
-    min_dollar_vol: float = 2_000_000.0,
-    min_mcap: float = 500_000_000.0,
-    drop_pre_rev_biotech: bool = True,
-    ps_limit_for_loss: float = 40.0,
-    min_rev_for_non_fin: float = 50_000_000.0
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    d = df.copy()
+    min_vfq_coverage: int = 0,   # <<< enlázalo al slider "Cobertura VFQ mínima"
+):
+    """
+    Devuelve: (kept_symbols_list, diag_df)
+      - kept_symbols_list: símbolos que pasan TODOS los guardrails activos
+      - diag_df: por símbolo, motivo textual y flags por guardia (True = pasa)
+    Reglas robustas:
+      * NaN == 'sin dato' -> NO falla (se deja pasar la regla) salvo cobertura VFQ
+      * net_issuance: solo falla si es POSITIVO y > umbral (buybacks negativos pasan)
+      * accruals_ta: se compara por ABS(valor) > umbral
+      * ndebt/ebitda: negativos (caja neta) se clippean a 0 antes de comparar
+    """
+    if df_guard is None or df_guard.empty:
+        return [], pd.DataFrame(columns=["symbol","guard_reason",
+                                         "guard_profit","guard_issuance","guard_assets","guard_accruals","guard_liquidity","guard_anti_junk"])
 
-    # ====== lecturas numéricas robustas ======
-    px   = _first_num(d, ["price", "Price", "lastPrice"])
-    dv   = _first_num(d, ["avgDollarVol_3m", "dollarVol_3m", "avgDollarVolume3m"])
-    mcap = _first_num(d, ["marketCap_unified", "marketCap", "MarketCap", "marketCap_profile"])
+    df = df_guard.copy()
+    df["symbol"] = df["symbol"].astype(str)
 
-    # Cada chequeo “pasa” si el valor está por encima del umbral **o** si es NaN.
-    price_ok = (px >= float(min_price)) | px.isna()
-    mcap_ok  = (mcap >= float(min_mcap)) | mcap.isna()
-    dv_ok    = (dv >= float(min_dollar_vol)) | dv.isna()   # si dv no existe o es todo NaN, no bloquea
+    # --- aliases de columnas más comunes ---
+    col_profit = next((c for c in ["profit_hits","profits_hits","profit_floor_hits"] if c in df.columns), None)
+    col_issu  = next((c for c in ["net_issuance_1y","net_issuance","netIssuance"] if c in df.columns), None)
+    col_asset = next((c for c in ["asset_growth_1y","asset_growth","assetGrowth"] if c in df.columns), None)
+    col_accr  = next((c for c in ["accruals_ta","acc_pct","accrualsTA"] if c in df.columns), None)
+    col_ndebt = next((c for c in ["ndebt_ebitda","netDebt_EBITDA","net_debt_ebitda"] if c in df.columns), None)
+    col_cov   = "coverage_count" if "coverage_count" in df.columns else None
 
-    liq_pass = (price_ok & mcap_ok & dv_ok).fillna(True)
-    if not dv.isna().all():
-        liq_pass = liq_pass & (dv >= float(min_dollar_vol))
-    # Si dv está completamente vacío, NO bloqueamos por eso.
+    # Normaliza series numéricas (pero NaN no falla)
+    def num(col):
+        return pd.to_numeric(df[col], errors="coerce") if col and (col in df.columns) else pd.Series(np.nan, index=df.index)
 
-    # ====== ANTI-JUNK ======
-    sector   = d.get("sector",   pd.Series(index=d.index, dtype=object)).astype(str)
-    industry = d.get("industry", pd.Series(index=d.index, dtype=object)).astype(str)
-    rev      = _first_num(d, ["revenue_ttm", "revenueTTM", "totalRevenueTTM"]).fillna(0.0)
-    gp       = _first_num(d, ["gross_profit_ttm", "grossProfitTTM"])
-    sales    = _first_num(d, ["sales_ntm", "revenue_ntm", "salesNTM"])
-    nmar     = _first_num(d, ["netMargin", "net_margin", "netMarginTTM"])
+    s_profit = num(col_profit)
+    s_issu   = num(col_issu)
+    s_asset  = num(col_asset)
+    s_accr   = num(col_accr)
+    s_ndebt  = num(col_ndebt)
+    s_cov    = num(col_cov) if col_cov else pd.Series(np.nan, index=df.index)
 
-    biotech_flag = sector.str.contains("health", case=False, na=False) & \
-                   industry.str.contains("biotech|drug", case=False, na=False)
-    pre_rev = (rev < float(min_rev_for_non_fin)) | (gp.fillna(0.0) <= 0.0)
+    # --- cobertura VFQ mínima ---
+    # Si no cumple cobertura, no "falla guardrail": se excluye por cobertura, y punto.
+    cov_ok = (s_cov.fillna(0) >= int(min_vfq_coverage)) if min_vfq_coverage else pd.Series(True, index=df.index)
 
-    # PS ratio (mcap / ventas). Si no hay ventas -> NaN -> no bloquea por story, a menos que haya cifra.
-    ps = (mcap / sales.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-    story_flag = (ps >= float(ps_limit_for_loss)) & (nmar <= 0.0)
+    # --- reglas robustas ---
+    # profit floor: SOLO aplica si hay dato (no NaN)
+    if require_profit_floor and col_profit:
+        pass_profit = ~((s_profit.notna()) & (s_profit < int(profit_floor_min_hits)))
+    else:
+        pass_profit = pd.Series(True, index=df.index)
 
-    anti_junk_pass = ~((bool(drop_pre_rev_biotech) & biotech_flag & pre_rev) | story_flag)
-    anti_junk_pass = anti_junk_pass.fillna(True)
+    # net issuance: solo falla si POSITIVO y mayor a umbral
+    if col_issu:
+        pass_issu = ~((s_issu.notna()) & (s_issu > float(max_net_issuance)) & (s_issu > 0))
+    else:
+        pass_issu = pd.Series(True, index=df.index)
 
-    # ====== PISO DE UTILIDADES (1 de 3) ======
-    ebit = _first_num(d, ["ebit_ttm", "EBITTTM", "ebitTTM"])
-    cfo  = _first_num(d, ["cfo_ttm", "cashFromOperationsTTM", "operatingCashFlowTTM"])
-    fcf  = _first_num(d, ["fcf_ttm", "freeCashFlowTTM", "FCFTTM"])
-    hits = (ebit > 0).astype(int) + (cfo > 0).astype(int) + (fcf > 0).astype(int)
-    profit_pass = (hits >= int(profit_floor_min_hits)) if require_profit_floor else pd.Series(True, index=d.index, dtype=bool)
-    profit_pass = profit_pass.fillna(True)
+    # asset growth y/y: NaN pasa; negativos no fallan; solo falla si > umbral
+    if col_asset:
+        pass_asset = ~((s_asset.notna()) & (s_asset > float(max_asset_growth)))
+    else:
+        pass_asset = pd.Series(True, index=df.index)
 
-    # ====== EMISIÓN NETA ======
-    net_iss = _first_num(d, ["net_issuance", "netIssuance", "net_issuance_ttm",
-                             "share_issuance_pct_ttm", "shares_change_1y", "sharesChange1Y"])
-    issuance_pass = pd.Series(True, index=d.index, dtype=bool)
-    if not net_iss.isna().all():
-        # si viene en % (p.ej 7.5), asumir 0.075 si > 2
-        net_iss_scaled = net_iss.copy()
-        net_iss_scaled[net_iss_scaled.abs() > 2] = net_iss_scaled[net_iss_scaled.abs() > 2] / 100.0
-        issuance_pass = (net_iss_scaled <= float(max_net_issuance)) | net_iss_scaled.isna()
-    issuance_pass = issuance_pass.fillna(True)
+    # accruals/TA: compara por ABS(accruals)
+    if col_accr:
+        pass_accr = ~((s_accr.abs().notna()) & (s_accr.abs() > float(max_accruals_ta)))
+    else:
+        pass_accr = pd.Series(True, index=df.index)
 
-    # ====== CRECIMIENTO DE ACTIVOS ======
-    asset_g = _first_num(d, ["asset_growth_ttm", "assetGrowth", "assets_yoy", "assetsYoY"])
-    if asset_g.isna().all():
-        ta_now = _first_num(d, ["totalAssetsTTM", "total_assets_ttm", "TotalAssetsTTM"])
-        ta_1y  = _first_num(d, ["totalAssetsTTM_1y", "total_assets_ttm_1y", "TotalAssetsTTM_1Y"])
-        asset_g = (ta_now / ta_1y.replace(0, np.nan) - 1.0).replace([np.inf, -np.inf], np.nan)
-    # Corrige escala si parece porcentaje mal escalado
-    ag = asset_g.copy()
-    ag[ag.abs() > 2] = ag[ag.abs() > 2] / 100.0
-    asset_pass = (ag <= float(max_asset_growth)) | ag.isna()
-    asset_pass = asset_pass.fillna(True)
+    # net debt / EBITDA: negativos -> 0; NaN pasa; falla si > umbral
+    if col_ndebt:
+        s_ndebt_clip = s_ndebt.clip(lower=0)
+        pass_ndebt = ~((s_ndebt_clip.notna()) & (s_ndebt_clip > float(max_netdebt_ebitda)))
+    else:
+        pass_ndebt = pd.Series(True, index=df.index)
 
-    # ====== SLOAN ACCRUALS / TA ======
-    accr_ta = _first_num(d, ["accruals_ta", "sloan_accruals_ta", "accrualsTotAssets", "accruals_to_assets"])
-    ac = accr_ta.copy()
-    ac[ac.abs() > 2] = ac[ac.abs() > 2] / 100.0
-    accruals_pass = (ac.abs() <= float(max_accruals_ta)) | ac.isna()
-    accruals_pass = accruals_pass.fillna(True)
+    # Combina (guardrail pasa si TODAS pasan) y además cumple cobertura
+    guard_pass = pass_profit & pass_issu & pass_asset & pass_accr & pass_ndebt
+    final_pass = guard_pass & cov_ok
 
-    # ====== NET DEBT / EBITDA ======
-    nde = _first_num(d, ["netDebtToEBITDA", "net_debt_to_ebitda", "NetDebtToEBITDA"])
-    nde[nde < 0] = np.nan  # valores negativos → tratar como sin deuda neta
-    lev_pass = (nde <= float(max_netdebt_ebitda)) | nde.isna()
-    lev_pass = lev_pass.fillna(True)
-
-    # ====== máscara final ======
-    mask = liq_pass & anti_junk_pass & profit_pass & issuance_pass & asset_pass & accruals_pass & lev_pass
-
-    # ====== trazabilidad de motivos ======
+    # Motivo textual (solo por reglas que realmente fallan; cobertura se filtra aparte)
     reasons = []
-    reasons.append(np.where(liq_pass, "", "liq"))
-    reasons.append(np.where(anti_junk_pass, "", "junk"))
-    reasons.append(np.where(profit_pass, "", "profit"))
-    reasons.append(np.where(issuance_pass, "", "issue"))
-    reasons.append(np.where(asset_pass, "", "assets"))
-    reasons.append(np.where(accruals_pass, "", "accruals"))
-    reasons.append(np.where(lev_pass, "", "leverage"))
-    reasons = np.column_stack(reasons)
-    d["guard_reason"] = [";".join(r for r in row if r) or "" for row in reasons]
+    for i, sym in enumerate(df["symbol"]):
+        rs = []
+        if not pass_profit.iloc[i]: rs.append("profit")
+        if not pass_issu.iloc[i]:   rs.append("issuance")
+        if not pass_asset.iloc[i]:  rs.append("assets")
+        if not pass_accr.iloc[i]:   rs.append("accruals")
+        if not pass_ndebt.iloc[i]:  rs.append("liquidity")
+        reasons.append(";".join(rs))
 
-    d["guard_liquidity"] = liq_pass
-    d["guard_anti_junk"] = anti_junk_pass
-    d["guard_profit"]    = profit_pass
-    d["guard_issuance"]  = issuance_pass
-    d["guard_assets"]    = asset_pass
-    d["guard_accruals"]  = accruals_pass
-    d["guard_leverage"]  = lev_pass
-    d["guard_all"]       = mask
+    diag = pd.DataFrame({
+        "symbol": df["symbol"],
+        "guard_reason": reasons,
+        "guard_profit": pass_profit.astype(bool),
+        "guard_issuance": pass_issu.astype(bool),
+        "guard_assets": pass_asset.astype(bool),
+        "guard_accruals": pass_accr.astype(bool),
+        "guard_liquidity": pass_ndebt.astype(bool),
+        "guard_anti_junk": True,  # si tienes otra regla “anti_junk” cámbiala aquí
+        "cov_ok": cov_ok.astype(bool),
+    })
 
-    return d[mask].copy(), d
+    kept = df.loc[final_pass, "symbol"].tolist()
+    # Opcional: si quieres ver por qué alguien quedó fuera por cobertura, filtra con ~cov_ok
+
+    return kept, diag.sort_values(["guard_reason","symbol"], ascending=True)
 
 
 

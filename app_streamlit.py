@@ -315,7 +315,8 @@ with tab2:
                     max_net_issuance=max_issuance,
                     max_asset_growth=max_assets,
                     max_accruals_ta=max_accr,
-                    max_netdebt_ebitda=max_ndeb
+                    max_netdebt_ebitda=max_ndeb,
+                    min_vfq_coverage = min_cov,
                 )
                 status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
             st.session_state["kept"] = kept
