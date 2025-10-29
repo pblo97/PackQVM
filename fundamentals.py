@@ -1105,7 +1105,26 @@ def apply_quality_guardrails(
     })
 
     kept = diag.loc[diag["pass_all"], ["symbol"]].reset_index(drop=True)
-    return kept, diag.sort_values(["pass_all","profit_hits","coverage_count"], ascending=[False, False, False])
+    if df_guard is None or df_guard.empty or "symbol" not in df_guard.columns:
+        empty_kept = pd.DataFrame(columns=["symbol"])
+        empty_diag = pd.DataFrame({
+            "symbol": pd.Series(dtype=str),
+            "profit_hits": pd.Series(dtype="Int64"),
+            "coverage_count": pd.Series(dtype="Int64"),
+            "net_issuance": pd.Series(dtype=float),
+            "asset_growth": pd.Series(dtype=float),
+            "accruals_ta": pd.Series(dtype=float),
+            "netdebt_ebitda": pd.Series(dtype=float),
+            "pass_profit": pd.Series(dtype=bool),
+            "pass_issuance": pd.Series(dtype=bool),
+            "pass_assets": pd.Series(dtype=bool),
+            "pass_accruals": pd.Series(dtype=bool),
+            "pass_ndebt": pd.Series(dtype=bool),
+            "pass_coverage": pd.Series(dtype=bool),
+            "pass_all": pd.Series(dtype=bool),
+            "reason": pd.Series(dtype=str),
+        })
+    return empty_kept, empty_diag
 
 
 # ======================================================================

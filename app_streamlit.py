@@ -394,8 +394,22 @@ with tab2:
             "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"
         ] if c in diag_view.columns]
 
-        st.dataframe(diag_view[cols_show].sort_values(["pass_all","profit_hits","coverage_count"], ascending=[False, False, False]),
-                     use_container_width=True, hide_index=True)
+        # Claves de orden presentes
+        order_keys = [c for c in ["pass_all","profit_hits","coverage_count"] if c in diag_view.columns]
+        ascending_flags = []
+        for k in order_keys:
+            # Mantén el orden lógico: pass_all desc, hits desc, coverage desc
+            ascending_flags.append(False)
+
+        # Fallback si no hay claves de orden
+        if not order_keys:
+            st.dataframe(diag_view[cols_show], use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(
+                diag_view[cols_show].sort_values(order_keys, ascending=ascending_flags),
+                use_container_width=True, hide_index=True
+            )
+
 
         st.caption("Notas: 'profit_hits' cuenta {EBIT, CFO, FCF} > 0. Emisión neta solo penaliza si es positiva.")
 
