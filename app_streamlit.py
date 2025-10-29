@@ -30,25 +30,25 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1re
 """, unsafe_allow_html=True)
 
 # ============== IMPORTS DE TU PIPELINE ==============
-from qvm_trend.scoring import (
+from scoring import (
     blend_breakout_qvm, build_momentum_proxy
 )
-from qvm_trend.data_io import (
+from data_io import (
     run_fmp_screener, filter_universe, load_prices_panel, load_benchmark,
     DEFAULT_START, DEFAULT_END
 )
-from qvm_trend.fundamentals import (
+from fundamentals import (
     download_fundamentals, build_vfq_scores_dynamic,
     download_guardrails_batch, apply_quality_guardrails
 )
-from qvm_trend.pipeline import (
+from pipeline import (
     apply_trend_filter, enrich_with_breakout,
     market_regime_on
 )
-from qvm_trend.backtests import backtest_many
+from backtests import backtest_many
 
 # NUEVOS IMPORTS (growth-aware)
-from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rules
+from factors_growth_aware import compute_qvm_scores, apply_megacap_rules
 
 
 # ------------------ CACHÉ DE I/O ------------------
