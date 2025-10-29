@@ -1129,11 +1129,14 @@ def build_vfq_scores_dynamic(
     quality_metrics: list[str],
     w_value: float = 0.5,
     w_quality: float = 0.5,
-    method_intra: str = "mean",    # "mean" | "median" | "weighted_mean" (=mean)
+    method_intra: str = "mean",    # "mean" | "median"
     winsor_p: float = 0.01,
     size_buckets: int = 3,
     group_mode: str = "sector",    # "sector" | "sector|size"
 ) -> pd.DataFrame:
+    import numpy as np
+    import pandas as pd
+
     df = df.copy()
 
     def _numcol(name):
@@ -1146,7 +1149,7 @@ def build_vfq_scores_dynamic(
         lo, hi = s.quantile(p), s.quantile(1 - p)
         return s.clip(lo, hi)
 
-    # Derivadas mínimas si faltan
+    # --- Derivadas mínimas si faltan ---
     if "inv_ev_ebitda" in value_metrics and "inv_ev_ebitda" not in df.columns:
         ev = _numcol("evToEbitda")
         df["inv_ev_ebitda"] = (1.0 / ev).replace([np.inf, -np.inf], np.nan)
@@ -1160,13 +1163,15 @@ def build_vfq_scores_dynamic(
     V = [c for c in value_metrics if c in df.columns]
     Q = [c for c in quality_metrics if c in df.columns]
 
+    # Winsorizar métricas usadas
     for c in set(V + Q):
         df[c] = _winsor_local(df[c], winsor_p)
 
+    # Cobertura VFQ = nº de métricas disponibles (Value+Quality)
     use_cols = V + Q
-    df["coverage_count"] = df[use_cols].notna().sum(axis=1) if use_cols else 0
+    df["coverage_count"] = df[use_cols].notna().sum(axis=1).astype(int) if use_cols else 0
 
-    # size buckets
+    # --- Size buckets (opcional) ---
     if size_buckets > 1:
         mcap = _numcol("marketCap_unified")
         r = mcap.rank(method="first", na_option="keep")
@@ -1177,11 +1182,13 @@ def build_vfq_scores_dynamic(
     else:
         size_bucket = pd.Series(0, index=df.index)
 
+    # --- Clave de grupo ---
     df["sector"] = df.get("sector", "Unknown").fillna("Unknown").astype(str)
     grp_key = df["sector"] if group_mode == "sector" else df["sector"].astype(str) + "|" + size_bucket.astype(str)
 
     def _rank_group(col):
         s = pd.to_numeric(df[col], errors="coerce")
+        # ranks altos = mejor (ascending=False)
         return s.groupby(grp_key).rank(method="average", ascending=False, na_option="bottom")
 
     def _block_score(cols):
@@ -1201,13 +1208,16 @@ def build_vfq_scores_dynamic(
         w_sum = 1.0
     df["VFQ"] = (df["ValueScore"] * w_value + df["QualityScore"] * w_quality) / w_sum
 
+    # Percentil por sector
     try:
         df["VFQ_pct_sector"] = df.groupby("sector")["VFQ"].rank(pct=True)
     except Exception:
         df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
     df["VFQ_pct_sector"] = df["VFQ_pct_sector"].clip(0.0, 1.0).fillna(1.0)
 
+    # Devuelve df con columnas listas para filtros/guardrails
     return df
+
 
 # ----------------------------- Robust VFQ wrapper (appended) -----------------------------
 def build_vfq_scores_dynamic2(
