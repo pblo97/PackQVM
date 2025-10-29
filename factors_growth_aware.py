@@ -307,6 +307,60 @@ def neutralize_by_sector_cap(df: pd.DataFrame,
     return z_neut
 
 # ----------------------------- QVM -------------------------------
+def compute_qvm_scores(df: pd.DataFrame,
+                       w_quality: float = 0.40,
+                       w_value: float = 0.25,
+                       w_momentum: float = 0.35,
+                       momentum_col: str = "momentum_score",
+                       sector_col: str = "sector",
+                       mcap_col: str = "market_cap") -> pd.DataFrame:
+    d = df.copy()
+    d = d.loc[:, ~d.columns.duplicated(keep="last")]
+
+    if sector_col not in d.columns: d[sector_col] = "Unknown"
+    d[sector_col] = d[sector_col].astype(str).fillna("Unknown")
+
+    if momentum_col not in d.columns: d[momentum_col] = 0.0
+    d[momentum_col] = _to_float(d[momentum_col])
+
+    d["value_adj"]   = value_growth_aware(d)
+    d["quality_adj"] = quality_intangible_aware(d)
+
+    d["value_adj_neut"]   = neutralize_by_sector_cap(d, "value_adj",  sector_col, mcap_col)
+    d["quality_adj_neut"] = neutralize_by_sector_cap(d, "quality_adj", sector_col, mcap_col)
+
+    m_z = _zscore(d[momentum_col])
+    d["qvm_score"] = (
+        w_quality * _zscore(d["quality_adj_neut"]) +
+        w_value   * _zscore(d["value_adj_neut"])   +
+        w_momentum* m_z
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return d
+
+# ----------------------- Guardrails/overrides --------------------
+def apply_megacap_rules(df: pd.DataFrame,
+                        momentum_col="momentum_score",
+                        quality_col="quality_adj_neut",
+                        value_col="value_adj_neut") -> pd.DataFrame:
+    out = df.copy()
+    for col in (momentum_col, quality_col, value_col):
+        if col not in out.columns:
+            out[col] = 0.0
+    out["q_pct_sector"] = out.groupby("sector")[quality_col].transform(lambda s: s.rank(pct=True)).fillna(0.0)
+    out["v_pct_sector"] = out.groupby("sector")[value_col].transform(lambda s: s.rank(pct=True)).fillna(0.0)
+    out["m_pct_global"] = out[momentum_col].rank(pct=True).fillna(0.0)
+    out["mega_exception_ok"] = (
+        (out["m_pct_global"] >= 0.70) &
+        (out["q_pct_sector"] >= 0.55) &
+        (out["v_pct_sector"] >= 0.35)
+    )
+    out["quality_too_low"] = out["q_pct_sector"] < 0.45
+    return out
+# ===================== FIN QVM CORE (todo en uno) =====================
+
+
+# ----------------------------- QVM -------------------------------
 def compute_qvm_scores(df: pd.DataFrame, 
                        w_quality: float = 0.40,
                        w_value: float = 0.25,

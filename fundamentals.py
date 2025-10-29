@@ -13,7 +13,14 @@ import pandas as pd
 from data_io import _http_get
 
 # Cache opcional (si no está, definimos no-ops)
-from cache_io import save_df, load_df
+try:
+    from .cache_io import save_df, load_df
+except Exception:
+    def save_df(df: pd.DataFrame, key: str):
+        return
+    def load_df(key: str) -> Optional[pd.DataFrame]:
+        return None
+
 # ======================================================================
 # Helpers genéricos / numéricos robustos
 # ======================================================================
@@ -302,6 +309,57 @@ def neutralize_by_sector_cap(df: pd.DataFrame, score_col: str, sector_col: str =
 
     final = 0.5 * z_sector + 0.5 * z_cap
     return final
+
+def compute_qvm_scores(df: pd.DataFrame,
+                       w_quality: float = 0.40,
+                       w_value: float = 0.25,
+                       w_momentum: float = 0.35,
+                       momentum_col: str = "momentum_score",
+                       sector_col: str = "sector",
+                       mcap_col: str = "market_cap") -> pd.DataFrame:
+    """
+    Calcula Value y Quality “growth-aware”,
+    neutraliza por sector+cap y devuelve:
+      value_adj, quality_adj, value_adj_neut, quality_adj_neut, qvm_score
+    """
+    df = df.copy()
+    df["value_adj"] = value_growth_aware(df)
+    df["quality_adj"] = quality_intangible_aware(df)
+    df["value_adj_neut"] = neutralize_by_sector_cap(df, "value_adj", sector_col, mcap_col)
+    df["quality_adj_neut"] = neutralize_by_sector_cap(df, "quality_adj", sector_col, mcap_col)
+    m = _zscore(_to_float(df.get(momentum_col, np.nan)))
+    df["qvm_score"] = (
+        w_quality * _zscore(df["quality_adj_neut"]) +
+        w_value   * _zscore(df["value_adj_neut"])   +
+        w_momentum* m
+    )
+    return df
+
+def apply_megacap_rules(df: pd.DataFrame,
+                        momentum_col="momentum_score",
+                        quality_col="quality_adj_neut",
+                        value_col="value_adj_neut") -> pd.DataFrame:
+    """
+    Reglas:
+     - Permite peso aunque Value quede 35–45p si Momentum>=70p y Quality>=55p (sectorial).
+     - Si Quality<45p o profit warning, marca 'quality_too_low'.
+    """
+    out = df.copy()
+    out["q_pct_sector"] = out.groupby("sector")[quality_col].transform(lambda s: s.rank(pct=True))
+    out["v_pct_sector"] = out.groupby("sector")[value_col].transform(lambda s: s.rank(pct=True))
+    out["m_pct_global"] = out[momentum_col].rank(pct=True)
+    out["mega_exception_ok"] = (
+        (out["m_pct_global"] >= 0.70) &
+        (out["q_pct_sector"] >= 0.55) &
+        (out["v_pct_sector"] >= 0.35)
+    )
+    out["quality_too_low"] = out["q_pct_sector"] < 0.45
+    return out
+
+# ======================================================================
+# FUNDAMENTALES (mínimo de batalla) → para VFQ
+# ======================================================================
+
 def _num(x):
     try:
         return float(x)
@@ -937,13 +995,228 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
 # Guardrails: aplicación de umbrales
 # ======================================================================
 
-def compute_qvm_scores(*args, **kwargs):
-    return _fg_compute_qvm_scores(*args, **kwargs)
+def _num_or_nan(d: pd.DataFrame, col: str) -> pd.Series:
+    if col not in d.columns:
+        return pd.Series(np.nan, index=d.index)
+    return pd.to_numeric(d[col], errors="coerce")
 
-def apply_megacap_rules(*args, **kwargs):
-    return _fg_apply_megacap_rules(*args, **kwargs)
-# ----------------------------- Added wrappers for app compatibility -----------------------------
+def apply_quality_guardrails(
+    df: pd.DataFrame,
+    require_profit_floor: bool = True,
+    profit_floor_min_hits: int = 1,
+    max_net_issuance: float = 0.08,
+    max_asset_growth: float = 0.35,
+    max_accruals_ta: float = 0.15,
+    max_netdebt_ebitda: float = 4.0,
+    *,
+    # Anti-basura / liquidez (puedes sobreescribir desde la UI)
+    min_price: float = 5.0,
+    min_dollar_vol: float = 2_000_000.0,
+    min_mcap: float = 500_000_000.0,
+    drop_pre_rev_biotech: bool = True,
+    ps_limit_for_loss: float = 40.0,
+    min_rev_for_non_fin: float = 50_000_000.0
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    d = df.copy()
+
+    # ====== lecturas numéricas robustas ======
+    px   = _first_num(d, ["price", "Price", "lastPrice"])
+    dv   = _first_num(d, ["avgDollarVol_3m", "dollarVol_3m", "avgDollarVolume3m"])
+    mcap = _first_num(d, ["marketCap_unified", "marketCap", "MarketCap", "marketCap_profile"])
+
+    # Cada chequeo “pasa” si el valor está por encima del umbral **o** si es NaN.
+    price_ok = (px >= float(min_price)) | px.isna()
+    mcap_ok  = (mcap >= float(min_mcap)) | mcap.isna()
+    dv_ok    = (dv >= float(min_dollar_vol)) | dv.isna()   # si dv no existe o es todo NaN, no bloquea
+
+    liq_pass = (price_ok & mcap_ok & dv_ok).fillna(True)
+    if not dv.isna().all():
+        liq_pass = liq_pass & (dv >= float(min_dollar_vol))
+    # Si dv está completamente vacío, NO bloqueamos por eso.
+
+    # ====== ANTI-JUNK ======
+    sector   = d.get("sector",   pd.Series(index=d.index, dtype=object)).astype(str)
+    industry = d.get("industry", pd.Series(index=d.index, dtype=object)).astype(str)
+    rev      = _first_num(d, ["revenue_ttm", "revenueTTM", "totalRevenueTTM"]).fillna(0.0)
+    gp       = _first_num(d, ["gross_profit_ttm", "grossProfitTTM"])
+    sales    = _first_num(d, ["sales_ntm", "revenue_ntm", "salesNTM"])
+    nmar     = _first_num(d, ["netMargin", "net_margin", "netMarginTTM"])
+
+    biotech_flag = sector.str.contains("health", case=False, na=False) & \
+                   industry.str.contains("biotech|drug", case=False, na=False)
+    pre_rev = (rev < float(min_rev_for_non_fin)) | (gp.fillna(0.0) <= 0.0)
+
+    # PS ratio (mcap / ventas). Si no hay ventas -> NaN -> no bloquea por story, a menos que haya cifra.
+    ps = (mcap / sales.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    story_flag = (ps >= float(ps_limit_for_loss)) & (nmar <= 0.0)
+
+    anti_junk_pass = ~((bool(drop_pre_rev_biotech) & biotech_flag & pre_rev) | story_flag)
+    anti_junk_pass = anti_junk_pass.fillna(True)
+
+    # ====== PISO DE UTILIDADES (1 de 3) ======
+    ebit = _first_num(d, ["ebit_ttm", "EBITTTM", "ebitTTM"])
+    cfo  = _first_num(d, ["cfo_ttm", "cashFromOperationsTTM", "operatingCashFlowTTM"])
+    fcf  = _first_num(d, ["fcf_ttm", "freeCashFlowTTM", "FCFTTM"])
+    hits = (ebit > 0).astype(int) + (cfo > 0).astype(int) + (fcf > 0).astype(int)
+    profit_pass = (hits >= int(profit_floor_min_hits)) if require_profit_floor else pd.Series(True, index=d.index, dtype=bool)
+    profit_pass = profit_pass.fillna(True)
+
+    # ====== EMISIÓN NETA ======
+    net_iss = _first_num(d, ["net_issuance", "netIssuance", "net_issuance_ttm",
+                             "share_issuance_pct_ttm", "shares_change_1y", "sharesChange1Y"])
+    issuance_pass = pd.Series(True, index=d.index, dtype=bool)
+    if not net_iss.isna().all():
+        # si viene en % (p.ej 7.5), asumir 0.075 si > 2
+        net_iss_scaled = net_iss.copy()
+        net_iss_scaled[net_iss_scaled.abs() > 2] = net_iss_scaled[net_iss_scaled.abs() > 2] / 100.0
+        issuance_pass = (net_iss_scaled <= float(max_net_issuance)) | net_iss_scaled.isna()
+    issuance_pass = issuance_pass.fillna(True)
+
+    # ====== CRECIMIENTO DE ACTIVOS ======
+    asset_g = _first_num(d, ["asset_growth_ttm", "assetGrowth", "assets_yoy", "assetsYoY"])
+    if asset_g.isna().all():
+        ta_now = _first_num(d, ["totalAssetsTTM", "total_assets_ttm", "TotalAssetsTTM"])
+        ta_1y  = _first_num(d, ["totalAssetsTTM_1y", "total_assets_ttm_1y", "TotalAssetsTTM_1Y"])
+        asset_g = (ta_now / ta_1y.replace(0, np.nan) - 1.0).replace([np.inf, -np.inf], np.nan)
+    # Corrige escala si parece porcentaje mal escalado
+    ag = asset_g.copy()
+    ag[ag.abs() > 2] = ag[ag.abs() > 2] / 100.0
+    asset_pass = (ag <= float(max_asset_growth)) | ag.isna()
+    asset_pass = asset_pass.fillna(True)
+
+    # ====== SLOAN ACCRUALS / TA ======
+    accr_ta = _first_num(d, ["accruals_ta", "sloan_accruals_ta", "accrualsTotAssets", "accruals_to_assets"])
+    ac = accr_ta.copy()
+    ac[ac.abs() > 2] = ac[ac.abs() > 2] / 100.0
+    accruals_pass = (ac.abs() <= float(max_accruals_ta)) | ac.isna()
+    accruals_pass = accruals_pass.fillna(True)
+
+    # ====== NET DEBT / EBITDA ======
+    nde = _first_num(d, ["netDebtToEBITDA", "net_debt_to_ebitda", "NetDebtToEBITDA"])
+    nde[nde < 0] = np.nan  # valores negativos → tratar como sin deuda neta
+    lev_pass = (nde <= float(max_netdebt_ebitda)) | nde.isna()
+    lev_pass = lev_pass.fillna(True)
+
+    # ====== máscara final ======
+    mask = liq_pass & anti_junk_pass & profit_pass & issuance_pass & asset_pass & accruals_pass & lev_pass
+
+    # ====== trazabilidad de motivos ======
+    reasons = []
+    reasons.append(np.where(liq_pass, "", "liq"))
+    reasons.append(np.where(anti_junk_pass, "", "junk"))
+    reasons.append(np.where(profit_pass, "", "profit"))
+    reasons.append(np.where(issuance_pass, "", "issue"))
+    reasons.append(np.where(asset_pass, "", "assets"))
+    reasons.append(np.where(accruals_pass, "", "accruals"))
+    reasons.append(np.where(lev_pass, "", "leverage"))
+    reasons = np.column_stack(reasons)
+    d["guard_reason"] = [";".join(r for r in row if r) or "" for row in reasons]
+
+    d["guard_liquidity"] = liq_pass
+    d["guard_anti_junk"] = anti_junk_pass
+    d["guard_profit"]    = profit_pass
+    d["guard_issuance"]  = issuance_pass
+    d["guard_assets"]    = asset_pass
+    d["guard_accruals"]  = accruals_pass
+    d["guard_leverage"]  = lev_pass
+    d["guard_all"]       = mask
+
+    return d[mask].copy(), d
+
+
+
+# ======================================================================
+# VFQ dinámico (si quieres definir columnas ad-hoc)
+# ======================================================================
+
 def build_vfq_scores_dynamic(
+    df: pd.DataFrame,
+    value_metrics: list[str],
+    quality_metrics: list[str],
+    w_value: float = 0.5,
+    w_quality: float = 0.5,
+    method_intra: str = "mean",    # "mean" | "median" | "weighted_mean" (=mean)
+    winsor_p: float = 0.01,
+    size_buckets: int = 3,
+    group_mode: str = "sector",    # "sector" | "sector|size"
+) -> pd.DataFrame:
+    df = df.copy()
+
+    def _numcol(name):
+        return pd.to_numeric(df[name], errors="coerce") if name in df.columns else pd.Series(np.nan, index=df.index)
+
+    def _winsor_local(s: pd.Series, p: float):
+        s = pd.to_numeric(s, errors="coerce")
+        if s.isna().all() or p <= 0:
+            return s
+        lo, hi = s.quantile(p), s.quantile(1 - p)
+        return s.clip(lo, hi)
+
+    # Derivadas mínimas si faltan
+    if "inv_ev_ebitda" in value_metrics and "inv_ev_ebitda" not in df.columns:
+        ev = _numcol("evToEbitda")
+        df["inv_ev_ebitda"] = (1.0 / ev).replace([np.inf, -np.inf], np.nan)
+
+    if "fcf_yield" in value_metrics and "fcf_yield" not in df.columns:
+        df["fcf_yield"] = (_numcol("fcf_ttm") / _numcol("marketCap_unified")).replace([np.inf, -np.inf], np.nan)
+
+    if "gross_profitability" in quality_metrics and "gross_profitability" not in df.columns:
+        df["gross_profitability"] = (_numcol("grossProfitTTM") / _numcol("totalAssetsTTM")).replace([np.inf, -np.inf], np.nan)
+
+    V = [c for c in value_metrics if c in df.columns]
+    Q = [c for c in quality_metrics if c in df.columns]
+
+    for c in set(V + Q):
+        df[c] = _winsor_local(df[c], winsor_p)
+
+    use_cols = V + Q
+    df["coverage_count"] = df[use_cols].notna().sum(axis=1) if use_cols else 0
+
+    # size buckets
+    if size_buckets > 1:
+        mcap = _numcol("marketCap_unified")
+        r = mcap.rank(method="first", na_option="keep")
+        try:
+            size_bucket = pd.qcut(r, size_buckets, labels=False, duplicates="drop")
+        except Exception:
+            size_bucket = pd.Series(np.nan, index=df.index)
+    else:
+        size_bucket = pd.Series(0, index=df.index)
+
+    df["sector"] = df.get("sector", "Unknown").fillna("Unknown").astype(str)
+    grp_key = df["sector"] if group_mode == "sector" else df["sector"].astype(str) + "|" + size_bucket.astype(str)
+
+    def _rank_group(col):
+        s = pd.to_numeric(df[col], errors="coerce")
+        return s.groupby(grp_key).rank(method="average", ascending=False, na_option="bottom")
+
+    def _block_score(cols):
+        if not cols:
+            return pd.Series(np.nan, index=df.index)
+        ranks = pd.concat([_rank_group(c) for c in cols], axis=1)
+        if method_intra == "median":
+            return ranks.median(axis=1)
+        return ranks.mean(axis=1)
+
+    df["ValueScore"]   = _block_score(V)
+    df["QualityScore"] = _block_score(Q)
+
+    w_sum = (w_value or 0) + (w_quality or 0)
+    if w_sum == 0:
+        w_value = w_quality = 0.5
+        w_sum = 1.0
+    df["VFQ"] = (df["ValueScore"] * w_value + df["QualityScore"] * w_quality) / w_sum
+
+    try:
+        df["VFQ_pct_sector"] = df.groupby("sector")["VFQ"].rank(pct=True)
+    except Exception:
+        df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
+    df["VFQ_pct_sector"] = df["VFQ_pct_sector"].clip(0.0, 1.0).fillna(1.0)
+
+    return df
+
+# ----------------------------- Robust VFQ wrapper (appended) -----------------------------
+def build_vfq_scores_dynamic2(
     df: pd.DataFrame,
     value_metrics=("inv_ev_ebitda","fcf_yield"),
     quality_metrics=("gross_profitability","roic"),
@@ -954,148 +1227,67 @@ def build_vfq_scores_dynamic(
     size_buckets: int = 3,
     group_mode: str = "sector",
 ) -> pd.DataFrame:
-    """
-    Calcula un puntaje VFQ simple (Value+Quality) a partir de métricas seleccionadas y
-    devuelve percentiles por sector para filtrado en la UI.
+    # Coerce input
+    if isinstance(df, (list, tuple)):
+        try:
+            df = pd.DataFrame(df)
+        except Exception:
+            return pd.DataFrame(columns=["symbol","sector","industry","VFQ","VFQ_pct_sector"])
+    elif isinstance(df, dict):
+        try:
+            df = pd.DataFrame(df)
+        except Exception:
+            return pd.DataFrame(columns=["symbol","sector","industry","VFQ","VFQ_pct_sector"])
+    elif not isinstance(df, pd.DataFrame):
+        return pd.DataFrame(columns=["symbol","sector","industry","VFQ","VFQ_pct_sector"])
 
-    - df: DataFrame con al menos ['symbol', 'sector', 'industry'] y columnas métricas
-    - value_metrics / quality_metrics: listas de nombres de columnas a usar
-    - method_intra: 'z' (zscore) o 'pct' (rank percentil)
-    - winsor_p: winsorización de colas por métrica
-    - group_mode: actualmente usado solo para el reporte; VFQ_pct_sector usa 'sector'
-
-    Retorna columnas: ['symbol','sector','industry','VFQ','VFQ_pct_sector','coverage_count'(si existe)]
-    """
     if df is None or df.empty:
         return pd.DataFrame(columns=["symbol","sector","industry","VFQ","VFQ_pct_sector"])
 
     work = df.copy()
-    work["sector"] = work.get("sector", "Unknown").astype(str)
-    work["industry"] = work.get("industry", None)
+    if "sector" not in work.columns:
+        work["sector"] = "Unknown"
+    work["sector"] = work["sector"].astype(str)
+    if "industry" not in work.columns:
+        work["industry"] = pd.Series([None]*len(work), index=work.index)
 
     def _prep(col):
-        s = pd.to_numeric(work.get(col, pd.Series(index=work.index, dtype=float)), errors="coerce")
+        s = pd.to_numeric(work[col], errors="coerce") if col in work.columns else pd.Series(index=work.index, dtype=float)
         s = _winsorize(s, p=winsor_p)
-        if method_intra.lower().startswith("z"):
+        if isinstance(method_intra, str) and method_intra.lower().startswith("z"):
             return _zscore(s)
         else:
             return _rank_pct(s)
 
-    # Value score
-    v_cols = [c for c in value_metrics if c in work.columns]
-    if v_cols:
-        v_mat = pd.concat([_prep(c) for c in v_cols], axis=1)
-        v_score = v_mat.mean(axis=1, skipna=True)
-    else:
-        v_score = pd.Series(0.0, index=work.index)
+    v_cols = [c for c in (list(value_metrics) if not isinstance(value_metrics, (list, tuple)) else value_metrics) if c in work.columns]
+    v_score = pd.concat([_prep(c) for c in v_cols], axis=1).mean(axis=1, skipna=True) if v_cols else pd.Series(0.0, index=work.index)
 
-    # Quality score
-    q_cols = [c for c in quality_metrics if c in work.columns]
-    if q_cols:
-        q_mat = pd.concat([_prep(c) for c in q_cols], axis=1)
-        q_score = q_mat.mean(axis=1, skipna=True)
-    else:
-        q_score = pd.Series(0.0, index=work.index)
+    q_cols = [c for c in (list(quality_metrics) if not isinstance(quality_metrics, (list, tuple)) else quality_metrics) if c in work.columns]
+    q_score = pd.concat([_prep(c) for c in q_cols], axis=1).mean(axis=1, skipna=True) if q_cols else pd.Series(0.0, index=work.index)
 
     v_weight = float(w_value) if pd.notna(w_value) else 0.5
     q_weight = float(w_quality) if pd.notna(w_quality) else 0.5
     total_w = v_weight + q_weight if (v_weight + q_weight) != 0 else 1.0
-
     v_weight /= total_w
     q_weight /= total_w
 
     VFQ = v_weight * v_score + q_weight * q_score
-    # Percentil por sector (si no hay sector, cae a global)
+
     if "sector" in work.columns:
         VFQ_pct_sector = VFQ.groupby(work["sector"]).rank(pct=True, method="average")
     else:
         VFQ_pct_sector = VFQ.rank(pct=True, method="average")
 
-    out_cols = ["symbol","sector","industry"]
-    out = work[out_cols].copy()
+    out = work[["symbol","sector","industry"]].copy() if all(c in work.columns for c in ["symbol","sector","industry"]) else pd.DataFrame({
+        "symbol": work["symbol"] if "symbol" in work.columns else pd.Series([None]*len(work), index=work.index),
+        "sector": work["sector"],
+        "industry": work["industry"],
+    })
     out["VFQ"] = VFQ
     out["VFQ_pct_sector"] = VFQ_pct_sector
-
     if "coverage_count" in work.columns:
         out["coverage_count"] = pd.to_numeric(work["coverage_count"], errors="coerce")
-
     return out
 
-
-def apply_quality_guardrails(
-    df_guard: pd.DataFrame,
-    require_profit_floor: bool = True,
-    profit_floor_min_hits: int = 2,
-    max_net_issuance: float = 0.15,
-    max_asset_growth: float = 0.35,
-    max_accruals_ta: float = 0.10,
-    max_netdebt_ebitda: float = 4.0,
-):
-    """
-    Aplica guardrails "duros" sobre un DataFrame de fundamentales precomputados.
-    Acepta nombres de columna variantes y asume 'symbol' como clave.
-    Retorna: (kept_symbols_list, diag_df_con_motivos)
-    """
-    if df_guard is None or df_guard.empty:
-        return [], pd.DataFrame(columns=["symbol","reason"])
-
-    df = df_guard.copy()
-    df["symbol"] = df["symbol"].astype(str)
-
-    # Resolver nombres de columnas con alias comunes
-    col_profit = next((c for c in ["profit_hits","profits_hits","profit_floor_hits"] if c in df.columns), None)
-    col_issu  = next((c for c in ["net_issuance_1y","net_issuance","netIssuance"] if c in df.columns), None)
-    col_asset = next((c for c in ["asset_growth_1y","asset_growth","assetGrowth"] if c in df.columns), None)
-    col_accr  = next((c for c in ["accruals_ta","acc_pct","accrualsTA"] if c in df.columns), None)
-    col_ndebt = next((c for c in ["ndebt_ebitda","netDebt_EBITDA","net_debt_ebitda"] if c in df.columns), None)
-
-    reasons = {s: [] for s in df["symbol"]}
-
-    def _gt(val, th):
-        try:
-            return float(val) > float(th)
-        except Exception:
-            return False
-
-    def _lt(val, th):
-        try:
-            return float(val) < float(th)
-        except Exception:
-            return False
-
-    # Reglas
-    if require_profit_floor and col_profit:
-        bad = df[pd.to_numeric(df[col_profit], errors="coerce").fillna(0) < int(profit_floor_min_hits)]
-        for s in bad["symbol"]:
-            reasons[s].append(f"profit_hits<{profit_floor_min_hits}")
-
-    if col_issu:
-        bad = df[pd.to_numeric(df[col_issu], errors="coerce").fillna(0) > float(max_net_issuance)]
-        for s in bad["symbol"]:
-            reasons[s].append(f"net_issuance>{max_net_issuance}")
-
-    if col_asset:
-        bad = df[pd.to_numeric(df[col_asset], errors="coerce").fillna(0) > float(max_asset_growth)]
-        for s in bad["symbol"]:
-            reasons[s].append(f"asset_growth>{max_asset_growth}")
-
-    if col_accr:
-        bad = df[pd.to_numeric(df[col_accr], errors="coerce").fillna(0) > float(max_accruals_ta)]
-        for s in bad["symbol"]:
-            reasons[s].append(f"accruals>{max_accruals_ta}")
-
-    if col_ndebt:
-        bad = df[pd.to_numeric(df[col_ndebt], errors="coerce").fillna(0) > float(max_netdebt_ebitda)]
-        for s in bad["symbol"]:
-            reasons[s].append(f"ndebt_ebitda>{max_netdebt_ebitda}")
-
-    # Construir kept y diag
-    kept = [s for s, rs in reasons.items() if len(rs) == 0]
-    rows = []
-    for s, rs in reasons.items():
-        if rs:
-            rows.append({"symbol": s, "reason": ";".join(sorted(set(rs)))})
-
-    diag = pd.DataFrame(rows).sort_values(["reason","symbol"], ascending=True) if rows else pd.DataFrame(columns=["symbol","reason"])
-    return kept, diag
-# -----------------------------------------------------------------------------------------------
+# Alias to keep the original app import name
+build_vfq_scores_dynamic = build_vfq_scores_dynamic2

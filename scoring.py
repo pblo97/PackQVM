@@ -1,10 +1,10 @@
 from __future__ import annotations
 from typing import Dict, Tuple
-from factors import BreakoutFeatures
+from .factors import BreakoutFeatures
 
 import pandas as pd
 import numpy as np
-from factors_growth_aware import compute_qvm_scores, apply_megacap_rules
+from .factors_growth_aware import compute_qvm_scores, apply_megacap_rules
 
 DEFAULT_TH = {
     "rvol_min": 1.5,
@@ -74,7 +74,7 @@ def _z(x: pd.Series) -> pd.Series:
     return (x - x.mean()) / (x.std(ddof=0) + 1e-12)
 
 try:
-    from factors_growth_aware import (
+    from .factors_growth_aware import (
         compute_qvm_scores,
         apply_megacap_rules,
     )

@@ -268,7 +268,7 @@ def run_fmp_screener(limit: int = 300,
     needs_fallback = (df["sector"].eq("").mean() > 0.8)  # >80% vacío
     if needs_fallback:
         try:
-            from fundamentals import download_fundamentals  # import local para evitar ciclos
+            from .fundamentals import download_fundamentals  # import local para evitar ciclos
             syms = df["symbol"].dropna().astype(str).unique().tolist()
             fund = download_fundamentals(syms, cache_key="screener_fallback", force=False)
             if isinstance(fund, pd.DataFrame) and not fund.empty:
