@@ -14,7 +14,7 @@ from data_io import _http_get
 
 # Cache opcional (si no está, definimos no-ops)
 try:
-    from .cache_io import save_df, load_df
+    from cache_io import save_df, load_df
 except Exception:
     def save_df(df: pd.DataFrame, key: str):
         return
