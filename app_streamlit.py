@@ -1481,7 +1481,7 @@ if not os.environ.get("FMP_API_KEY"):
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
-)
+
 
 # CSS suave
 st.markdown("""
