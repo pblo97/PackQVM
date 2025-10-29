@@ -1,3 +1,4 @@
+from __future__ import annotations
 # --- poner esto ARRIBA DE TODO ---
 import os
 os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"  # o "none" si prefieres desactivar
@@ -302,79 +303,102 @@ with tab1:
 # ====== Paso 2: FUNDAMENTALES & GUARDRAILS ======
 with tab2:
     st.subheader("Guardrails")
+
     try:
         if run_btn and "uni" in st.session_state:
             uni = st.session_state["uni"]
-            syms = uni["symbol"].dropna().astype(str).unique().tolist()
-            with st.status("Descargando guardrails/fundamentales (cacheados)…", expanded=False) as status:
-                from fundamentals import download_guardrails_batch, apply_quality_guardrails
+            syms = (
+                uni.get("symbol", pd.Series(dtype=str))
+                   .dropna().astype(str).unique().tolist()
+            )
+            if not syms:
+                st.warning("No hay símbolos en el universo. Ejecuta el screener primero.")
+                st.stop()
 
-                df_guard = download_guardrails_batch(syms)  # DataFrame con columnas como profit_hits, net_issuance_1y, etc.
+            # Lee sliders de la UI (si no existen en session_state, usa valores por defecto robustos)
+            profit_hits   = int(st.session_state.get("profit_hits",   2))
+            max_issuance  = float(st.session_state.get("max_issuance", 0.03))
+            max_assets    = float(st.session_state.get("max_assets",   0.20))
+            max_accr      = float(st.session_state.get("max_accr",     0.10))
+            max_ndeb      = float(st.session_state.get("max_ndeb",     3.0))
+            min_cov_guard = int(st.session_state.get("min_cov_guard",  2))
 
-                # Métricas VFQ (toma de la UI si existen; si no, defaults robustos)
-                value_metrics   = st.session_state.get("value_metrics",   ["inv_ev_ebitda", "fcf_yield"])
-                quality_metrics = st.session_state.get("quality_metrics", ["gross_profitability", "roic"])
+            # Refleja sliders en session_state (para que VFQ/otras pestañas los vean consistentes)
+            st.session_state["profit_hits"]   = profit_hits
+            st.session_state["max_issuance"]  = max_issuance
+            st.session_state["max_assets"]    = max_assets
+            st.session_state["max_accr"]      = max_accr
+            st.session_state["max_ndeb"]      = max_ndeb
+            st.session_state["min_cov_guard"] = min_cov_guard
 
-                # Cobertura VFQ = cuántas métricas (Value+Quality) tiene cada símbolo
+            with st.status("Descargando métricas de guardrails…", expanded=False) as status:
+                # Descarga en batch (cacheada si definiste _cached_download_guardrails)
+                try:
+                    df_guard = _cached_download_guardrails(tuple(syms), cache_key=cache_tag)
+                except Exception:
+                    # fallback directo sin cache wrapper
+                    from fundamentals import download_guardrails_batch
+                    df_guard = download_guardrails_batch(syms, cache_key=cache_tag, force=False)
+
+                # Calcula cobertura VFQ si aún no existe (métricas que luego usa VFQ)
+                value_metrics   = st.session_state.get("value_metrics",   ["inv_ev_ebitda","fcf_yield"])
+                quality_metrics = st.session_state.get("quality_metrics", ["gross_profitability","roic"])
                 coverage_cols = [c for c in (list(value_metrics) + list(quality_metrics)) if c in df_guard.columns]
-                df_guard["coverage_count"] = df_guard[coverage_cols].notna().sum(axis=1).astype(int) if coverage_cols else 0
+                if coverage_cols:
+                    df_guard["coverage_count"] = df_guard[coverage_cols].notna().sum(axis=1).astype(int)
+                else:
+                    # heurística mínima
+                    base_cov = [c for c in ["evToEbitda","fcf_ttm","grossProfitTTM","roic","roa","netMargin"] if c in df_guard.columns]
+                    df_guard["coverage_count"] = df_guard[base_cov].notna().sum(axis=1).astype(int) if base_cov else 0
 
-                # Lee sliders (o usa defaults si no están en el estado)
-                profit_hits   = int(st.session_state.get("profit_hits",   1))     # pisos EBIT/CFO/FCF
-                max_issuance  = float(st.session_state.get("max_issuance", 0.15)) # emisión neta máx. (solo positivos fallan)
-                max_assets    = float(st.session_state.get("max_assets",   0.35)) # crecimiento activos y/y máx.
-                max_accr      = float(st.session_state.get("max_accr",     0.10)) # |accruals/TA| máx. (se evalúa abs)
-                max_ndeb      = float(st.session_state.get("max_ndeb",     4.0))  # NetDebt/EBITDA máx. (negativos clip a 0)
-                min_cov       = int(st.session_state.get("min_cov",        0))    # cobertura VFQ mínima (# métricas)
-
-                # Aplica guardrails (versión robusta)
+                # Aplica guardrails
                 kept, diag = apply_quality_guardrails(
                     df_guard=df_guard,
                     require_profit_floor=bool(profit_hits > 0),
-                    profit_floor_min_hits=int(profit_hits),
-                    max_net_issuance=float(max_issuance),
-                    max_asset_growth=float(max_assets),
-                    max_accruals_ta=float(max_accr),
-                    max_netdebt_ebitda=float(max_ndeb),
-                    min_vfq_coverage=int(min_cov),
+                    profit_floor_min_hits=profit_hits,
+                    max_net_issuance=max_issuance,
+                    max_asset_growth=max_assets,
+                    max_accruals_ta=max_accr,
+                    max_netdebt_ebitda=max_ndeb,
+                    min_vfq_coverage=min_cov_guard
                 )
 
                 status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
-# ↑↑↑ fin del bloque dentro del with st.status(...) ↑↑↑
-                coverage_cols = [c for c in (list(value_metrics) + list(quality_metrics)) if c in df_guard.columns]
-                df_guard["coverage_count"] = df_guard[coverage_cols].notna().sum(axis=1).astype(int) if coverage_cols else 0
 
-                kept, diag = apply_quality_guardrails(
-                    df_guard=df_guard,
-                    require_profit_floor=bool(profit_hits > 0),
-                    profit_floor_min_hits=int(profit_hits),
-                    max_net_issuance=float(max_issuance),
-                    max_asset_growth=float(max_assets),
-                    max_accruals_ta=float(max_accr),
-                    max_netdebt_ebitda=float(max_ndeb),
-                    min_vfq_coverage=int(min_cov),
-                )
-
-                status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
+            # Guarda en sesión
             st.session_state["kept"] = kept
             st.session_state["guard_diag"] = diag
-        elif "kept" in st.session_state:
+            st.session_state["pipeline_ready"] = False
+
+        elif "kept" in st.session_state and "guard_diag" in st.session_state:
             kept = st.session_state["kept"]
-            uni = st.session_state["uni"]
-            diag = st.session_state.get("guard_diag", pd.DataFrame())
+            diag = st.session_state["guard_diag"]
+            uni  = st.session_state.get("uni", pd.DataFrame())
         else:
             st.info("Primero ejecuta **Universo** (botón Ejecutar).")
             st.stop()
 
+        # Métricas rápidas
         c1, c2 = st.columns(2)
         c1.metric("Pasan guardrails", f"{len(kept):,}")
-        c2.metric("Rechazados", f"{len(st.session_state['uni']) - len(kept):,}")
+        c2.metric("Rechazados", f"{max(len(st.session_state.get('uni', pd.DataFrame())),0) - len(kept):,}")
 
-        st.dataframe(
-            diag.merge(uni[["symbol", "sector"]], on="symbol", how="left"),
-            use_container_width=True, hide_index=True
-        )
-        st.caption("Nota: si ves '__err_guard' o NaN, son símbolos con datos faltantes; quedan fuera.")
+        # Vista diagnóstica (merge con sector si existe)
+        diag_view = diag.copy()
+        if isinstance(uni, pd.DataFrame) and "symbol" in uni.columns:
+            diag_view = diag_view.merge(uni[["symbol","sector"]].drop_duplicates("symbol"), on="symbol", how="left")
+
+        cols_show = [c for c in [
+            "symbol","sector","reason","pass_all","profit_hits","coverage_count",
+            "net_issuance","asset_growth","accruals_ta","netdebt_ebitda",
+            "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"
+        ] if c in diag_view.columns]
+
+        st.dataframe(diag_view[cols_show].sort_values(["pass_all","profit_hits","coverage_count"], ascending=[False, False, False]),
+                     use_container_width=True, hide_index=True)
+
+        st.caption("Notas: 'profit_hits' cuenta {EBIT, CFO, FCF} > 0. Emisión neta solo penaliza si es positiva.")
+
     except Exception as e:
         st.error(f"Error en guardrails: {e}")
 
