@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 # HTTP común (robusto, con rate limit/backoff) provisto en data_io.py
-from .data_io import _http_get
+from data_io import _http_get
 
 # Cache opcional (si no está, definimos no-ops)
 from cache_io import save_df, load_df

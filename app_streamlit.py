@@ -1480,7 +1480,8 @@ if not os.environ.get("FMP_API_KEY"):
     page_title="Sistema QVM",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+)
 
 # CSS suave
 st.markdown("""
