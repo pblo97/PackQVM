@@ -536,18 +536,64 @@ with tab3:
             df_vfq = df_vfq.reset_index().rename(columns={"index":"symbol"})
         df_vfq["symbol"] = df_vfq["symbol"].astype(str)
 
-        # merge con info útil (deuda/accruals desde diag, sector/mcap desde uni)
-        diag_slim = diag[["symbol","netdebt_ebitda","accruals_ta"]].drop_duplicates("symbol") \
-                    if not diag.empty else pd.DataFrame(columns=["symbol","netdebt_ebitda","accruals_ta"])
-        base_uni = uni[["symbol","sector","market_cap"]].drop_duplicates("symbol") \
-                   if ("symbol" in uni.columns) else pd.DataFrame(columns=["symbol","sector","market_cap"])
+        # ---- merge con info útil ----
+        # a) desde diag: netdebt_ebitda, accruals_ta
+        if not diag.empty and "symbol" in diag.columns:
+            diag_slim_cols = [c for c in ["symbol","netdebt_ebitda","accruals_ta"] if c in diag.columns]
+            diag_slim = diag[diag_slim_cols].drop_duplicates("symbol")
+        else:
+            diag_slim = pd.DataFrame(columns=["symbol","netdebt_ebitda","accruals_ta"])
 
+        # b) desde uni: sector y market_cap (pero algunos nombres cambian)
+        if isinstance(uni, pd.DataFrame) and "symbol" in uni.columns:
+            # detectar columna de market cap real
+            mcap_candidates = ["market_cap","marketCap","marketCap_unified","mkt_cap","Market Cap"]
+            mcap_col = None
+            for c in mcap_candidates:
+                if c in uni.columns:
+                    mcap_col = c
+                    break
+
+            uni_cols = ["symbol"]
+            if "sector" in uni.columns:
+                uni_cols.append("sector")
+            if mcap_col is not None:
+                uni_cols.append(mcap_col)
+
+            uni_slim = (
+                uni[uni_cols]
+                .drop_duplicates("symbol", keep="first")
+                .copy()
+            )
+
+            # normalizamos el nombre a 'market_cap' si lo encontramos con otro alias
+            if mcap_col is not None and mcap_col != "market_cap":
+                uni_slim = uni_slim.rename(columns={mcap_col: "market_cap"})
+
+            # si no hay sector lo creamos vacío
+            if "sector" not in uni_slim.columns:
+                uni_slim["sector"] = "Unknown"
+
+            # si no hay market_cap lo creamos NaN
+            if "market_cap" not in uni_slim.columns:
+                uni_slim["market_cap"] = np.nan
+
+        else:
+            uni_slim = pd.DataFrame(
+                {
+                    "symbol": kept_syms,
+                    "sector": "Unknown",
+                    "market_cap": np.nan
+                }
+            )
+
+        # merge final fundamental + contexto base
         df_vfq = (
             df_vfq.merge(diag_slim, on="symbol", how="left")
-                  .merge(base_uni, on="symbol", how="left")
+                  .merge(uni_slim,  on="symbol", how="left")
         )
 
-        # 2. sliders VFQ (pueden estar súper laxos o súper estrictos)
+        # 2. sliders VFQ
         c1, c2, c3 = st.columns(3)
         with c1:
             min_quality = st.slider("Min Quality neut.", 0.0, 1.0, 0.0, 0.01)
@@ -578,7 +624,7 @@ with tab3:
                 df_vfq[col] = val
             df_vfq[col] = pd.to_numeric(df_vfq[col], errors="coerce")
 
-        # 4. máscara VFQ pura (NO inventamos universos)
+        # 4. máscara VFQ pura
         mask = (
             (df_vfq["quality_adj_neut"] >= float(min_quality)) &
             (df_vfq["value_adj_neut"]   >= float(min_value))   &
@@ -594,7 +640,7 @@ with tab3:
         )
         mask &= ndebt_ok
 
-        # accruals/NOA limpia: acc_pct alto = sano
+        # accruals / NOA limpia
         mask &= (
             df_vfq["acc_pct"].isna() |
             (df_vfq["acc_pct"] >= float(min_acc_pct))
@@ -602,7 +648,7 @@ with tab3:
 
         df_keep_vfq = df_vfq.loc[mask].copy()
 
-        # 5. rank: prob_up DESC (si no hay, BreakoutScore DESC)
+        # 5. rank: prob_up DESC (fallback BreakoutScore)
         if "prob_up" in df_keep_vfq.columns:
             df_keep_vfq = df_keep_vfq.sort_values("prob_up", ascending=False)
         else:
@@ -610,7 +656,7 @@ with tab3:
 
         vfq_top = df_keep_vfq.head(int(topN_prob)).copy()
 
-        # 6. mostramos
+        # 6. mostramos resultados
         st.markdown("### 🟢 Selección VFQ filtrada")
         st.dataframe(
             vfq_top,
@@ -621,7 +667,6 @@ with tab3:
         st.markdown("### 🧹 Rechazados por VFQ")
         rejected_syms = sorted(set(kept_syms) - set(df_keep_vfq["symbol"]))
         rej_view = df_vfq[df_vfq["symbol"].isin(rejected_syms)].copy()
-
         st.dataframe(
             rej_view[[c for c in [
                 "symbol","sector","market_cap",
@@ -633,12 +678,13 @@ with tab3:
             hide_index=True
         )
 
-        # 7. guardamos para tab4
+        # 7. guardar para tab4
         st.session_state["vfq_top"] = vfq_top[["symbol"]].drop_duplicates()
         st.session_state["vfq_table"] = vfq_top.reset_index(drop=True)
 
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
+
 
 
 # ====== Paso 4: SEÑALES (placeholder si tu lógica está en otro módulo) ======
