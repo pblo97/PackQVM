@@ -414,31 +414,63 @@ with tab2:
         # --- Resumen de rechazos por regla ---
         if "guard_diag" in st.session_state:
             diag = st.session_state["guard_diag"]
-            if not diag.empty and "pass_all" in diag.columns:
+            if isinstance(diag, pd.DataFrame) and not diag.empty:
+                # Asegurar dtypes booleanos
+                bool_cols = [c for c in [
+                    "pass_profit","pass_issuance","pass_assets",
+                    "pass_accruals","pass_ndebt","pass_coverage","pass_all"
+                ] if c in diag.columns]
+                for c in bool_cols:
+                    diag[c] = diag[c].astype(bool)
+
+                # Si faltara pass_all por algún motivo, lo recomputamos
+                if "pass_all" not in diag.columns:
+                    checks = [c for c in [
+                        "pass_profit","pass_issuance","pass_assets",
+                        "pass_accruals","pass_ndebt","pass_coverage"
+                    ] if c in diag.columns]
+                    if checks:
+                        diag["pass_all"] = diag[checks].all(axis=1)
+                    else:
+                        diag["pass_all"] = False
+
                 total = len(diag)
-                fails = (~diag["pass_all"]).sum()
-                st.markdown(f"**Resumen de filtros** — fallan {fails} de {total}")
+                fails_df = diag.loc[~diag["pass_all"]].copy()
+                fails = len(fails_df)
+                st.markdown(f"**Resumen de filtros** — fallan **{fails}** de **{total}**")
 
-                def _fail_rate(col):  # % que fallan esa regla (entre todos)
-                    if col not in diag.columns: 
-                        return 0.0
-                    return (diag[col] == False).mean() * 100.0
+                if fails == 0:
+                    st.success("Todos pasan los guardrails con los umbrales actuales.")
+                else:
+                    # Conteo por regla usando columnas pass_*
+                    def _cnt(col):
+                        return int((~fails_df[col]).sum()) if col in fails_df.columns else 0
 
-                summary = pd.DataFrame({
-                    "regla": ["profit_floor","net_issuance","asset_growth","accruals_ta","netdebt_ebitda","vfq_coverage"],
-                    "% que falla": [
-                        _fail_rate("pass_profit"),
-                        _fail_rate("pass_issuance"),
-                        _fail_rate("pass_assets"),
-                        _fail_rate("pass_accruals"),
-                        _fail_rate("pass_ndebt"),
-                        _fail_rate("pass_coverage"),
-                    ],
-                }).sort_values("% que falla", ascending=False)
-                st.dataframe(summary, use_container_width=True, hide_index=True)
+                    summary = pd.DataFrame({
+                        "regla": ["profit_floor","net_issuance","asset_growth","accruals_ta","netdebt_ebitda","vfq_coverage"],
+                        "rechazos": [
+                            _cnt("pass_profit"),
+                            _cnt("pass_issuance"),
+                            _cnt("pass_assets"),
+                            _cnt("pass_accruals"),
+                            _cnt("pass_ndebt"),
+                            _cnt("pass_coverage"),
+                        ],
+                    }).sort_values("rechazos", ascending=False)
+
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+                    # Breakdown adicional usando la columna 'reason' (si existe)
+                    if "reason" in fails_df.columns:
+                        rs = fails_df["reason"].fillna("").str.split(",").explode().str.strip()
+                        rs = rs[rs != ""]
+                        if not rs.empty:
+                            reason_counts = rs.value_counts(dropna=False).reset_index()
+                            reason_counts.columns = ["regla (reason)", "rechazos"]
+                            st.dataframe(reason_counts, use_container_width=True, hide_index=True)
 
 
-        st.caption("Notas: 'profit_hits' cuenta {EBIT, CFO, FCF} > 0. Emisión neta solo penaliza si es positiva.")
+            st.caption("Notas: 'profit_hits' cuenta {EBIT, CFO, FCF} > 0. Emisión neta solo penaliza si es positiva.")
 
     except Exception as e:
         st.error(f"Error en guardrails: {e}")
