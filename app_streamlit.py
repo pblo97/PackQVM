@@ -860,144 +860,160 @@ with tab3:
 with tab4:
     st.subheader("Señales técnicas / Breakout")
 
-    # --- seguridad básica ---
+    # =========================
+    # Recuperar de session_state lo que dejó tab3
+    # =========================
     uni_df = st.session_state.get("uni", pd.DataFrame())
     vfq_all = st.session_state.get("vfq_all", pd.DataFrame())
     vfq_keep = st.session_state.get("vfq_keep", pd.DataFrame())
     vfq_rej = st.session_state.get("vfq_rejected", pd.DataFrame())
     vfq_params = st.session_state.get("vfq_params", {})
 
-    if (
-        uni_df is None or uni_df.empty or
-        vfq_all is None or vfq_all.empty
-    ):
-        st.info("Todavía no hay datos técnicos. Corre Universo → Guardrails → VFQ primero.")
+    if vfq_all is None or vfq_all.empty:
+        st.info("Todavía no hay datos técnicos / VFQ. Corre la pestaña VFQ primero.")
         st.stop()
 
-    # =========================
-    # 1. RESUMEN DE MERCADO
-    # =========================
-    st.markdown("### 1. Estado de mercado")
+    # thresholds que definiste en tab3 y guardaste en vfq_params
+    min_hits_thr = vfq_params.get("min_hits", 1)
+    min_breakout_thr = vfq_params.get("min_breakout", 50.0)
+    min_rvol20_thr = vfq_params.get("min_rvol20", 1.2)
+    require_breakout_flag = vfq_params.get("require_breakout", False)
 
-    # % de tickers sobre MA200 (si existe columna tipo 'ma200_up' o 'aboveMA200')
-    ma_col_candidates = [c for c in vfq_all.columns if c.lower() in ("ma200_up","above_ma200","aboveMA200".lower())]
-    if ma_col_candidates:
-        col_ma = ma_col_candidates[0]
-        pct_above_ma200 = (
-            vfq_all[col_ma]
-            .astype(float)
-            .gt(0)
-            .mean()
-        )
-    else:
-        pct_above_ma200 = np.nan  # si tu DF todavía no expone esto
-
-    # % de tickers con momentum 12-1 positivo (columna tipo 'mom_12_1')
-    mom_col_candidates = [c for c in vfq_all.columns if c.lower() in ("mom_12_1","mom12_1","mom121")]
-    if mom_col_candidates:
-        col_mom = mom_col_candidates[0]
-        pct_mom_pos = vfq_all[col_mom].astype(float).gt(0).mean()
-    else:
-        pct_mom_pos = np.nan
-
-    # Risk-ON global del benchmark (si ya calculas market_regime_on)
-    # Nota: usamos el toggle de sidebar `risk_on`, pero idealmente deberías
-    # correr market_regime_on(bench, start, end) y guardarlo al vuelo.
+    # toggle 'risk_on' viene de la sidebar (Régimen & Fechas)
+    # si por algún motivo no existe acá en tab4 (scope), lo pisamos a False
     try:
         global_risk_on = bool(risk_on)
     except NameError:
         global_risk_on = False
 
+    # =========================
+    # 1. Estado de mercado (proxy amplitud)
+    # =========================
+    st.markdown("### 1. Estado de mercado")
+
+    # proxy amplitud:
+    #   pct_hits_ok        = % tickers cuyo 'hits' >= min_hits_thr
+    #   pct_breakout_ok    = % tickers cuyo 'BreakoutScore' >= min_breakout_thr
+    #   global_risk_on     = tu semáforo macro/táctico (toggle Risk-ON)
+
+    if "hits" in vfq_all.columns:
+        pct_hits_ok = (
+            pd.to_numeric(vfq_all["hits"], errors="coerce")
+            .fillna(0)
+            .ge(min_hits_thr)
+            .mean()
+        )
+    else:
+        pct_hits_ok = np.nan
+
+    if "BreakoutScore" in vfq_all.columns:
+        pct_breakout_ok = (
+            pd.to_numeric(vfq_all["BreakoutScore"], errors="coerce")
+            .fillna(0)
+            .ge(min_breakout_thr)
+            .mean()
+        )
+    else:
+        pct_breakout_ok = np.nan
+
     c1, c2, c3 = st.columns(3)
+
     c1.metric(
-        "% arriba de MA200",
-        f"{pct_above_ma200*100:.1f}%" if not np.isnan(pct_above_ma200) else "n/a"
+        "% setups técnicos OK",
+        f"{pct_hits_ok*100:.1f}%" if not np.isnan(pct_hits_ok) else "n/d",
+        help="≈ % del universo con suficientes 'hits' (checks técnicos cumplidos)."
     )
+
     c2.metric(
-        "% Mom 12–1 > 0",
-        f"{pct_mom_pos*100:.1f}%" if not np.isnan(pct_mom_pos) else "n/a"
+        "% ruptura/momentum OK",
+        f"{pct_breakout_ok*100:.1f}%" if not np.isnan(pct_breakout_ok) else "n/d",
+        help="≈ % del universo con BreakoutScore ≥ umbral (momentum fuerte / ruptura)."
     )
+
     c3.metric(
         "Régimen mercado",
-        "RISK ON ✅" if global_risk_on else "RISK OFF ⚠️"
+        "RISK ON ✅" if global_risk_on else "RISK OFF ⚠️",
+        help="Tu switch macro/táctico desde la barra lateral."
     )
 
     st.caption(
-        "Arriba de MA200 = tendencia sana. Mom 12–1 > 0 = desempeño relativo reciente fuerte. "
-        "RISK ON es tu switch/benchmark; si está OFF, las entradas son más frágiles."
+        "- % setups técnicos OK ≈ amplitud de tendencia/volumen en verde según tus 'hits'.\n"
+        "- % ruptura/momentum OK ≈ cuántas están rompiendo con fuerza según BreakoutScore.\n"
+        "- RISK ON viene de tu toggle (si está OFF, las entradas nuevas son más frágiles).\n"
     )
 
     st.markdown("---")
 
     # =========================
-    # 2. CHECKLIST TÉCNICO POR TICKER
+    # 2. Checklist técnico actual
     # =========================
-    st.markdown("### 2. Checklist técnico por ticker (diagnóstico individual)")
+    st.markdown("### 2. Checklist técnico activo")
 
-    # armamos un dataframe técnico con columnas clave que ya calculas en VFQ
-    # Las que esperamos tener: symbol, sector, market_cap,
-    # hits, BreakoutScore, RVOL20, prob_up,
-    # ClosePos / cercanía high (a veces la llamas 'ClosePos' o 'p52' o 'ClosePctOf52W')
-    # Mom 12-1, MA200 up, etc., si existen.
+    # Mostramos los thresholds que están gobernando las señales técnicas
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("Hits mínimos", f"{min_hits_thr}")
+    col_b.metric("BreakoutScore mín.", f"{min_breakout_thr:.1f}")
+    col_c.metric("RVOL20 mín.", f"{min_rvol20_thr:.2f}")
+    col_d.metric("Requiere breakout?", "Sí" if require_breakout_flag else "No")
 
-    tech_cols_pref = [
-        "symbol",
-        "sector",
-        "market_cap",
-        "hits",
-        "BreakoutScore",
-        "RVOL20",
-        "prob_up",
-        "ClosePos",        # cerca del high reciente
-        "p52",             # % del high de 52w, si está
-        "mom_12_1",
-        "ma200_up",
-        "aboveMA200",
-    ]
-    tech_cols = [c for c in tech_cols_pref if c in vfq_all.columns]
+    st.caption(
+        "Estos parámetros vienen de tu pestaña VFQ / técnico. "
+        "Cualquier papel que no cumpla esto, queda fuera."
+    )
 
-    if not tech_cols:
-        st.warning("No encuentro columnas técnicas detalladas (hits / BreakoutScore / etc.).")
+    st.markdown("---")
+
+    # =========================
+    # 3. Watchlist técnica (los que quedaron después de VFQ+técnico)
+    # =========================
+    st.markdown("### 3. Watchlist técnica (post-VFQ + técnico)")
+
+    if vfq_keep is None or vfq_keep.empty:
+        st.warning("Ningún ticker pasó VFQ + técnico con los filtros actuales.")
     else:
-        # ordenamos por BreakoutScore o prob_up si está disponible
-        if "prob_up" in vfq_all.columns and vfq_all["prob_up"].notna().any():
-            tech_view = vfq_all.sort_values("prob_up", ascending=False)[tech_cols].copy()
-        elif "BreakoutScore" in vfq_all.columns:
-            tech_view = vfq_all.sort_values("BreakoutScore", ascending=False)[tech_cols].copy()
-        else:
-            tech_view = vfq_all[tech_cols].copy()
+        cols_keep_show = [
+            "symbol",
+            "sector",
+            "market_cap",
+            "quality_adj_neut",
+            "value_adj_neut",
+            "acc_pct",
+            "hits",
+            "BreakoutScore",
+            "RVOL20",
+            "prob_up",
+        ]
+        cols_keep_show = [
+            c for c in cols_keep_show if c in vfq_keep.columns
+        ]
 
         st.dataframe(
-            tech_view.head(50),
-            use_container_width=True,
+            vfq_keep[cols_keep_show]
+                .sort_values(
+                    ["prob_up", "BreakoutScore"],
+                    ascending=False,
+                    na_position="last"
+                ),
             hide_index=True,
+            use_container_width=True,
         )
 
     st.caption(
-        "hits = cuántas condiciones técnicas pasó (volumen, cercanía al high, etc.). "
-        "BreakoutScore = tu score compuesto de ruptura/momentum. "
-        "RVOL20 = interés de volumen reciente. "
-        "prob_up = probabilidad de subida modelada."
+        "Watchlist técnica = candidatos activos que ya pasaron Guardrails y VFQ "
+        "y además cumplen señales de tendencia/momentum/volumen."
     )
 
     st.markdown("---")
 
     # =========================
-    # 3. Buenos fundamentales que FALLARON técnica
+    # 4. Rechazados técnicos (fallaron momentum / volumen / hits)
     # =========================
-    st.markdown("### 3. Buenos fundamentales que no pasan técnica mínima")
+    st.markdown("### 4. Rechazados técnicos")
 
-    # idea: tomar tickers que tienen buena calidad/value pero que no quedaron en vfq_keep
-    # o sea: en vfq_all pero NO en vfq_keep. De esos, mostrar por qué fallaron.
-    if (
-        vfq_keep is not None and not vfq_keep.empty and
-        vfq_rej is not None
-    ):
-        # vfq_rej ya lo calculaste como tickers rechazados en VFQ tab
-        # ahí estaban columnas tipo:
-        #   quality_adj_neut, value_adj_neut,
-        #   netdebt_ebitda, acc_pct, BreakoutScore, hits, RVOL20, prob_up
-        rej_cols_pref = [
+    if vfq_rej is None or vfq_rej.empty:
+        st.info("No hay rechazados técnicos adicionales (o no se guardaron).")
+    else:
+        cols_rej_show = [
             "symbol",
             "sector",
             "market_cap",
@@ -1010,45 +1026,36 @@ with tab4:
             "RVOL20",
             "prob_up",
         ]
-        rej_cols = [c for c in rej_cols_pref if c in vfq_rej.columns]
-        if rej_cols:
-            # Orden: primero los que casi pasan (por ejemplo hits altos, Breakout medio)
-            rej_view = vfq_rej.sort_values(
-                ["hits","BreakoutScore","prob_up"],
-                ascending=[False, False, False],
-            )[rej_cols].copy()
+        cols_rej_show = [
+            c for c in cols_rej_show if c in vfq_rej.columns
+        ]
 
-            st.dataframe(
-                rej_view.head(50),
-                use_container_width=True,
-                hide_index=True,
-            )
-            # Explicación dinámica, usando thresholds actuales
-            min_hits_req = vfq_params.get("min_hits", None)
-            brea_req = vfq_params.get("min_breakout", None)
-            rvol_req = vfq_params.get("min_rvol20", None)
+        st.dataframe(
+            vfq_rej[cols_rej_show]
+                .sort_values(
+                    ["BreakoutScore", "prob_up"],
+                    ascending=False,
+                    na_position="last"
+                ),
+            hide_index=True,
+            use_container_width=True,
+        )
 
-            msg_bits = []
-            if min_hits_req is not None:
-                msg_bits.append(f"hits < {min_hits_req}")
-            if brea_req is not None:
-                msg_bits.append(f"BreakoutScore < {brea_req}")
-            if rvol_req is not None:
-                msg_bits.append(f"RVOL20 < {rvol_req}")
-            if msg_bits:
-                fail_str = " o ".join(msg_bits)
-            else:
-                fail_str = "las condiciones técnicas actuales"
+    st.caption(
+        "Estos tickers pasaron calidad/valor básico pero no cumplen aún las "
+        "condiciones mínimas de momentum, volumen o ruptura. Se pueden vigilar "
+        "para ver si 'encienden' luego."
+    )
 
-            st.caption(
-                f"Estos tickers tenían métricas fundamentalmente decentes "
-                f"(quality/value) pero NO pasaron {fail_str}. "
-                f"Sirve para watchlist: si tecnican mejora, entran."
-            )
-        else:
-            st.info("No hay rechazados con datos básicos para mostrar.")
-    else:
-        st.info("Aún no hay 'rechazados técnicos' en memoria.")
+    # =========================
+    # 5. Nota final
+    # =========================
+    st.info(
+        "Resumen rápido:\n"
+        "- El % setups técnicos OK y el % ruptura/momentum OK funcionan como 'amplitud interna' del mercado.\n"
+        "- Si ambas amplitudes son altas Y estás en RISK ON ✅, el entorno está listo para tomar trades nuevos.\n"
+        "- Si están bajas o estás en RISK OFF ⚠️, reduces agresividad / tamaño de posición."
+    )
 
 # ====== TAB 5: QVM (growth-aware) ======
 with tab5:
