@@ -202,10 +202,8 @@ def _is_common_equity(row: pd.Series) -> bool:
 # ---------------------------------------------------------
 def build_quality_universe(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    df_raw tiene las columnas:
-    ['symbol','sector','pass_all','profit_hits','coverage_count',
-     'pass_profit','pass_issuance','pass_assets','pass_accruals',
-     'pass_ndebt','pass_coverage', ...además de métricas como asset_growth...]
+    Devuelve el pool de calidad fundamental listo para Tab2.
+    Hace casting defensivo de tipos para evitar que todo quede vacío.
     """
 
     if df_raw is None or df_raw.empty:
@@ -213,25 +211,48 @@ def build_quality_universe(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     df = df_raw.copy()
 
-    # 1. nos quedamos con tickers que pasan TODAS las banderas fundamentales
-    df = df[df["pass_all"] == True]
+    # --- casting defensivo ---
+    # pass_all a bool real
+    if "pass_all" in df.columns:
+        df["pass_all"] = (
+            df["pass_all"]
+            .astype(str)
+            .str.lower()
+            .map({"true": True, "false": False})
+            .fillna(df["pass_all"])  # si ya era bool, se mantiene
+        )
+        df["pass_all"] = df["pass_all"].astype(bool)
 
-    # 2. sacamos ETFs / bonos / índices / fondos
+    # coverage_count a número
+    if "coverage_count" in df.columns:
+        df["coverage_count"] = pd.to_numeric(df["coverage_count"], errors="coerce").fillna(0)
+
+    # profit_hits a número
+    if "profit_hits" in df.columns:
+        df["profit_hits"] = pd.to_numeric(df["profit_hits"], errors="coerce").fillna(0)
+
+    # --- filtro base 1: exigir pass_all ---
+    if "pass_all" in df.columns:
+        df = df[df["pass_all"] == True]
+
+    # --- filtro base 2: cobertura decente ---
+    if "coverage_count" in df.columns:
+        df = df[df["coverage_count"] >= 4]
+
+    # --- filtro base 3: sacar ETFs / bonos / índices ---
     df = df[df.apply(_is_common_equity, axis=1)]
 
-    # 3. opcional: filtrito mínimo de datos / cobertura
-    #    coverage_count >= 4 significa "tengo casi todos los checks con data real"
-    df = df[df["coverage_count"] >= 4]
+    # --- ordenar por calidad/robustez ---
+    sort_cols = [c for c in ["profit_hits", "coverage_count"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(
+            by=sort_cols,
+            ascending=[False] * len(sort_cols),
+        )
 
-    # 4. orden de "calidad prioritaria"
-    #    primero: más 'profit_hits' (más señales de calidad/rentabilidad)
-    #    después: mayor 'coverage_count'
-    df = df.sort_values(
-        by=["profit_hits", "coverage_count"],
-        ascending=[False, False],
-    ).reset_index(drop=True)
-
+    df = df.reset_index(drop=True)
     return df
+
 
 
 # ---------------------------------------------------------
