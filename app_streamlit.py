@@ -713,9 +713,7 @@ with tab3:
     uni_cur = st.session_state.get("uni", pd.DataFrame())
 
     if kept is None or kept.empty or "symbol" not in kept.columns:
-        st.warning(
-            "No hay símbolos aprobados por Guardrails. Ajusta la pestaña Guardrails."
-        )
+        st.warning("No hay símbolos aprobados por Guardrails. Ajusta la pestaña Guardrails.")
         st.stop()
 
     kept_syms = (
@@ -745,112 +743,50 @@ with tab3:
     # sliders VFQ locales a esta vista
     c1v, c2v, c3v = st.columns(3)
     with c1v:
-        min_quality = st.slider(
-            "Min Quality neut.", 0.0, 1.0, 0.3, 0.01
-        )
-        min_value = st.slider(
-            "Min Value neut.", 0.0, 1.0, 0.3, 0.01
-        )
-        max_ndebt = st.slider(
-            "Max NetDebt/EBITDA",
-            0.0,
-            5.0,
-            2.0,
-            0.1,
-        )
-    with c2v:
-        min_acc_pct = st.slider(
-            "Accruals limpios (% mínimo)",
-            0,
-            100,
-            30,
-            1,
-        )
-        min_hits_req = st.slider(
-            "Min hits (breakout hits)",
-            0,
-            5,
-            1,
-            1,
-        )
-        min_rvol20 = st.slider(
-            "Min RVOL20",
-            0.0,
-            5.0,
-            1.2,
-            0.05,
-        )
-    with c3v:
-        min_breakout = st.slider(
-            "Min BreakoutScore",
-            0,
-            100,
-            50,
-            1,
-        )
-        topN_prob = st.slider(
-            "Top N por prob_up",
-            5,
-            100,
-            30,
-            1,
-        )
+        min_quality = st.slider("Min Quality neut.", 0.0, 1.0, 0.3, 0.01)
+        min_value = st.slider("Min Value neut.", 0.0, 1.0, 0.3, 0.01)
+        max_ndebt = st.slider("Max NetDebt/EBITDA", 0.0, 5.0, 2.0, 0.1)
 
+    with c2v:
+        min_acc_pct = st.slider("Accruals limpios (% mínimo)", 0, 100, 30, 1)
+        min_hits_req = st.slider("Min hits (breakout hits)", 0, 5, 1, 1)
+        min_rvol20 = st.slider("Min RVOL20", 0.0, 5.0, 1.2, 0.05)
+
+    with c3v:
+        min_breakout = st.slider("Min BreakoutScore", 0, 100, 50, 1)
+        topN_prob = st.slider("Top N por prob_up", 5, 100, 30, 1)
+
+    # --------- filtros VFQ + técnico ----------
     mask = pd.Series(True, index=df_vfq_all.index, dtype=bool)
 
-    # quality / value floors
-    mask &= (
-        df_vfq_all["quality_adj_neut"].fillna(0)
-        >= float(min_quality)
-    )
-    mask &= (
-        df_vfq_all["value_adj_neut"].fillna(0)
-        >= float(min_value)
-    )
+    # floors de quality / value
+    mask &= (df_vfq_all["quality_adj_neut"].fillna(0) >= float(min_quality))
+    mask &= (df_vfq_all["value_adj_neut"].fillna(0)   >= float(min_value))
 
-    # breakout hits, breakoutscore, rvol
-    mask &= (
-        df_vfq_all["hits"].fillna(0)
-        >= int(min_hits_req)
-    )
-    mask &= (
-        df_vfq_all["BreakoutScore"].fillna(0)
-        >= float(min_breakout)
-    )
-    mask &= (
-        df_vfq_all["RVOL20"].fillna(0)
-        >= float(min_rvol20)
-    )
+    # técnica básica: hits, breakoutscore, rvol
+    mask &= (df_vfq_all["hits"].fillna(0)            >= int(min_hits_req))
+    mask &= (df_vfq_all["BreakoutScore"].fillna(0)   >= float(min_breakout))
+    mask &= (df_vfq_all["RVOL20"].fillna(0)          >= float(min_rvol20))
 
     # endeudamiento
     mask &= (
         df_vfq_all["netdebt_ebitda"].isna()
-        | (
-            df_vfq_all["netdebt_ebitda"]
-            <= float(max_ndebt)
-        )
+        | (df_vfq_all["netdebt_ebitda"] <= float(max_ndebt))
     )
 
     # accruals limpios (% alto es mejor en tu escala actual)
     mask &= (
         df_vfq_all["acc_pct"].isna()
-        | (
-            df_vfq_all["acc_pct"]
-            >= float(min_acc_pct)
-        )
+        | (df_vfq_all["acc_pct"] >= float(min_acc_pct))
     )
 
     df_keep_vfq = df_vfq_all.loc[mask].copy()
 
-    # ranking: si hay prob_up úsala, si no, BreakoutScore
+    # ranking final: prob_up si existe, si no BreakoutScore
     if df_keep_vfq["prob_up"].notna().any():
-        df_keep_vfq = df_keep_vfq.sort_values(
-            "prob_up", ascending=False
-        )
+        df_keep_vfq = df_keep_vfq.sort_values("prob_up", ascending=False)
     else:
-        df_keep_vfq = df_keep_vfq.sort_values(
-            "BreakoutScore", ascending=False
-        )
+        df_keep_vfq = df_keep_vfq.sort_values("BreakoutScore", ascending=False)
 
     vfq_top = df_keep_vfq.head(int(topN_prob)).copy()
 
@@ -877,13 +813,10 @@ with tab3:
         hide_index=True,
     )
 
-    st.markdown("### 🧹 Rechazados por VFQ")
-    rejected_syms = sorted(
-        set(kept_syms) - set(df_keep_vfq["symbol"])
-    )
-    rej_view = df_vfq_all[
-        df_vfq_all["symbol"].isin(rejected_syms)
-    ].copy()
+    # ------- rechazados (para watchlist técnica) -------
+    st.markdown("### 🧹 Rechazados por VFQ / técnica")
+    rejected_syms = sorted(set(kept_syms) - set(df_keep_vfq["symbol"]))
+    rej_view = df_vfq_all[df_vfq_all["symbol"].isin(rejected_syms)].copy()
 
     cols_rej_show = [
         "symbol",
@@ -898,9 +831,7 @@ with tab3:
         "RVOL20",
         "prob_up",
     ]
-    cols_rej_show = [
-        c for c in cols_rej_show if c in rej_view.columns
-    ]
+    cols_rej_show = [c for c in cols_rej_show if c in rej_view.columns]
 
     st.dataframe(
         rej_view[cols_rej_show],
@@ -908,31 +839,216 @@ with tab3:
         hide_index=True,
     )
 
-    # Guardar para tabs futuras
-    st.session_state["vfq_top"] = (
-        vfq_top[["symbol"]].drop_duplicates()
-    )
-    st.session_state["vfq_table"] = vfq_top.reset_index(
-        drop=True
-    )
+    # ------- guardar en session_state para las otras tabs -------
+    st.session_state["vfq_top"] = vfq_top[["symbol"]].drop_duplicates()
+    st.session_state["vfq_table"] = vfq_top.reset_index(drop=True)
     st.session_state["pipeline_ready"] = True
+
+    st.session_state["vfq_all"] = df_vfq_all.copy()        # todos los kept con métricas
+    st.session_state["vfq_keep"] = df_keep_vfq.copy()      # los que pasaron filtros VFQ+técnico
+    st.session_state["vfq_rejected"] = rej_view.copy()     # los que quedaron fuera
+    st.session_state["vfq_params"] = {
+        "min_hits": int(min_hits_req),
+        "min_rvol20": float(min_rvol20),
+        "min_breakout": float(min_breakout),
+        "min_acc_pct": float(min_acc_pct),
+        "max_ndebt": float(max_ndebt),
+    }
 
 
 # ====== TAB 4: SEÑALES (placeholder por ahora) ======
 with tab4:
     st.subheader("Señales técnicas / Breakout")
-    if not st.session_state.get("pipeline_ready", False):
-        st.info(
-            "Aún no hay pipeline listo. Corre Universo → Guardrails → VFQ."
+
+    # --- seguridad básica ---
+    uni_df = st.session_state.get("uni", pd.DataFrame())
+    vfq_all = st.session_state.get("vfq_all", pd.DataFrame())
+    vfq_keep = st.session_state.get("vfq_keep", pd.DataFrame())
+    vfq_rej = st.session_state.get("vfq_rejected", pd.DataFrame())
+    vfq_params = st.session_state.get("vfq_params", {})
+
+    if (
+        uni_df is None or uni_df.empty or
+        vfq_all is None or vfq_all.empty
+    ):
+        st.info("Todavía no hay datos técnicos. Corre Universo → Guardrails → VFQ primero.")
+        st.stop()
+
+    # =========================
+    # 1. RESUMEN DE MERCADO
+    # =========================
+    st.markdown("### 1. Estado de mercado")
+
+    # % de tickers sobre MA200 (si existe columna tipo 'ma200_up' o 'aboveMA200')
+    ma_col_candidates = [c for c in vfq_all.columns if c.lower() in ("ma200_up","above_ma200","aboveMA200".lower())]
+    if ma_col_candidates:
+        col_ma = ma_col_candidates[0]
+        pct_above_ma200 = (
+            vfq_all[col_ma]
+            .astype(float)
+            .gt(0)
+            .mean()
         )
     else:
-        st.write(
-            "Acá vas a calcular señal técnica final (tendencia, breakout, RS slope, etc.)."
-        )
-        st.caption(
-            "Todavía placeholder: falta amarrar apply_trend_filter(), enrich_with_breakout(), etc."
+        pct_above_ma200 = np.nan  # si tu DF todavía no expone esto
+
+    # % de tickers con momentum 12-1 positivo (columna tipo 'mom_12_1')
+    mom_col_candidates = [c for c in vfq_all.columns if c.lower() in ("mom_12_1","mom12_1","mom121")]
+    if mom_col_candidates:
+        col_mom = mom_col_candidates[0]
+        pct_mom_pos = vfq_all[col_mom].astype(float).gt(0).mean()
+    else:
+        pct_mom_pos = np.nan
+
+    # Risk-ON global del benchmark (si ya calculas market_regime_on)
+    # Nota: usamos el toggle de sidebar `risk_on`, pero idealmente deberías
+    # correr market_regime_on(bench, start, end) y guardarlo al vuelo.
+    try:
+        global_risk_on = bool(risk_on)
+    except NameError:
+        global_risk_on = False
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "% arriba de MA200",
+        f"{pct_above_ma200*100:.1f}%" if not np.isnan(pct_above_ma200) else "n/a"
+    )
+    c2.metric(
+        "% Mom 12–1 > 0",
+        f"{pct_mom_pos*100:.1f}%" if not np.isnan(pct_mom_pos) else "n/a"
+    )
+    c3.metric(
+        "Régimen mercado",
+        "RISK ON ✅" if global_risk_on else "RISK OFF ⚠️"
+    )
+
+    st.caption(
+        "Arriba de MA200 = tendencia sana. Mom 12–1 > 0 = desempeño relativo reciente fuerte. "
+        "RISK ON es tu switch/benchmark; si está OFF, las entradas son más frágiles."
+    )
+
+    st.markdown("---")
+
+    # =========================
+    # 2. CHECKLIST TÉCNICO POR TICKER
+    # =========================
+    st.markdown("### 2. Checklist técnico por ticker (diagnóstico individual)")
+
+    # armamos un dataframe técnico con columnas clave que ya calculas en VFQ
+    # Las que esperamos tener: symbol, sector, market_cap,
+    # hits, BreakoutScore, RVOL20, prob_up,
+    # ClosePos / cercanía high (a veces la llamas 'ClosePos' o 'p52' o 'ClosePctOf52W')
+    # Mom 12-1, MA200 up, etc., si existen.
+
+    tech_cols_pref = [
+        "symbol",
+        "sector",
+        "market_cap",
+        "hits",
+        "BreakoutScore",
+        "RVOL20",
+        "prob_up",
+        "ClosePos",        # cerca del high reciente
+        "p52",             # % del high de 52w, si está
+        "mom_12_1",
+        "ma200_up",
+        "aboveMA200",
+    ]
+    tech_cols = [c for c in tech_cols_pref if c in vfq_all.columns]
+
+    if not tech_cols:
+        st.warning("No encuentro columnas técnicas detalladas (hits / BreakoutScore / etc.).")
+    else:
+        # ordenamos por BreakoutScore o prob_up si está disponible
+        if "prob_up" in vfq_all.columns and vfq_all["prob_up"].notna().any():
+            tech_view = vfq_all.sort_values("prob_up", ascending=False)[tech_cols].copy()
+        elif "BreakoutScore" in vfq_all.columns:
+            tech_view = vfq_all.sort_values("BreakoutScore", ascending=False)[tech_cols].copy()
+        else:
+            tech_view = vfq_all[tech_cols].copy()
+
+        st.dataframe(
+            tech_view.head(50),
+            use_container_width=True,
+            hide_index=True,
         )
 
+    st.caption(
+        "hits = cuántas condiciones técnicas pasó (volumen, cercanía al high, etc.). "
+        "BreakoutScore = tu score compuesto de ruptura/momentum. "
+        "RVOL20 = interés de volumen reciente. "
+        "prob_up = probabilidad de subida modelada."
+    )
+
+    st.markdown("---")
+
+    # =========================
+    # 3. Buenos fundamentales que FALLARON técnica
+    # =========================
+    st.markdown("### 3. Buenos fundamentales que no pasan técnica mínima")
+
+    # idea: tomar tickers que tienen buena calidad/value pero que no quedaron en vfq_keep
+    # o sea: en vfq_all pero NO en vfq_keep. De esos, mostrar por qué fallaron.
+    if (
+        vfq_keep is not None and not vfq_keep.empty and
+        vfq_rej is not None
+    ):
+        # vfq_rej ya lo calculaste como tickers rechazados en VFQ tab
+        # ahí estaban columnas tipo:
+        #   quality_adj_neut, value_adj_neut,
+        #   netdebt_ebitda, acc_pct, BreakoutScore, hits, RVOL20, prob_up
+        rej_cols_pref = [
+            "symbol",
+            "sector",
+            "market_cap",
+            "quality_adj_neut",
+            "value_adj_neut",
+            "netdebt_ebitda",
+            "acc_pct",
+            "hits",
+            "BreakoutScore",
+            "RVOL20",
+            "prob_up",
+        ]
+        rej_cols = [c for c in rej_cols_pref if c in vfq_rej.columns]
+        if rej_cols:
+            # Orden: primero los que casi pasan (por ejemplo hits altos, Breakout medio)
+            rej_view = vfq_rej.sort_values(
+                ["hits","BreakoutScore","prob_up"],
+                ascending=[False, False, False],
+            )[rej_cols].copy()
+
+            st.dataframe(
+                rej_view.head(50),
+                use_container_width=True,
+                hide_index=True,
+            )
+            # Explicación dinámica, usando thresholds actuales
+            min_hits_req = vfq_params.get("min_hits", None)
+            brea_req = vfq_params.get("min_breakout", None)
+            rvol_req = vfq_params.get("min_rvol20", None)
+
+            msg_bits = []
+            if min_hits_req is not None:
+                msg_bits.append(f"hits < {min_hits_req}")
+            if brea_req is not None:
+                msg_bits.append(f"BreakoutScore < {brea_req}")
+            if rvol_req is not None:
+                msg_bits.append(f"RVOL20 < {rvol_req}")
+            if msg_bits:
+                fail_str = " o ".join(msg_bits)
+            else:
+                fail_str = "las condiciones técnicas actuales"
+
+            st.caption(
+                f"Estos tickers tenían métricas fundamentalmente decentes "
+                f"(quality/value) pero NO pasaron {fail_str}. "
+                f"Sirve para watchlist: si tecnican mejora, entran."
+            )
+        else:
+            st.info("No hay rechazados con datos básicos para mostrar.")
+    else:
+        st.info("Aún no hay 'rechazados técnicos' en memoria.")
 
 # ====== TAB 5: QVM (growth-aware) ======
 with tab5:
