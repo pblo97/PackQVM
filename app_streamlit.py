@@ -508,6 +508,8 @@ with tab3:
         kept = st.session_state.get("kept", pd.DataFrame())
         diag = st.session_state.get("guard_diag", pd.DataFrame())
         uni  = st.session_state.get("uni", pd.DataFrame())
+
+        # cache_tag viene de antes (universo / guardrails); si no existe, default
         cache_tag = st.session_state.get("cache_tag", "v1")
 
         # --- aseguramos que haya algo desde Guardrails ---
@@ -537,7 +539,7 @@ with tab3:
             df_vfq_raw = df_vfq_raw.reset_index().rename(columns={"index": "symbol"})
         df_vfq_raw["symbol"] = df_vfq_raw["symbol"].astype(str)
 
-        # --- 2. Merge con diag (deuda, accruals) ---
+        # --- 2. Merge con diag (deuda, accruals, pass_all...) ---
         cols_from_diag = [
             "symbol","netdebt_ebitda","accruals_ta",
             "profit_hits","coverage_count",
@@ -546,9 +548,13 @@ with tab3:
         ]
         diag_slim = pd.DataFrame()
         if isinstance(diag, pd.DataFrame) and "symbol" in diag.columns:
-            diag_slim = diag[[c for c in cols_from_diag if c in diag.columns]].drop_duplicates("symbol", keep="last")
+            diag_slim = (
+                diag[[c for c in cols_from_diag if c in diag.columns]]
+                .drop_duplicates("symbol", keep="last")
+                .copy()
+            )
 
-        # --- 3. Merge con uni (sector / market cap), tolerante a nombres raros ---
+        # --- 3. Merge con uni (sector / market cap), tolerante ---
         if isinstance(uni, pd.DataFrame) and "symbol" in uni.columns:
             mcap_candidates = ["market_cap","marketCap","marketCap_unified","mkt_cap","Market Cap"]
             mcap_col = None
@@ -569,6 +575,7 @@ with tab3:
                 .copy()
             )
 
+            # normalizamos nombres
             if mcap_col is not None and mcap_col != "market_cap":
                 uni_slim = uni_slim.rename(columns={mcap_col: "market_cap"})
             if "sector" not in uni_slim.columns:
@@ -605,24 +612,59 @@ with tab3:
                 df_vfq[col] = val
             df_vfq[col] = pd.to_numeric(df_vfq[col], errors="coerce")
 
-        # --- 6. UI de sliders VFQ ---
+        # --- 6. UI de sliders VFQ (con keys únicos para evitar colisiones) ---
         c1, c2, c3 = st.columns(3)
         with c1:
-            min_quality = st.slider("Min Quality neut.", 0.0, 1.0, 0.0, 0.01)
-            min_value   = st.slider("Min Value neut.",   0.0, 1.0, 0.0, 0.01)
-            max_ndebt   = st.slider("Max NetDebt/EBITDA", 0.0, 5.0, 1.5, 0.1)
+            min_quality = st.slider(
+                "Min Quality neut.",
+                0.0, 1.0, 0.0, 0.01,
+                key="vfq_min_quality"
+            )
+            min_value   = st.slider(
+                "Min Value neut.",
+                0.0, 1.0, 0.0, 0.01,
+                key="vfq_min_value"
+            )
+            max_ndebt   = st.slider(
+                "Max NetDebt/EBITDA",
+                0.0, 5.0, 1.5, 0.1,
+                key="vfq_max_ndebt"
+            )
         with c2:
-            min_acc_pct = st.slider("Accruals (NOA) percentil mínimo", 0, 100, 30, 1)
-            min_hits    = st.slider("Min hits", 0, 5, 2, 1)
-            min_rvol20  = st.slider("Min RVOL20", 0.0, 5.0, 1.5, 0.05)
+            min_acc_pct = st.slider(
+                "Accruals (NOA) percentil mínimo",
+                0, 100, 30, 1,
+                key="vfq_min_acc_pct"
+            )
+            min_hits    = st.slider(
+                "Min hits",
+                0, 5, 2, 1,
+                key="vfq_min_hits"
+            )
+            min_rvol20  = st.slider(
+                "Min RVOL20",
+                0.0, 5.0, 1.5, 0.05,
+                key="vfq_min_rvol20"
+            )
         with c3:
-            min_breakout = st.slider("Min BreakoutScore", 0, 100, 60, 1)
-            beta_prob    = st.slider("β prob_up (logit)", 0.0, 10.0, 6.0, 0.1)
-            topN_prob    = st.slider("Top N por prob_up", 5, 100, 30, 1)
+            min_breakout = st.slider(
+                "Min BreakoutScore",
+                0, 100, 60, 1,
+                key="vfq_min_breakout"
+            )
+            beta_prob    = st.slider(
+                "β prob_up (logit)",
+                0.0, 10.0, 6.0, 0.1,
+                key="vfq_beta_prob"
+            )
+            topN_prob    = st.slider(
+                "Top N por prob_up",
+                5, 100, 30, 1,
+                key="vfq_topN_prob"
+            )
 
         # --- 7. ¿TENEMOS SCORES REALES O ESTÁ TODO EN CERO? ---
         def _has_signal_data(series: pd.Series) -> bool:
-            # True si hay por lo menos un valor no nulo y distinto de 0
             s = pd.to_numeric(series, errors="coerce")
             return bool(s.notna().any() and (s.fillna(0).abs().sum() > 0))
 
@@ -635,7 +677,7 @@ with tab3:
             _has_signal_data(df_vfq["prob_up"])
         )
 
-        # --- 8. Construimos la máscara SOLO si realmente hay datos útiles ---
+        # --- 8. Filtro VFQ si hay datos reales; si no, pasa todo kept ---
         if have_real_scores:
             mask = pd.Series(True, index=df_vfq.index, dtype=bool)
 
@@ -645,13 +687,13 @@ with tab3:
             mask &= (df_vfq["BreakoutScore"].fillna(0) >= float(min_breakout))
             mask &= (df_vfq["RVOL20"].fillna(0) >= float(min_rvol20))
 
-            # deuda (permitimos NaN)
+            # deuda (NaN no castiga)
             mask &= (
                 df_vfq["netdebt_ebitda"].isna() |
                 (df_vfq["netdebt_ebitda"] <= float(max_ndebt))
             )
 
-            # accruals / NOA (si acc_pct es tipo "percentil limpio", 100 mejor)
+            # accruals / NOA (acc_pct alto = sano)
             mask &= (
                 df_vfq["acc_pct"].isna() |
                 (df_vfq["acc_pct"] >= float(min_acc_pct))
@@ -659,7 +701,7 @@ with tab3:
 
             df_keep_vfq = df_vfq.loc[mask].copy()
         else:
-            # NO TENEMOS MÉTRICAS VFQ AÚN → no filtres más, sólo pasa kept
+            # sin métricas VFQ reales → no filtres más allá de guardrails
             df_keep_vfq = df_vfq.copy()
 
         # --- 9. Ranking para topN ---
@@ -668,7 +710,6 @@ with tab3:
         elif "BreakoutScore" in df_keep_vfq.columns and _has_signal_data(df_keep_vfq["BreakoutScore"]):
             df_keep_vfq = df_keep_vfq.sort_values("BreakoutScore", ascending=False)
         else:
-            # fallback estable: deja orden alfabético de símbolo
             df_keep_vfq = df_keep_vfq.sort_values("symbol")
 
         vfq_top = df_keep_vfq.head(int(topN_prob)).copy()
@@ -686,7 +727,6 @@ with tab3:
         )
 
         st.markdown("### 🧹 Rechazados por VFQ")
-        # lo que estaba en kept_syms pero NO quedó en df_keep_vfq
         rejected_syms = sorted(set(kept_syms) - set(df_keep_vfq["symbol"]))
         rej_view = df_vfq[df_vfq["symbol"].isin(rejected_syms)].copy()
 
@@ -701,10 +741,26 @@ with tab3:
             hide_index=True
         )
 
-        # --- 11. Guardar para tab4 (Señales) ---
-        # vfq_top es la watchlist real que queremos testear técnicamente.
+        # --- 11. Guardar TODO lo que tab4 necesita ---
+        # símbolos priorizados
         st.session_state["vfq_top"]   = vfq_top[["symbol"]].drop_duplicates()
+        # tabla con fundamentales ya ordenada
         st.session_state["vfq_table"] = vfq_top.reset_index(drop=True)
+
+        # guardo parámetros técnicos/riesgo/fechas actuales en sesión para tab4:
+        st.session_state["bench_local"]       = bench
+        st.session_state["use_and_local"]     = use_and
+        st.session_state["rvol_th_local"]     = rvol_th
+        st.session_state["closepos_th_local"] = closepos_th
+        st.session_state["p52_th_local"]      = p52_th
+        st.session_state["updown_vol_local"]  = updown_vol_th
+        st.session_state["min_hits_local"]    = min_hits
+        st.session_state["use_rs_slope_loc"]  = use_rs_slope
+        st.session_state["risk_on_local"]     = risk_on
+        st.session_state["start_local"]       = str(start)
+        st.session_state["end_local"]         = str(end)
+        st.session_state["cache_tag_local"]   = cache_tag
+
         st.session_state["pipeline_ready"] = True
 
     except Exception as e:
@@ -730,26 +786,26 @@ with tab4:
             .dropna().astype(str).unique().tolist()
         )
 
-        # leemos parámetros técnicos directamente de la sidebar actual,
-        # SIN renombrarlos:
-        bench_local      = bench
-        use_and_local    = use_and
-        rvol_th_local    = rvol_th
-        closepos_th_local= closepos_th
-        p52_th_local     = p52_th
-        updown_vol_local = updown_vol_th
-        min_hits_local   = min_hits
-        use_rs_slope_loc = use_rs_slope
-        risk_on_local    = risk_on
-        start_local      = str(start)
-        end_local        = str(end)
+        # parámetros guardados en tab3
+        bench_local        = st.session_state.get("bench_local", "SPY")
+        use_and_local      = st.session_state.get("use_and_local", True)
+        rvol_th_local      = float(st.session_state.get("rvol_th_local", 1.5))
+        closepos_th_local  = float(st.session_state.get("closepos_th_local", 0.8))
+        p52_th_local       = float(st.session_state.get("p52_th_local", 0.97))
+        updown_vol_local   = float(st.session_state.get("updown_vol_local", 1.2))
+        min_hits_local     = int(st.session_state.get("min_hits_local", 2))
+        use_rs_slope_loc   = bool(st.session_state.get("use_rs_slope_loc", True))
+        risk_on_local      = bool(st.session_state.get("risk_on_local", True))
+        start_local        = st.session_state.get("start_local", "2022-01-01")
+        end_local          = st.session_state.get("end_local", None)
+        cache_tag_local    = st.session_state.get("cache_tag_local", "v1")
 
         with st.status("Cargando precios y calculando señales…", expanded=False) as status:
             panel = _cached_load_prices_panel(
                 syms,
                 start=start_local,
                 end=end_local,
-                cache_key=cache_tag,
+                cache_key=cache_tag_local,
             )
 
             trend_df = apply_trend_filter(
@@ -801,7 +857,7 @@ with tab4:
         # === MERGE FINAL PARA RECOMENDACIÓN ===
         final_df = vfq_table.merge(sig_df, on="symbol", how="left")
 
-        # esto ya es el output maestro
+        # esto es el output maestro completo
         st.session_state["final_df"] = final_df
 
     except Exception as e:
@@ -813,6 +869,7 @@ with tab4:
         st.info("Sin resultados combinados.")
     else:
         st.markdown("### ✅ Lista final (fundamental + técnico)")
+
         cols_candidate = [c for c in [
             "symbol","sector","market_cap",
             "quality_adj_neut","value_adj_neut","acc_pct",
@@ -821,18 +878,20 @@ with tab4:
             "ClosePos","P52","UDVol20","ATR_pct","rs_ma20_slope"
         ] if c in final_df.columns]
 
-        # ranking heurístico simple:
-        #   1. preferir signal_breakout True
-        #   2. luego prob_up alto
         ranked = final_df.copy()
+
+        # Score heurístico simple:
+        # 1. breakout activo pesa mucho
+        # 2. luego prob_up o BreakoutScore
         if "signal_breakout" in ranked.columns:
             ranked["score_rank"] = ranked["signal_breakout"].fillna(False).astype(int)
         else:
             ranked["score_rank"] = 0
+
         if "prob_up" in ranked.columns:
-            ranked["score_rank"] = ranked["score_rank"]*1000 + ranked["prob_up"].fillna(0)*100
+            ranked["score_rank"] = ranked["score_rank"] * 1000 + ranked["prob_up"].fillna(0) * 100
         elif "BreakoutScore" in ranked.columns:
-            ranked["score_rank"] = ranked["score_rank"]*1000 + ranked["BreakoutScore"].fillna(0)
+            ranked["score_rank"] = ranked["score_rank"] * 1000 + ranked["BreakoutScore"].fillna(0)
 
         ranked = ranked.sort_values("score_rank", ascending=False)
 
@@ -842,7 +901,11 @@ with tab4:
             hide_index=True
         )
 
-        st.caption("Interpretación rápida: arriba = mejor mezcla de fundamentales, flujo y señal técnica lista.")
+        st.caption(
+            "Arriba = mejor mezcla de fundamentales + flujo (VFQ) + señal técnica lista.\n"
+            "signal_breakout=True y risk_on=True es entrada más agresiva. "
+            "Si risk_on=False, el mercado está feo y la entrada se frena."
+        )
 
 
 # ====== Paso 5: QVM (growth-aware) ======
