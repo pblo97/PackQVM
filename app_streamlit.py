@@ -200,10 +200,15 @@ def _is_common_equity(row: pd.Series) -> bool:
 # ---------------------------------------------------------
 # 1. UNIVERSO DE CALIDAD (Tab2)
 # ---------------------------------------------------------
-def build_quality_universe(df_raw: pd.DataFrame) -> pd.DataFrame:
+def build_quality_universe_relajado(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Devuelve el pool de calidad fundamental listo para Tab2.
-    Hace casting defensivo de tipos para evitar que todo quede vacío.
+    Versión menos estricta:
+    - pasa rentabilidad ("pass_profit")
+    - no está diluyendo feo ("pass_issuance")
+    - no huele raro contablemente ("pass_accruals")
+    - deuda razonable ("pass_ndebt")
+    - tiene datos suficientes ("coverage_count" >= 4)
+    - no es ETF/fondo
     """
 
     if df_raw is None or df_raw.empty:
@@ -211,48 +216,40 @@ def build_quality_universe(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     df = df_raw.copy()
 
-    # --- casting defensivo ---
-    # pass_all a bool real
-    if "pass_all" in df.columns:
-        df["pass_all"] = (
-            df["pass_all"]
-            .astype(str)
-            .str.lower()
-            .map({"true": True, "false": False})
-            .fillna(df["pass_all"])  # si ya era bool, se mantiene
-        )
-        df["pass_all"] = df["pass_all"].astype(bool)
+    # casting defensivo booleans
+    for col in ["pass_profit", "pass_issuance", "pass_accruals", "pass_ndebt", "pass_coverage"]:
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.lower()
+                .map({"true": True, "false": False})
+                .fillna(df[col])
+            ).astype(bool)
 
-    # coverage_count a número
     if "coverage_count" in df.columns:
         df["coverage_count"] = pd.to_numeric(df["coverage_count"], errors="coerce").fillna(0)
 
-    # profit_hits a número
-    if "profit_hits" in df.columns:
-        df["profit_hits"] = pd.to_numeric(df["profit_hits"], errors="coerce").fillna(0)
+    # filtro fundamental core
+    must_have = ["pass_profit", "pass_issuance", "pass_accruals", "pass_ndebt"]
+    for col in must_have:
+        if col in df.columns:
+            df = df[df[col] == True]
 
-    # --- filtro base 1: exigir pass_all ---
-    if "pass_all" in df.columns:
-        df = df[df["pass_all"] == True]
-
-    # --- filtro base 2: cobertura decente ---
+    # cobertura de datos
     if "coverage_count" in df.columns:
         df = df[df["coverage_count"] >= 4]
 
-    # --- filtro base 3: sacar ETFs / bonos / índices ---
+    # fuera ETFs / bonos
     df = df[df.apply(_is_common_equity, axis=1)]
 
-    # --- ordenar por calidad/robustez ---
+    # ordenar por prioridad básica
     sort_cols = [c for c in ["profit_hits", "coverage_count"] if c in df.columns]
     if sort_cols:
-        df = df.sort_values(
-            by=sort_cols,
-            ascending=[False] * len(sort_cols),
-        )
+        df = df.sort_values(by=sort_cols, ascending=[False]*len(sort_cols))
 
     df = df.reset_index(drop=True)
     return df
-
 
 
 # ---------------------------------------------------------
@@ -542,7 +539,7 @@ with tab2:
     st.subheader("Pool de calidad estructural (fundamentals limpios)")
 
     universe_df: pd.DataFrame = st.session_state.get("universe_df", pd.DataFrame())
-    quality_df = build_quality_universe(universe_df)
+    quality_df = build_quality_universe_relajado(universe_df)
 
     st.write(
         "Acciones que pasan TODAS las banderas fundamentales "
