@@ -189,7 +189,7 @@ def run_fmp_screener(limit: int = 300,
                      roe_min: float = 10,
                      volume_min: int = 500_000,
                      isEtf: bool = False,
-                     isFund: bool= False,
+                     
                      isActivelyTrading: bool = True,
                      
                      mcap_min: float = 1e7,
