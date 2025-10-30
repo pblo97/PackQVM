@@ -185,30 +185,46 @@ def _merge_sector_industry(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFr
 # ============================ SCREENER (UNIVERSO) ============================
 
 def run_fmp_screener(limit: int = 300,
-                     eps_growth_min: float = 15,
-                     roe_min: float = 10,
-                     volume_min: int = 500_000,
-                     isEtf: bool = False,
-                     
-                     
-                     
-                     mcap_min: float = 1e7,
-                     *,
-                     fetch_profiles: bool = True,
-                     cache_key: str | None = None,
-                     force: bool = False) -> pd.DataFrame:
+            eps_growth_min: float = 15,
+            roe_min: float = 10,
+            volume_min: int = 500_000,
+            mcap_min: float = 1e9,
+            *,
+            isEtf: bool = False,
+            isFund: bool = False,
+            isActivelyTrading: bool = True,
+            includeAllShareClasses: bool = False,
+            price_min: float = 5.0,
+            exchange: str | None = None,  # "NYSE", "NASDAQ", etc. o None = no forzar
+            fetch_profiles: bool = True,
+            cache_key: str | None = None,
+            force: bool = False,) -> pd.DataFrame:
     """
     Descarga universo base desde /stock-screener de FMP y (opcionalmente) enriquece con /profile/{sym}.
     Si los perfiles fallan o llegan vacíos, hace fallback a fundamentals para sector/industry.
     """
     url = "https://financialmodelingprep.com/api/v3/stock-screener"
     params = {
+        # --- filtros fundamentales base ---
         "epsGrowthMoreThan": eps_growth_min,
         "returnOnEquityMoreThan": roe_min,
+
+        # --- liquidez / tamaño ---
         "volumeMoreThan": int(volume_min),
         "marketCapMoreThan": mcap_min,
+        "priceMoreThan": price_min,
+
+        # --- calidad del ticker ---
+        "isEtf": str(isEtf).lower(),  # "false"
+        "isFund": str(isFund).lower(),  # "false"
+        "isActivelyTrading": str(isActivelyTrading).lower(),  # "true"
+        "includeAllShareClasses": str(includeAllShareClasses).lower(),  # "false"
+
+        # --- universo general ---
         "limit": int(limit),
     }
+    if exchange is not None:
+        params["exchange"] = exchange
     base = _http_get(url, params=params)
     df = pd.DataFrame(base)
     if df.empty or "symbol" not in df.columns:
@@ -268,6 +284,25 @@ def run_fmp_screener(limit: int = 300,
             df[c] = ""
         df[c] = df[c].fillna("").astype(str)
 
+    bad_words = (
+        "ETF", "Fund", "Trust", "Treasury", "Bond", "Preferred",
+        "ETN", "ETP", "SPDR", "iShares", "Vanguard"
+    )
+
+    def _looks_like_fund(name: str) -> bool:
+        if not isinstance(name, str):
+            return False
+        up = name.upper()
+        return any(w in up for w in bad_words)
+
+    if "companyName" in df.columns:
+        mask_bad = df["companyName"].apply(_looks_like_fund)
+        df = df.loc[~mask_bad].copy()
+
+    # eliminar tickers que son claramente renta fija / factor ETF que ya cachamos
+    blacklist = {"VTIP", "SPTL", "TLT", "IEF", "SCHV", "AGG", "LQD"}
+    df = df.loc[~df["symbol"].isin(blacklist)].copy()
+
     # ---------- Fallback: si perfiles fallan o quedaron vacíos, intenta fundamentals ----------
     needs_fallback = (df["sector"].eq("").mean() > 0.8)  # >80% vacío
     if needs_fallback:
@@ -301,13 +336,26 @@ def run_fmp_screener(limit: int = 300,
         df["ipoDate"] = pd.to_datetime(df["ipoDate"], errors="coerce")
 
     df = df.sort_values("marketCap", ascending=False).drop_duplicates(subset=["symbol"], keep="first")
+    if "market_cap" not in df.columns:
+        df["market_cap"] = pd.to_numeric(df.get("marketCap"), errors="coerce")
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    if "price" in df.columns:
+        df["price"] = pd.to_numeric(df["price"], errors="coerce")
 
+    df["sector"] = df["sector"].replace("", "Unknown").fillna("Unknown").astype(str)
+    df["industry"] = df["industry"].fillna("").astype(str)
+
+    # ordenar grande→chico para que el límite top-N tienda a ser cosas relevantes
+    df = df.sort_values("market_cap", ascending=False).drop_duplicates(subset=["symbol"], keep="first")
     keep = [
         "symbol", "sector", "industry", "exchange", "type", "country",
-        "marketCap", "price", "beta", "isEtf", "isFund", "isAdr", "ipoDate", "volume"
+        "market_cap", "price", "beta", "isEtf", "isFund", "isAdr",
+        "ipoDate", "volume"
     ]
     keep = [c for c in keep if c in df.columns]
-    return df[keep].copy()
+    return df[keep].copy().reset_index(drop=True)
+
 
 def filter_universe(df: pd.DataFrame,
                     min_mcap: float = 5e8,
