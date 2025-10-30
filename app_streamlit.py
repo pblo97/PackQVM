@@ -393,142 +393,74 @@ with tab1:
 with tab2:
     st.subheader("Guardrails")
 
-    # ---------- 0. Obtener universo ----------
     uni = st.session_state.get("uni", pd.DataFrame())
     if uni is None or uni.empty or "symbol" not in uni.columns:
         st.info("Primero corre Universo (tab1).")
         st.stop()
 
-    syms = (
-        uni["symbol"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
+    syms = uni["symbol"].dropna().astype(str).unique().tolist()
     if not syms:
         st.info("No hay símbolos en el universo.")
         st.stop()
 
-    # ---------- 1. Traer fundamentales / guardrails base ----------
+    # Recalcular todo acá (fuente única)
     df_all = build_factor_frame(syms)
 
-    # Traer sector / market_cap desde el universo (preferimos tu universo como verdad)
+    # injertar sector / market_cap desde universo
+    base_cols = ["symbol","sector","market_cap"]
     df_all = (
-        df_all
-        .drop(columns=["sector", "market_cap"], errors="ignore")
-        .merge(
-            uni[["symbol", "sector", "market_cap"]],
-            on="symbol",
-            how="left"
-        )
+        df_all.drop(columns=["sector","market_cap"], errors="ignore")
+              .merge(
+                  uni[[c for c in base_cols if c in uni.columns]],
+                  on="symbol",
+                  how="left"
+              )
     )
 
-    # ---------- 2. Detectar megacaps ----------
-    # market_cap puede venir como string → hacemos coerción numérica
-    mcap_num = pd.to_numeric(df_all.get("market_cap"), errors="coerce")
-    is_mega = mcap_num >= 2e11  # ~200B USD
-
-    # ---------- 3. Construir pass_relaxed ----------
-    # pass_all normalmente ya viene de build_factor_frame
-    # pero vamos a permitir "fallar 1 check" si es megacap
-    checks = [
-        "pass_profit",
-        "pass_issuance",
-        "pass_assets",
-        "pass_accruals",
-        "pass_ndebt",
-        "pass_coverage",
-    ]
-
-    def _relaxed_ok(row) -> bool:
-        """
-        True si:
-        - pasa todo (cero fallos), o
-        - es megacap y sólo falla 1 check blando
-        """
-        # lista booleana de cada check. Si falta la col asumimos True (no bloquea).
-        flags = [bool(row.get(col, True)) for col in checks]
-        bads = sum(1 for ok in flags if not ok)
-
-        if bads == 0:
-            return True
-
-        # permitir un (1) fallo si es megacap
-        sym = row.get("symbol")
-        if bads == 1 and sym in df_all.loc[is_mega.fillna(False), "symbol"].values:
-            return True
-
-        return False
-
-    df_all["pass_relaxed"] = df_all.apply(_relaxed_ok, axis=1)
-
-    # ---------- 4. Máscaras estricto / relajado ----------
-    strict_mask   = df_all.get("pass_all", False) == True
-    relaxed_mask  = strict_mask | df_all["pass_relaxed"]
-
-    # kept_raw ahora incluye los relajados
+    # mascara estricta
+    strict_mask = df_all.get("pass_all", False) == True
     kept_raw = (
-        df_all
-        .loc[relaxed_mask, ["symbol"]]
-        .drop_duplicates()
-        .reset_index(drop=True)
+        df_all.loc[strict_mask, ["symbol"]]
+              .drop_duplicates()
+              .reset_index(drop=True)
     )
 
-    # guardamos para las pestañas siguientes
-    st.session_state["kept"] = kept_raw.copy()
+    # guarda para otros tabs si quieres mantener ese flujo
+    st.session_state["kept"] = kept_raw
     st.session_state["guard_diag"] = df_all.copy()
 
-    # ---------- 5. Métricas resumen ----------
-    total    = len(df_all)
-    pasan_e  = int(strict_mask.sum())        # pasan estricto (pass_all)
-    pasan_r  = int(relaxed_mask.sum())       # pasan con relajado
-    rechaz   = total - pasan_r               # rechazados después de relajado
+    total = len(df_all)
+    pasan = int(strict_mask.sum())
+    rechaz = total - pasan
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Pasan guardrails estrictos (pass_all)", f"{pasan_e}")
-    c2.metric("Candidatos 'saludables' (relajado)",   f"{pasan_r}")
-    c3.metric("Rechazados totales",                   f"{rechaz}")
+    c1.metric("Pasan guardrails estrictos", f"{pasan}")
+    # 'relajado' por ahora lo igualo a pasan; luego lo puedes tunear
+    c2.metric("Candidatos saludables (relajado)", f"{pasan}")
+    c3.metric("Rechazados totales", f"{rechaz}")
 
-    # ---------- 6. Tabla de diagnóstico ----------
+    cols_show = [
+        "symbol","sector","pass_all",
+        "profit_hits","coverage_count",
+        "asset_growth","accruals_ta","netdebt_ebitda",
+        "pass_profit","pass_issuance","pass_assets",
+        "pass_accruals","pass_ndebt","pass_coverage",
+    ]
+    cols_show = [c for c in cols_show if c in df_all.columns]
+
     with st.expander(
-        f"Guardrails (estricto vs relajado): {pasan_e} estricto / {pasan_r} relajado / {total} total",
+        f"Detalle guardrails (estricto): {pasan} / {total}",
         expanded=True
     ):
-        cols_show = [
-            "symbol",
-            "sector",
-            "market_cap",
-            "pass_all",
-            "pass_relaxed",
-            "profit_hits",
-            "coverage_count",
-            "asset_growth",
-            "accruals_ta",
-            "netdebt_ebitda",
-            "pass_profit",
-            "pass_issuance",
-            "pass_assets",
-            "pass_accruals",
-            "pass_ndebt",
-            "pass_coverage",
-        ]
-        cols_show = [c for c in cols_show if c in df_all.columns]
-
         st.dataframe(
-            df_all[cols_show]
-                .sort_values(
-                    ["pass_all", "pass_relaxed", "symbol"],
-                    ascending=[False, False, True]
-                ),
+            df_all[cols_show].sort_values("symbol"),
             use_container_width=True,
             hide_index=True
         )
 
     st.caption(
-        "pass_all = pasó TODAS las barreras simultáneamente.\n"
-        "pass_relaxed = megacaps (>~200B mcap) pueden fallar 1 check blando y aún así entrar.\n"
-        "coverage_count = cuánta info fundamental tenemos disponible para ese ticker."
+        "pass_all = pasó TODAS las barreras simultáneamente. "
+        "coverage_count = cuánta info fundamental tenemos disponible."
     )
 
 # ====== Paso 3: VFQ ======
