@@ -1029,7 +1029,30 @@ def _num_or_nan(d: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(d[col], errors="coerce")
 
 # fundamentals.py
+def _safe_series(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    """
+    Devuelve una Serie FLOAT con la PRIMERA columna disponible de 'candidates'.
+    MUY IMPORTANTE: preserva NaN (NO rellena con 0). Si ninguna existe, todo NaN.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series(dtype=float)
 
+    s = pd.Series(np.nan, index=df.index, dtype=float)
+    for c in candidates:
+        if c in df.columns:
+            vals = pd.to_numeric(df[c], errors="coerce")
+            # Sólo escribe donde s es NaN (primera columna válida gana)
+            s = s.where(s.notna(), vals)
+    return s
+
+def _positive_hits(ebit: pd.Series, cfo: pd.Series, fcf: pd.Series) -> pd.Series:
+    """
+    Cuenta cuántos de {EBIT, CFO, FCF} son > 0. NaN NO suma (equivale a 0 en la cuenta).
+    """
+    e = pd.to_numeric(ebit, errors="coerce")
+    c = pd.to_numeric(cfo,  errors="coerce")
+    f = pd.to_numeric(fcf,  errors="coerce")
+    return (e.gt(0).astype(int) + c.gt(0).astype(int) + f.gt(0).astype(int))
 
 def apply_quality_guardrails(
     df_guard: pd.DataFrame,
