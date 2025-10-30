@@ -31,6 +31,9 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1re
 """, unsafe_allow_html=True)
 
 # ============== IMPORTS DE TU PIPELINE ==============
+
+from fundamentals import apply_quality_guardrails as _apply_quality_guardrails
+from fundamentals import download_guardrails_batch as _download_guardrails_batch
 from scoring import (
     blend_breakout_qvm, build_momentum_proxy
 )
@@ -339,8 +342,88 @@ with tab2:
                 except Exception:
                     # fallback directo sin cache wrapper
                     from fundamentals import download_guardrails_batch
-                    df_guard = download_guardrails_batch(syms, cache_key=cache_tag, force=False)
+                    df_guard = _download_guardrails_batch(syms, cache_key=cache_tag, force=False)
 
+                    kept, diag = _apply_quality_guardrails(
+                        df_guard=df_guard,
+                        require_profit_floor=bool(profit_hits > 0),
+                        profit_floor_min_hits=profit_hits,
+                        max_net_issuance=max_issuance,
+                        max_asset_growth=max_assets,
+                        max_accruals_ta=max_accr,
+                        max_netdebt_ebitda=max_ndeb,
+                        min_vfq_coverage=min_cov_guard
+                    )
+
+                needed = {"pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage","pass_all","profit_hits"}
+                if not needed.issubset(set(diag.columns)):
+                    # Vincula por símbolo para poder leer las columnas crudas desde df_guard
+                    base = df_guard.copy()
+                    if "symbol" not in base.columns:
+                        # intenta inferir símbolo desde índice
+                        base["symbol"] = base.index.astype(str)
+                    work = diag.merge(base, on="symbol", how="left", suffixes=("", "_raw"))
+
+                    # helpers locales (mismos nombres suaves que en fundamentals)
+                    def _pick(*cols):
+                        for c in cols:
+                            if c in work.columns: 
+                                s = pd.to_numeric(work[c], errors="coerce")
+                                if s.notna().any():
+                                    return s
+                        return pd.Series(np.nan, index=work.index, dtype=float)
+
+                    ebit = _pick("ebit_ttm","EBITDAttm","ebit","operatingIncomeTTM")
+                    cfo  = _pick("operatingCashFlowTTM","cashFlowFromOperationsTTM","cfo_ttm","netCashProvidedByOperatingActivitiesTTM")
+                    fcf  = _pick("freeCashFlowTTM","fcf_ttm")
+
+                    net_issuance = _pick("net_issuance","sharesNetIssuanceRate","shares_change_1y")
+                    asset_growth = _pick("asset_growth","totalAssetsGrowthYoY")
+                    accruals_ta  = _pick("accruals_ta","accrualsToAssets")
+                    nd_ebitda    = _pick("netdebt_ebitda","netDebtToEBITDA","netDebtEbitda")
+
+                    coverage = pd.to_numeric(work.get("coverage_count", np.nan), errors="coerce").fillna(0).astype(int)
+
+                    profit_hits_series = (
+                        (pd.to_numeric(ebit, errors="coerce") > 0).astype(int)
+                        + (pd.to_numeric(cfo, errors="coerce")  > 0).astype(int)
+                        + (pd.to_numeric(fcf, errors="coerce")  > 0).astype(int)
+                    )
+
+                    work["profit_hits"]   = profit_hits_series
+                    work["pass_profit"]   = (profit_hits_series >= int(max(0, profit_hits))) if profit_hits > 0 else True
+                    work["pass_issuance"] = (net_issuance <= max_issuance) | net_issuance.isna()
+                    work["pass_assets"]   = (asset_growth <= max_assets)   | asset_growth.isna()
+                    work["pass_accruals"] = (accruals_ta.abs() <= max_accr) | accruals_ta.isna()
+                    work["pass_ndebt"]    = (nd_ebitda <= max_ndeb)        | nd_ebitda.isna()
+                    work["pass_coverage"] = (coverage >= int(max(0, min_cov_guard))) | pd.Series(False, index=work.index)  # coverage ya es int
+
+                    for c in ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]:
+                        work[c] = work[c].astype(bool)
+
+                    checks = ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]
+                    work["pass_all"] = work[checks].all(axis=1)
+
+                    # reason (solo en fallas)
+                    def _mk_reason(row):
+                        r = []
+                        if not row["pass_profit"]:   r.append("profit_floor")
+                        if not row["pass_issuance"]: r.append("net_issuance")
+                        if not row["pass_assets"]:   r.append("asset_growth")
+                        if not row["pass_accruals"]: r.append("accruals_ta")
+                        if not row["pass_ndebt"]:    r.append("netdebt_ebitda")
+                        if not row["pass_coverage"]: r.append("vfq_coverage")
+                        return ",".join(r)
+                    work["reason"] = work.apply(_mk_reason, axis=1)
+
+                    # deja 'diag' listo para mostrar
+                    keep_cols = ["symbol","profit_hits","coverage_count","net_issuance","asset_growth","accruals_ta","netdebt_ebitda",
+                                "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage","pass_all","reason"]
+                    diag = work[[c for c in keep_cols if c in work.columns]].copy()
+                    st.session_state["guard_diag"] = diag
+                    # también corrige kept
+                    kept = diag.loc[diag["pass_all"], ["symbol"]].copy()
+                    st.session_state["kept"] = kept
                 # Calcula cobertura VFQ si aún no existe (métricas que luego usa VFQ)
                 value_metrics   = st.session_state.get("value_metrics",   ["inv_ev_ebitda","fcf_yield"])
                 quality_metrics = st.session_state.get("quality_metrics", ["gross_profitability","roic"])
