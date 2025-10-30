@@ -605,49 +605,52 @@ with tab3:
     st.subheader("VFQ (Value / Quality / Flow)")
 
     try:
-        # ====== 0. TRAER ESTADO COMPARTIDO ======
-        uni        = st.session_state.get("uni", pd.DataFrame())
-        diag       = st.session_state.get("guard_diag", pd.DataFrame())
-        kept_strict= st.session_state.get("kept", pd.DataFrame())            # los que pasaron pass_all
-        healthy    = st.session_state.get("healthy_syms", [])               # fallback relajado del tab2
-        cache_tag  = st.session_state.get("cache_tag", "v1")
+        # =========================
+        # 0. Traer de sesión lo que dejó Tab2
+        # =========================
+        kept = st.session_state.get("kept", pd.DataFrame())
+        diag = st.session_state.get("guard_diag", pd.DataFrame())
+        uni  = st.session_state.get("uni", pd.DataFrame())
+        cache_tag = st.session_state.get("cache_tag", "v1")
 
-        # ====== 1. DEFINIR universe_base ======
-        # preferimos healthy_syms (relajado). si está vacío, usamos kept_strict.
-        if healthy and len(healthy) > 0:
-            base_syms = sorted(set([str(s) for s in healthy if isinstance(s, str) or s is not None]))
-        else:
-            if kept_strict is None or kept_strict.empty or "symbol" not in kept_strict.columns:
-                st.warning("No hay símbolos aprobados / saludables desde Guardrails. Ajusta sliders en Guardrails (tab2).")
-                st.stop()
-
-            base_syms = (
-                kept_strict["symbol"]
-                .dropna().astype(str).unique().tolist()
-            )
-
-        if not base_syms:
-            st.warning("No quedaron símbolos para VFQ después de Guardrails.")
+        # necesitamos tickers que pasaron guardrails
+        if kept is None or kept.empty or "symbol" not in kept.columns:
+            st.warning("No hay símbolos aprobados por Guardrails. Ajusta sliders en Guardrails (tab2).")
             st.stop()
 
-        # ====== 2. DESCARGAR MÉTRICAS VFQ CRUDAS ======
+        kept_syms = (
+            kept["symbol"]
+            .dropna().astype(str).unique().tolist()
+        )
+        if not kept_syms:
+            st.warning("kept está vacío después de limpiar símbolos.")
+            st.stop()
+
+        # =========================
+        # 1. Descargar métricas VFQ en bruto
+        # =========================
         try:
             from fundamentals import download_vfq_batch
             df_vfq_raw = download_vfq_batch(
-                base_syms,
+                kept_syms,
                 cache_key=cache_tag,
                 force=False
             )
         except Exception:
-            # fallback mínimo
-            df_vfq_raw = pd.DataFrame({"symbol": base_syms})
+            # fallback mínimo si hay problemas de import/API
+            df_vfq_raw = pd.DataFrame({"symbol": kept_syms})
 
-        # asegurar symbol
+        # asegurar que exista columna 'symbol'
         if "symbol" not in df_vfq_raw.columns:
-            df_vfq_raw = df_vfq_raw.reset_index().rename(columns={"index": "symbol"})
+            if df_vfq_raw.index.name == "symbol":
+                df_vfq_raw = df_vfq_raw.reset_index()
+            else:
+                df_vfq_raw = df_vfq_raw.reset_index().rename(columns={"index": "symbol"})
         df_vfq_raw["symbol"] = df_vfq_raw["symbol"].astype(str)
 
-        # ====== 3. AGREGAR DIAGNÓSTICO DE GUARDRAILS (deuda, accruals, etc.) ======
+        # =========================
+        # 2. Extraer subset útil de diag (guardrails)
+        # =========================
         cols_from_diag = [
             "symbol","netdebt_ebitda","accruals_ta",
             "profit_hits","coverage_count",
@@ -661,11 +664,17 @@ with tab3:
                 .copy()
             )
         else:
-            diag_slim = pd.DataFrame(columns=["symbol"])
+            diag_slim = pd.DataFrame({"symbol": kept_syms})
 
-        # ====== 4. AGREGAR sector / market_cap DESDE EL UNIVERSO ======
+        # =========================
+        # 3. Sector y market_cap desde 'uni'
+        #    (tolerante a nombres raros de market cap)
+        # =========================
         if isinstance(uni, pd.DataFrame) and "symbol" in uni.columns:
-            mcap_candidates = ["market_cap","marketCap","marketCap_unified","mkt_cap","Market Cap"]
+            mcap_candidates = [
+                "market_cap","marketCap","marketCap_unified",
+                "mkt_cap","Market Cap"
+            ]
             mcap_col = None
             for c in mcap_candidates:
                 if c in uni.columns:
@@ -684,32 +693,39 @@ with tab3:
                 .copy()
             )
 
-            # normalizamos market_cap -> market_cap
+            # normalizamos nombre de market cap
             if mcap_col is not None and mcap_col != "market_cap":
                 uni_slim = uni_slim.rename(columns={mcap_col: "market_cap"})
+
             if "sector" not in uni_slim.columns:
                 uni_slim["sector"] = "Unknown"
             if "market_cap" not in uni_slim.columns:
                 uni_slim["market_cap"] = np.nan
         else:
+            # fallback
             uni_slim = pd.DataFrame({
-                "symbol": base_syms,
+                "symbol": kept_syms,
                 "sector": "Unknown",
                 "market_cap": np.nan,
             })
 
-        # ====== 5. ARMAR df_vfq MAESTRO ======
+        # =========================
+        # 4. df_vfq maestro (fundamentales + flujo bruto + contexto uni)
+        # =========================
         df_vfq = (
             df_vfq_raw
             .merge(diag_slim, on="symbol", how="left")
             .merge(uni_slim, on="symbol", how="left", suffixes=("","_u"))
         )
 
-        # ====== 6. ASEGURAR COLUMNAS CLAVE AUNQUE VENGAN VACÍAS ======
+        # =========================
+        # 5. Columnas esperadas. Si no existen o vienen NaN, creamos default.
+        #    Esto evita que peten filtros abajo.
+        # =========================
         needed_cols_defaults = {
             "quality_adj_neut": 0.0,
             "value_adj_neut":   0.0,
-            "acc_pct":          100.0,  # percentil "mejor accruals"
+            "acc_pct":          100.0,  # percentil de "accruals sanos" (100 bueno)
             "hits":             0,
             "BreakoutScore":    0.0,
             "RVOL20":           0.0,
@@ -719,69 +735,83 @@ with tab3:
         for col, val in needed_cols_defaults.items():
             if col not in df_vfq.columns:
                 df_vfq[col] = val
+            # nos aseguramos de que sean numéricos donde aplica
             df_vfq[col] = pd.to_numeric(df_vfq[col], errors="coerce")
 
-        # sector y market_cap pueden faltar si la API no devolvió nada raro
-        if "sector" not in df_vfq.columns:
-            df_vfq["sector"] = "Unknown"
-        if "market_cap" not in df_vfq.columns:
-            df_vfq["market_cap"] = np.nan
-
-        # ====== 7. SLIDERS VFQ (keys únicos para no chocar con otros sliders) ======
+        # =========================
+        # 6. Sliders UI (cada uno con key único → arregla el bug de Streamlit)
+        # =========================
         c1, c2, c3 = st.columns(3)
+
         with c1:
             min_quality = st.slider(
                 "Min Quality neut.",
-                0.0, 1.0, 0.0, 0.01,
-                key="vfq_min_quality"
+                min_value=0.0, max_value=1.0,
+                value=0.0, step=0.01,
+                key="vfq_min_quality_slider"
             )
-            min_value = st.slider(
+            min_value   = st.slider(
                 "Min Value neut.",
-                0.0, 1.0, 0.0, 0.01,
-                key="vfq_min_value"
+                min_value=0.0, max_value=1.0,
+                value=0.0, step=0.01,
+                key="vfq_min_value_slider"
             )
-            max_ndebt = st.slider(
+            max_ndebt   = st.slider(
                 "Max NetDebt/EBITDA",
-                0.0, 5.0, 1.5, 0.1,
-                key="vfq_max_ndebt"
+                min_value=0.0, max_value=5.0,
+                value=1.5, step=0.1,
+                key="vfq_max_ndebt_slider"
             )
+
         with c2:
             min_acc_pct = st.slider(
                 "Accruals (NOA) percentil mínimo",
-                0, 100, 30, 1,
-                key="vfq_min_acc_pct"
+                min_value=0, max_value=100,
+                value=30, step=1,
+                key="vfq_min_acc_pct_slider"
             )
-            min_hits = st.slider(
+            min_hits    = st.slider(
                 "Min hits",
-                0, 5, 2, 1,
-                key="vfq_min_hits"
+                min_value=0, max_value=5,
+                value=2, step=1,
+                key="vfq_min_hits_slider"
             )
-            min_rvol20 = st.slider(
+            min_rvol20  = st.slider(
                 "Min RVOL20",
-                0.0, 5.0, 1.5, 0.05,
-                key="vfq_min_rvol20"
+                min_value=0.0, max_value=5.0,
+                value=1.5, step=0.05,
+                key="vfq_min_rvol20_slider"
             )
+
         with c3:
             min_breakout = st.slider(
                 "Min BreakoutScore",
-                0, 100, 60, 1,
-                key="vfq_min_breakout"
+                min_value=0, max_value=100,
+                value=60, step=1,
+                key="vfq_min_breakout_slider"
             )
-            beta_prob = st.slider(
+            beta_prob    = st.slider(
                 "β prob_up (logit)",
-                0.0, 10.0, 6.0, 0.1,
-                key="vfq_beta_prob"
+                min_value=0.0, max_value=10.0,
+                value=6.0, step=0.1,
+                key="vfq_beta_prob_slider"
             )
-            topN_prob = st.slider(
+            topN_prob    = st.slider(
                 "Top N por prob_up",
-                5, 100, 30, 1,
-                key="vfq_topN_prob"
+                min_value=5, max_value=100,
+                value=30, step=1,
+                key="vfq_topN_prob_slider"
             )
 
-        # ====== 8. CHEQUEAR SI TENEMOS DATOS REALES O TODO ES PLACEHOLDER ======
+        # =========================
+        # 7. ¿Tenemos datos de flujo reales o todo viene en cero?
+        #    (si todo es 0/NaN no filtres agresivo todavía)
+        # =========================
         def _has_signal_data(series: pd.Series) -> bool:
             s = pd.to_numeric(series, errors="coerce")
-            # hay alguna señal distinta de puro cero/NaN?
+            # Hay señal si:
+            #   - al menos un valor no es NaN
+            #   - y el total absoluto no es 0 (o sea hay algo distinto de puro cero)
             return bool(s.notna().any() and (s.fillna(0).abs().sum() > 0))
 
         have_real_scores = (
@@ -793,26 +823,30 @@ with tab3:
             _has_signal_data(df_vfq["prob_up"])
         )
 
-        # ====== 9. FILTRADO VFQ ======
+        # =========================
+        # 8. Filtro VFQ
+        #    - si hay métricas reales, aplicamos umbrales
+        #    - si NO hay aún métricas (todo 0), dejamos pasar todo lo de Guardrails
+        # =========================
         if have_real_scores:
             mask = pd.Series(True, index=df_vfq.index, dtype=bool)
 
-            # calidad / value
+            # quality / value
             mask &= (df_vfq["quality_adj_neut"] >= float(min_quality))
             mask &= (df_vfq["value_adj_neut"]   >= float(min_value))
 
-            # momentum/flujo
+            # momentum/flow combos
             mask &= (df_vfq["hits"].fillna(0) >= int(min_hits))
             mask &= (df_vfq["BreakoutScore"].fillna(0) >= float(min_breakout))
             mask &= (df_vfq["RVOL20"].fillna(0) >= float(min_rvol20))
 
-            # deuda (NaN no castiga)
+            # deuda: NaN -> la dejamos pasar
             mask &= (
                 df_vfq["netdebt_ebitda"].isna() |
                 (df_vfq["netdebt_ebitda"] <= float(max_ndebt))
             )
 
-            # accruals / NOA (acc_pct alto es "limpio")
+            # accruals / NOA: acc_pct alto = sano
             mask &= (
                 df_vfq["acc_pct"].isna() |
                 (df_vfq["acc_pct"] >= float(min_acc_pct))
@@ -820,77 +854,92 @@ with tab3:
 
             df_keep_vfq = df_vfq.loc[mask].copy()
         else:
-            # Si todavía no tenemos métricas de VFQ reales,
-            # pasamos TODOS los base_syms crudos.
+            # Aún no hay data de flujo: no castigamos nada
             df_keep_vfq = df_vfq.copy()
 
-        # ====== 10. RANKEO PARA TOP N ======
-        if ("prob_up" in df_keep_vfq.columns) and _has_signal_data(df_keep_vfq["prob_up"]):
+        # =========================
+        # 9. Ranking dentro de VFQ
+        # =========================
+        if "prob_up" in df_keep_vfq.columns and _has_signal_data(df_keep_vfq["prob_up"]):
             df_keep_vfq = df_keep_vfq.sort_values("prob_up", ascending=False)
-        elif ("BreakoutScore" in df_keep_vfq.columns) and _has_signal_data(df_keep_vfq["BreakoutScore"]):
+        elif "BreakoutScore" in df_keep_vfq.columns and _has_signal_data(df_keep_vfq["BreakoutScore"]):
             df_keep_vfq = df_keep_vfq.sort_values("BreakoutScore", ascending=False)
         else:
+            # fallback estable
             df_keep_vfq = df_keep_vfq.sort_values("symbol")
 
         vfq_top = df_keep_vfq.head(int(topN_prob)).copy()
 
-        # ====== 11. TABLAS DE DISPLAY ======
+        # =========================
+        # 10. Mostrar tablas
+        # =========================
         st.markdown("### 🟢 Selección VFQ filtrada")
-        cols_sel = [
+        cols_keep_show = [
             "symbol","netdebt_ebitda","accruals_ta","sector","market_cap",
             "quality_adj_neut","value_adj_neut","acc_pct",
             "hits","BreakoutScore","RVOL20","prob_up"
         ]
-        cols_sel = [c for c in cols_sel if c in vfq_top.columns]
+        cols_keep_show = [c for c in cols_keep_show if c in vfq_top.columns]
 
         st.dataframe(
-            vfq_top[cols_sel],
+            vfq_top[cols_keep_show],
             use_container_width=True,
             hide_index=True
         )
 
         st.markdown("### 🧹 Rechazados por VFQ")
-        rejected_syms = sorted(set(base_syms) - set(df_keep_vfq["symbol"]))
-        rej_view = df_vfq[df_vfq["symbol"].isin(rejected_syms)].copy()
 
-        cols_rej = [
+        # quienes quedaron FUERA del filtro (solo si hubo filtro real)
+        if have_real_scores:
+            rejected_syms = sorted(set(kept_syms) - set(df_keep_vfq["symbol"]))
+            rej_view = df_vfq[df_vfq["symbol"].isin(rejected_syms)].copy()
+        else:
+            # si no filtramos nada porque todo es 0, entonces no hay rechazados todavía
+            rej_view = pd.DataFrame(columns=df_vfq.columns)
+
+        cols_rej_show = [
             "symbol","sector","market_cap",
             "quality_adj_neut","value_adj_neut",
             "netdebt_ebitda","acc_pct","BreakoutScore",
             "hits","RVOL20","prob_up"
         ]
-        cols_rej = [c for c in cols_rej if c in rej_view.columns]
+        cols_rej_show = [c for c in cols_rej_show if c in rej_view.columns]
 
         st.dataframe(
-            rej_view[cols_rej],
+            rej_view[cols_rej_show] if not rej_view.empty else pd.DataFrame({"empty":[""]}),
             use_container_width=True,
             hide_index=True
         )
 
-        # ====== 12. GUARDAR PARA TAB4 ======
-        # lista priorizada de símbolos
-        st.session_state["vfq_top"] = vfq_top[["symbol"]].drop_duplicates()
+        # =========================
+        # 11. Guardar todo para Tab4
+        # =========================
+        # Lista priorizada de símbolos
+        st.session_state["vfq_top"] = (
+            vfq_top[["symbol"]].drop_duplicates().copy()
+            if "symbol" in vfq_top.columns else
+            pd.DataFrame(columns=["symbol"])
+        )
 
-        # tabla completa priorizada (fundamental + flujo)
+        # Tabla fundamental/flujo priorizada ordenada
         st.session_state["vfq_table"] = vfq_top.reset_index(drop=True)
 
-        # También guardamos los parámetros técnicos para tab4.
-        # Si aún no existen en este punto (p.ej. están en sidebar/tab4),
-        # les metemos None para que tab4 no truene con NameError.
-        st.session_state["bench_local"]       = st.session_state.get("bench",       None)
-        st.session_state["use_and_local"]     = st.session_state.get("use_and",     None)
-        st.session_state["rvol_th_local"]     = st.session_state.get("rvol_th",     None)
-        st.session_state["closepos_th_local"] = st.session_state.get("closepos_th", None)
-        st.session_state["p52_th_local"]      = st.session_state.get("p52_th",      None)
-        st.session_state["updown_vol_local"]  = st.session_state.get("updown_vol_th", None)
-        st.session_state["min_hits_local"]    = st.session_state.get("min_hits",    None)
-        st.session_state["use_rs_slope_loc"]  = st.session_state.get("use_rs_slope",None)
-        st.session_state["risk_on_local"]     = st.session_state.get("risk_on",     None)
-        st.session_state["start_local"]       = str(st.session_state.get("start", "" ))
-        st.session_state["end_local"]         = str(st.session_state.get("end",   "" ))
-        st.session_state["cache_tag_local"]   = cache_tag
+        # Acá guardamos también los parámetros técnicos que Tab4 usa
+        # (los mismos sliders técnicos viven probablemente en la sidebar,
+        #  pero acá los persistimos con nombres claros)
+        st.session_state["bench_local"]        = st.session_state.get("bench", "SPY")
+        st.session_state["use_and_local"]      = st.session_state.get("use_and", True)
+        st.session_state["rvol_th_local"]      = st.session_state.get("rvol_th", 1.5)
+        st.session_state["closepos_th_local"]  = st.session_state.get("closepos_th", 0.8)
+        st.session_state["p52_th_local"]       = st.session_state.get("p52_th", 0.97)
+        st.session_state["updown_vol_local"]   = st.session_state.get("updown_vol_th", 1.2)
+        st.session_state["min_hits_local"]     = int(min_hits)  # usamos el slider VFQ "min_hits"
+        st.session_state["use_rs_slope_loc"]   = st.session_state.get("use_rs_slope", True)
+        st.session_state["risk_on_local"]      = st.session_state.get("risk_on", True)
+        st.session_state["start_local"]        = str(st.session_state.get("start", "2022-01-01"))
+        st.session_state["end_local"]          = str(st.session_state.get("end", "")) or None
+        st.session_state["cache_tag_local"]    = cache_tag
 
-        # Marcamos que ya tenemos insumo para Señales
         st.session_state["pipeline_ready"] = True
 
     except Exception as e:
