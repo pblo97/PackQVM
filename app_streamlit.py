@@ -510,7 +510,7 @@ with tab3:
         uni  = st.session_state.get("uni", pd.DataFrame())
         cache_tag = st.session_state.get("cache_tag", "v1")
 
-        # 0. asegurarnos que haya base
+        # --- aseguramos que haya algo desde Guardrails ---
         if kept is None or kept.empty or "symbol" not in kept.columns:
             st.warning("No hay símbolos aprobados por Guardrails. Ajusta sliders en Guardrails (tab2).")
             st.stop()
@@ -520,33 +520,36 @@ with tab3:
             .dropna().astype(str).unique().tolist()
         )
 
-        # 1. bajamos VFQ metrics
+        # --- 1. Descarga / arma df_vfq_raw ---
         try:
             from fundamentals import download_vfq_batch
-            df_vfq = download_vfq_batch(
+            df_vfq_raw = download_vfq_batch(
                 kept_syms,
                 cache_key=cache_tag,
                 force=False
             )
         except Exception:
-            df_vfq = pd.DataFrame({"symbol": kept_syms})
+            # fallback mínimo
+            df_vfq_raw = pd.DataFrame({"symbol": kept_syms})
 
         # asegurar symbol
-        if "symbol" not in df_vfq.columns:
-            df_vfq = df_vfq.reset_index().rename(columns={"index":"symbol"})
-        df_vfq["symbol"] = df_vfq["symbol"].astype(str)
+        if "symbol" not in df_vfq_raw.columns:
+            df_vfq_raw = df_vfq_raw.reset_index().rename(columns={"index": "symbol"})
+        df_vfq_raw["symbol"] = df_vfq_raw["symbol"].astype(str)
 
-        # ---- merge con info útil ----
-        # a) desde diag: netdebt_ebitda, accruals_ta
-        if not diag.empty and "symbol" in diag.columns:
-            diag_slim_cols = [c for c in ["symbol","netdebt_ebitda","accruals_ta"] if c in diag.columns]
-            diag_slim = diag[diag_slim_cols].drop_duplicates("symbol")
-        else:
-            diag_slim = pd.DataFrame(columns=["symbol","netdebt_ebitda","accruals_ta"])
+        # --- 2. Merge con diag (deuda, accruals) ---
+        cols_from_diag = [
+            "symbol","netdebt_ebitda","accruals_ta",
+            "profit_hits","coverage_count",
+            "pass_profit","pass_issuance","pass_assets",
+            "pass_accruals","pass_ndebt","pass_coverage","pass_all",
+        ]
+        diag_slim = pd.DataFrame()
+        if isinstance(diag, pd.DataFrame) and "symbol" in diag.columns:
+            diag_slim = diag[[c for c in cols_from_diag if c in diag.columns]].drop_duplicates("symbol", keep="last")
 
-        # b) desde uni: sector y market_cap (pero algunos nombres cambian)
+        # --- 3. Merge con uni (sector / market cap), tolerante a nombres raros ---
         if isinstance(uni, pd.DataFrame) and "symbol" in uni.columns:
-            # detectar columna de market cap real
             mcap_candidates = ["market_cap","marketCap","marketCap_unified","mkt_cap","Market Cap"]
             mcap_col = None
             for c in mcap_candidates:
@@ -566,34 +569,43 @@ with tab3:
                 .copy()
             )
 
-            # normalizamos el nombre a 'market_cap' si lo encontramos con otro alias
             if mcap_col is not None and mcap_col != "market_cap":
                 uni_slim = uni_slim.rename(columns={mcap_col: "market_cap"})
-
-            # si no hay sector lo creamos vacío
             if "sector" not in uni_slim.columns:
                 uni_slim["sector"] = "Unknown"
-
-            # si no hay market_cap lo creamos NaN
             if "market_cap" not in uni_slim.columns:
                 uni_slim["market_cap"] = np.nan
-
         else:
-            uni_slim = pd.DataFrame(
-                {
-                    "symbol": kept_syms,
-                    "sector": "Unknown",
-                    "market_cap": np.nan
-                }
-            )
+            uni_slim = pd.DataFrame({
+                "symbol": kept_syms,
+                "sector": "Unknown",
+                "market_cap": np.nan,
+            })
 
-        # merge final fundamental + contexto base
+        # --- 4. df_vfq maestro ---
         df_vfq = (
-            df_vfq.merge(diag_slim, on="symbol", how="left")
-                  .merge(uni_slim,  on="symbol", how="left")
+            df_vfq_raw
+            .merge(diag_slim, on="symbol", how="left")
+            .merge(uni_slim, on="symbol", how="left", suffixes=("","_u"))
         )
 
-        # 2. sliders VFQ
+        # --- 5. Creamos columnas esperadas (aunque vengan vacías) ---
+        needed_cols_defaults = {
+            "quality_adj_neut": 0.0,
+            "value_adj_neut":   0.0,
+            "acc_pct":          100.0,
+            "hits":             0,
+            "BreakoutScore":    0.0,
+            "RVOL20":           0.0,
+            "prob_up":          0.0,
+            "netdebt_ebitda":   np.nan,
+        }
+        for col, val in needed_cols_defaults.items():
+            if col not in df_vfq.columns:
+                df_vfq[col] = val
+            df_vfq[col] = pd.to_numeric(df_vfq[col], errors="coerce")
+
+        # --- 6. UI de sliders VFQ ---
         c1, c2, c3 = st.columns(3)
         with c1:
             min_quality = st.slider("Min Quality neut.", 0.0, 1.0, 0.0, 0.01)
@@ -608,65 +620,76 @@ with tab3:
             beta_prob    = st.slider("β prob_up (logit)", 0.0, 10.0, 6.0, 0.1)
             topN_prob    = st.slider("Top N por prob_up", 5, 100, 30, 1)
 
-        # 3. blindajes de columnas VFQ típicas
-        safe_defaults = {
-            "quality_adj_neut": 0.0,
-            "value_adj_neut":   0.0,
-            "acc_pct":          100.0,
-            "hits":             0,
-            "BreakoutScore":    0.0,
-            "RVOL20":           0.0,
-            "prob_up":          0.0,
-            "netdebt_ebitda":   np.nan,
-        }
-        for col, val in safe_defaults.items():
-            if col not in df_vfq.columns:
-                df_vfq[col] = val
-            df_vfq[col] = pd.to_numeric(df_vfq[col], errors="coerce")
+        # --- 7. ¿TENEMOS SCORES REALES O ESTÁ TODO EN CERO? ---
+        def _has_signal_data(series: pd.Series) -> bool:
+            # True si hay por lo menos un valor no nulo y distinto de 0
+            s = pd.to_numeric(series, errors="coerce")
+            return bool(s.notna().any() and (s.fillna(0).abs().sum() > 0))
 
-        # 4. máscara VFQ pura
-        mask = (
-            (df_vfq["quality_adj_neut"] >= float(min_quality)) &
-            (df_vfq["value_adj_neut"]   >= float(min_value))   &
-            (df_vfq["hits"].fillna(0)   >= int(min_hits))      &
-            (df_vfq["BreakoutScore"].fillna(0) >= float(min_breakout)) &
-            (df_vfq["RVOL20"].fillna(0) >= float(min_rvol20))
+        have_real_scores = (
+            _has_signal_data(df_vfq["quality_adj_neut"]) or
+            _has_signal_data(df_vfq["value_adj_neut"])   or
+            _has_signal_data(df_vfq["BreakoutScore"])    or
+            _has_signal_data(df_vfq["RVOL20"])           or
+            _has_signal_data(df_vfq["hits"])             or
+            _has_signal_data(df_vfq["prob_up"])
         )
 
-        # deuda
-        ndebt_ok = (
-            df_vfq["netdebt_ebitda"].isna() |
-            (df_vfq["netdebt_ebitda"] <= float(max_ndebt))
-        )
-        mask &= ndebt_ok
+        # --- 8. Construimos la máscara SOLO si realmente hay datos útiles ---
+        if have_real_scores:
+            mask = pd.Series(True, index=df_vfq.index, dtype=bool)
 
-        # accruals / NOA limpia
-        mask &= (
-            df_vfq["acc_pct"].isna() |
-            (df_vfq["acc_pct"] >= float(min_acc_pct))
-        )
+            mask &= (df_vfq["quality_adj_neut"] >= float(min_quality))
+            mask &= (df_vfq["value_adj_neut"]   >= float(min_value))
+            mask &= (df_vfq["hits"].fillna(0)   >= int(min_hits))
+            mask &= (df_vfq["BreakoutScore"].fillna(0) >= float(min_breakout))
+            mask &= (df_vfq["RVOL20"].fillna(0) >= float(min_rvol20))
 
-        df_keep_vfq = df_vfq.loc[mask].copy()
+            # deuda (permitimos NaN)
+            mask &= (
+                df_vfq["netdebt_ebitda"].isna() |
+                (df_vfq["netdebt_ebitda"] <= float(max_ndebt))
+            )
 
-        # 5. rank: prob_up DESC (fallback BreakoutScore)
-        if "prob_up" in df_keep_vfq.columns:
-            df_keep_vfq = df_keep_vfq.sort_values("prob_up", ascending=False)
+            # accruals / NOA (si acc_pct es tipo "percentil limpio", 100 mejor)
+            mask &= (
+                df_vfq["acc_pct"].isna() |
+                (df_vfq["acc_pct"] >= float(min_acc_pct))
+            )
+
+            df_keep_vfq = df_vfq.loc[mask].copy()
         else:
+            # NO TENEMOS MÉTRICAS VFQ AÚN → no filtres más, sólo pasa kept
+            df_keep_vfq = df_vfq.copy()
+
+        # --- 9. Ranking para topN ---
+        if "prob_up" in df_keep_vfq.columns and _has_signal_data(df_keep_vfq["prob_up"]):
+            df_keep_vfq = df_keep_vfq.sort_values("prob_up", ascending=False)
+        elif "BreakoutScore" in df_keep_vfq.columns and _has_signal_data(df_keep_vfq["BreakoutScore"]):
             df_keep_vfq = df_keep_vfq.sort_values("BreakoutScore", ascending=False)
+        else:
+            # fallback estable: deja orden alfabético de símbolo
+            df_keep_vfq = df_keep_vfq.sort_values("symbol")
 
         vfq_top = df_keep_vfq.head(int(topN_prob)).copy()
 
-        # 6. mostramos resultados
+        # --- 10. Mostrar tablas ---
         st.markdown("### 🟢 Selección VFQ filtrada")
         st.dataframe(
-            vfq_top,
+            vfq_top[[c for c in [
+                "symbol","netdebt_ebitda","accruals_ta","sector","market_cap",
+                "quality_adj_neut","value_adj_neut","acc_pct",
+                "hits","BreakoutScore","RVOL20","prob_up"
+            ] if c in vfq_top.columns]],
             use_container_width=True,
             hide_index=True
         )
 
         st.markdown("### 🧹 Rechazados por VFQ")
+        # lo que estaba en kept_syms pero NO quedó en df_keep_vfq
         rejected_syms = sorted(set(kept_syms) - set(df_keep_vfq["symbol"]))
         rej_view = df_vfq[df_vfq["symbol"].isin(rejected_syms)].copy()
+
         st.dataframe(
             rej_view[[c for c in [
                 "symbol","sector","market_cap",
@@ -678,12 +701,15 @@ with tab3:
             hide_index=True
         )
 
-        # 7. guardar para tab4
-        st.session_state["vfq_top"] = vfq_top[["symbol"]].drop_duplicates()
+        # --- 11. Guardar para tab4 (Señales) ---
+        # vfq_top es la watchlist real que queremos testear técnicamente.
+        st.session_state["vfq_top"]   = vfq_top[["symbol"]].drop_duplicates()
         st.session_state["vfq_table"] = vfq_top.reset_index(drop=True)
+        st.session_state["pipeline_ready"] = True
 
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
+
 
 
 
