@@ -177,6 +177,62 @@ def _probability_from_percentile(pct: pd.Series, beta: float = 6.0) -> pd.Series
     s = pd.to_numeric(pct, errors="coerce").fillna(0.5).clip(0, 1)
     return 1.0 / (1.0 + np.exp(-beta * (s - 0.5)))
 
+import numpy as np
+import pandas as pd
+
+def normalize_guard_diag(diag: pd.DataFrame, df_guard: pd.DataFrame | None = None) -> pd.DataFrame:
+    d = (diag.copy() if isinstance(diag, pd.DataFrame) else pd.DataFrame())
+    if d.empty:
+        cols = ["symbol","profit_hits","coverage_count","net_issuance","asset_growth",
+                "accruals_ta","netdebt_ebitda","pass_profit","pass_issuance",
+                "pass_assets","pass_accruals","pass_ndebt","pass_coverage","pass_all","reason"]
+        return pd.DataFrame(columns=cols)
+
+    # Asegura 'symbol'
+    if "symbol" not in d.columns:
+        if d.index.name == "symbol":
+            d = d.reset_index()
+        elif isinstance(df_guard, pd.DataFrame) and "symbol" in df_guard.columns:
+            d["symbol"] = df_guard["symbol"].values[:len(d)]
+        else:
+            d["symbol"] = pd.Index(range(len(d))).astype(str)
+
+    token_map = {
+        "pass_profit":   "profit_floor",
+        "pass_issuance": "net_issuance",
+        "pass_assets":   "asset_growth",
+        "pass_accruals": "accruals_ta",
+        "pass_ndebt":    "netdebt_ebitda",
+        "pass_coverage": "vfq_coverage",
+    }
+
+    # Completa pass_* desde reason si faltan
+    has_reason = "reason" in d.columns
+    for col, tok in token_map.items():
+        if col not in d.columns:
+            d[col] = ~d["reason"].fillna("").str.contains(tok) if has_reason else np.nan
+
+    # pass_all si falta
+    checks = list(token_map.keys())
+    if "pass_all" not in d.columns:
+        d["pass_all"] = d[checks].all(axis=1) if all(c in d.columns for c in checks) else False
+
+    # reason si falta
+    if "reason" not in d.columns:
+        def _mk_reason(row):
+            r=[]
+            if "pass_profit"   in d.columns and not bool(row.get("pass_profit", True)):     r.append("profit_floor")
+            if "pass_issuance" in d.columns and not bool(row.get("pass_issuance", True)):   r.append("net_issuance")
+            if "pass_assets"   in d.columns and not bool(row.get("pass_assets", True)):     r.append("asset_growth")
+            if "pass_accruals" in d.columns and not bool(row.get("pass_accruals", True)):   r.append("accruals_ta")
+            if "pass_ndebt"    in d.columns and not bool(row.get("pass_ndebt", True)):      r.append("netdebt_ebitda")
+            if "pass_coverage" in d.columns and not bool(row.get("pass_coverage", True)):   r.append("vfq_coverage")
+            return ",".join(r)
+        d["reason"] = d.apply(_mk_reason, axis=1)
+
+    return d
+
+
 # ==================== SIDEBAR ====================
 with st.sidebar:
     st.markdown("### ⚙️ Controles")
@@ -304,203 +360,58 @@ with tab1:
     except Exception as e:
         st.error(f"Error cargando universo: {e}")
 
-# ====== Paso 2: FUNDAMENTALES & GUARDRAILS ======
+## ====== Paso 2: FUNDAMENTALES & GUARDRAILS ======
 with tab2:
     st.subheader("Guardrails")
 
     try:
-        if run_btn and "uni" in st.session_state:
-            uni = st.session_state["uni"]
+        uni = st.session_state.get("uni", pd.DataFrame())
+        kept = pd.DataFrame(columns=["symbol"])
+        diag = pd.DataFrame()
+
+        if run_btn and not uni.empty and "symbol" in uni.columns:
             syms = (
                 uni.get("symbol", pd.Series(dtype=str))
                    .dropna().astype(str).unique().tolist()
             )
             if not syms:
-                st.warning("No hay símbolos en el universo. Ejecuta el screener primero.")
+                st.info("No hay símbolos en el universo. Ejecuta el screener primero.")
                 st.stop()
 
-            # Lee sliders de la UI (si no existen en session_state, usa valores por defecto robustos)
+            # sliders (y espejo en sesión)
             profit_hits   = int(st.session_state.get("profit_hits",   2))
             max_issuance  = float(st.session_state.get("max_issuance", 0.03))
             max_assets    = float(st.session_state.get("max_assets",   0.20))
             max_accr      = float(st.session_state.get("max_accr",     0.10))
             max_ndeb      = float(st.session_state.get("max_ndeb",     3.0))
             min_cov_guard = int(st.session_state.get("min_cov_guard",  2))
-
-            # Refleja sliders en session_state (para que VFQ/otras pestañas los vean consistentes)
-            st.session_state["profit_hits"]   = profit_hits
-            st.session_state["max_issuance"]  = max_issuance
-            st.session_state["max_assets"]    = max_assets
-            st.session_state["max_accr"]      = max_accr
-            st.session_state["max_ndeb"]      = max_ndeb
-            st.session_state["min_cov_guard"] = min_cov_guard
+            st.session_state.update(dict(
+                profit_hits=profit_hits, max_issuance=max_issuance, max_assets=max_assets,
+                max_accr=max_accr, max_ndeb=max_ndeb, min_cov_guard=min_cov_guard
+            ))
+            cache_tag = st.session_state.get("cache_tag", "v1")
 
             with st.status("Descargando métricas de guardrails…", expanded=False) as status:
-                # Descarga en batch (cacheada si definiste _cached_download_guardrails)
+                # 1) Descarga (con caché y fallback correcto)
                 try:
                     df_guard = _cached_download_guardrails(tuple(syms), cache_key=cache_tag)
                 except Exception:
-                    # fallback directo sin cache wrapper
                     from fundamentals import download_guardrails_batch
-                    df_guard = _download_guardrails_batch(syms, cache_key=cache_tag, force=False)
+                    df_guard = download_guardrails_batch(syms, cache_key=cache_tag, force=False)
 
-                    kept, diag = _apply_quality_guardrails(
-                        df_guard=df_guard,
-                        require_profit_floor=bool(profit_hits > 0),
-                        profit_floor_min_hits=profit_hits,
-                        max_net_issuance=max_issuance,
-                        max_asset_growth=max_assets,
-                        max_accruals_ta=max_accr,
-                        max_netdebt_ebitda=max_ndeb,
-                        min_vfq_coverage=min_cov_guard
-                    )
-
-                def _normalize_guard_diag(diag: pd.DataFrame, df_guard: pd.DataFrame) -> pd.DataFrame:
-                    d = diag.copy()
-
-                    # 1) Asegura 'symbol'
-                    if "symbol" not in d.columns:
-                        if d.index.name == "symbol":
-                            d = d.reset_index()
-                        else:
-                            # último recurso: intenta desde df_guard
-                            if isinstance(df_guard, pd.DataFrame):
-                                if "symbol" in df_guard.columns:
-                                    d["symbol"] = df_guard["symbol"].values[:len(d)]
-                                else:
-                                    d["symbol"] = pd.Index(range(len(d))).astype(str)
-                            else:
-                                d["symbol"] = pd.Index(range(len(d))).astype(str)
-
-                    # 2) Si no hay 'reason' pero sí 'pass_*', podemos reconstruirla
-                    def _mk_reason(row):
-                        r=[]
-                        if "pass_profit"   in d.columns and not bool(row.get("pass_profit", True)):     r.append("profit_floor")
-                        if "pass_issuance" in d.columns and not bool(row.get("pass_issuance", True)):   r.append("net_issuance")
-                        if "pass_assets"   in d.columns and not bool(row.get("pass_assets", True)):     r.append("asset_growth")
-                        if "pass_accruals" in d.columns and not bool(row.get("pass_accruals", True)):   r.append("accruals_ta")
-                        if "pass_ndebt"    in d.columns and not bool(row.get("pass_ndebt", True)):      r.append("netdebt_ebitda")
-                        if "pass_coverage" in d.columns and not bool(row.get("pass_coverage", True)):   r.append("vfq_coverage")
-                        return ",".join(r)
-
-                    # 3) Si faltan 'pass_*', infiérelo desde 'reason' (si existe) o márcalo NaN
-                    name_map = {
-                        "pass_profit":   "profit_floor",
-                        "pass_issuance": "net_issuance",
-                        "pass_assets":   "asset_growth",
-                        "pass_accruals": "accruals_ta",
-                        "pass_ndebt":    "netdebt_ebitda",
-                        "pass_coverage": "vfq_coverage",
-                    }
-
-                    has_reason = "reason" in d.columns
-                    for col, token in name_map.items():
-                        if col not in d.columns:
-                            if has_reason:
-                                d[col] = ~d["reason"].fillna("").str.contains(token)
-                            else:
-                                d[col] = np.nan  # sin información
-
-                    # 4) pass_all si falta
-                    checks = list(name_map.keys())
-                    if "pass_all" not in d.columns:
-                        if all(c in d.columns for c in checks):
-                            d["pass_all"] = d[checks].all(axis=1)
-                        else:
-                            d["pass_all"] = False
-
-                    # 5) Si no había 'reason' y ya tenemos pass_*, constrúyela
-                    if "reason" not in d.columns:
-                        d["reason"] = d.apply(_mk_reason, axis=1)
-
-                    return d
-                diag = _normalize_guard_diag(diag, df_guard)
-                st.session_state["guard_diag"] = diag
-                kept = diag.loc[diag["pass_all"], ["symbol"]].copy()
-                st.session_state["kept"] = kept
-
-                needed = {"pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage","pass_all","profit_hits"}
-                if not needed.issubset(set(diag.columns)):
-                    # Vincula por símbolo para poder leer las columnas crudas desde df_guard
-                    base = df_guard.copy()
-                    if "symbol" not in base.columns:
-                        # intenta inferir símbolo desde índice
-                        base["symbol"] = base.index.astype(str)
-                    work = diag.merge(base, on="symbol", how="left", suffixes=("", "_raw"))
-
-                    # helpers locales (mismos nombres suaves que en fundamentals)
-                    def _pick(*cols):
-                        for c in cols:
-                            if c in work.columns: 
-                                s = pd.to_numeric(work[c], errors="coerce")
-                                if s.notna().any():
-                                    return s
-                        return pd.Series(np.nan, index=work.index, dtype=float)
-
-                    ebit = _pick("ebit_ttm","EBITDAttm","ebit","operatingIncomeTTM")
-                    cfo  = _pick("operatingCashFlowTTM","cashFlowFromOperationsTTM","cfo_ttm","netCashProvidedByOperatingActivitiesTTM")
-                    fcf  = _pick("freeCashFlowTTM","fcf_ttm")
-
-                    net_issuance = _pick("net_issuance","sharesNetIssuanceRate","shares_change_1y")
-                    asset_growth = _pick("asset_growth","totalAssetsGrowthYoY")
-                    accruals_ta  = _pick("accruals_ta","accrualsToAssets")
-                    nd_ebitda    = _pick("netdebt_ebitda","netDebtToEBITDA","netDebtEbitda")
-
-                    coverage = pd.to_numeric(work.get("coverage_count", np.nan), errors="coerce").fillna(0).astype(int)
-
-                    profit_hits_series = (
-                        (pd.to_numeric(ebit, errors="coerce") > 0).astype(int)
-                        + (pd.to_numeric(cfo, errors="coerce")  > 0).astype(int)
-                        + (pd.to_numeric(fcf, errors="coerce")  > 0).astype(int)
-                    )
-
-                    work["profit_hits"]   = profit_hits_series
-                    work["pass_profit"]   = (profit_hits_series >= int(max(0, profit_hits))) if profit_hits > 0 else True
-                    work["pass_issuance"] = (net_issuance <= max_issuance) | net_issuance.isna()
-                    work["pass_assets"]   = (asset_growth <= max_assets)   | asset_growth.isna()
-                    work["pass_accruals"] = (accruals_ta.abs() <= max_accr) | accruals_ta.isna()
-                    work["pass_ndebt"]    = (nd_ebitda <= max_ndeb)        | nd_ebitda.isna()
-                    work["pass_coverage"] = (coverage >= int(max(0, min_cov_guard))) | pd.Series(False, index=work.index)  # coverage ya es int
-
-                    for c in ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]:
-                        work[c] = work[c].astype(bool)
-
-                    checks = ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]
-                    work["pass_all"] = work[checks].all(axis=1)
-
-                    # reason (solo en fallas)
-                    def _mk_reason(row):
-                        r = []
-                        if not row["pass_profit"]:   r.append("profit_floor")
-                        if not row["pass_issuance"]: r.append("net_issuance")
-                        if not row["pass_assets"]:   r.append("asset_growth")
-                        if not row["pass_accruals"]: r.append("accruals_ta")
-                        if not row["pass_ndebt"]:    r.append("netdebt_ebitda")
-                        if not row["pass_coverage"]: r.append("vfq_coverage")
-                        return ",".join(r)
-                    work["reason"] = work.apply(_mk_reason, axis=1)
-
-                    # deja 'diag' listo para mostrar
-                    keep_cols = ["symbol","profit_hits","coverage_count","net_issuance","asset_growth","accruals_ta","netdebt_ebitda",
-                                "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage","pass_all","reason"]
-                    diag = work[[c for c in keep_cols if c in work.columns]].copy()
-                    st.session_state["guard_diag"] = diag
-                    # también corrige kept
-                    kept = diag.loc[diag["pass_all"], ["symbol"]].copy()
-                    st.session_state["kept"] = kept
-                # Calcula cobertura VFQ si aún no existe (métricas que luego usa VFQ)
+                # 2) Cobertura mínima para VFQ/guardrails
                 value_metrics   = st.session_state.get("value_metrics",   ["inv_ev_ebitda","fcf_yield"])
                 quality_metrics = st.session_state.get("quality_metrics", ["gross_profitability","roic"])
-                coverage_cols = [c for c in (list(value_metrics) + list(quality_metrics)) if c in df_guard.columns]
+                coverage_cols = [c for c in (list(value_metrics)+list(quality_metrics)) if c in df_guard.columns]
                 if coverage_cols:
                     df_guard["coverage_count"] = df_guard[coverage_cols].notna().sum(axis=1).astype(int)
                 else:
-                    # heurística mínima
                     base_cov = [c for c in ["evToEbitda","fcf_ttm","grossProfitTTM","roic","roa","netMargin"] if c in df_guard.columns]
                     df_guard["coverage_count"] = df_guard[base_cov].notna().sum(axis=1).astype(int) if base_cov else 0
 
-                # Aplica guardrails
-                kept, diag = apply_quality_guardrails(
+                # 3) Aplica reglas (función correcta sin guión bajo)
+                from fundamentals import apply_quality_guardrails
+                kept_raw, diag_raw = apply_quality_guardrails(
                     df_guard=df_guard,
                     require_profit_floor=bool(profit_hits > 0),
                     profit_floor_min_hits=profit_hits,
@@ -511,6 +422,10 @@ with tab2:
                     min_vfq_coverage=min_cov_guard
                 )
 
+                # 4) Normaliza diagnóstico y kept
+                diag = normalize_guard_diag(diag_raw, df_guard)
+                kept = diag.loc[diag["pass_all"], ["symbol"]].copy()
+
                 status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
 
             # Guarda en sesión
@@ -520,18 +435,17 @@ with tab2:
 
         elif "kept" in st.session_state and "guard_diag" in st.session_state:
             kept = st.session_state["kept"]
-            diag = st.session_state["guard_diag"]
-            uni  = st.session_state.get("uni", pd.DataFrame())
+            diag = normalize_guard_diag(st.session_state["guard_diag"])
         else:
             st.info("Primero ejecuta **Universo** (botón Ejecutar).")
             st.stop()
 
-        # Métricas rápidas
+        # --- Métricas rápidas ---
         c1, c2 = st.columns(2)
         c1.metric("Pasan guardrails", f"{len(kept):,}")
-        c2.metric("Rechazados", f"{max(len(st.session_state.get('uni', pd.DataFrame())),0) - len(kept):,}")
+        c2.metric("Rechazados", f"{max(len(uni),0) - len(kept):,}")
 
-        # Vista diagnóstica (merge con sector si existe)
+        # --- Tabla diagnóstica ---
         diag_view = diag.copy()
         if isinstance(uni, pd.DataFrame) and "symbol" in uni.columns:
             diag_view = diag_view.merge(uni[["symbol","sector"]].drop_duplicates("symbol"), on="symbol", how="left")
@@ -542,68 +456,55 @@ with tab2:
             "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"
         ] if c in diag_view.columns]
 
-        # Claves de orden presentes
-        order_keys = [c for c in ["pass_all","profit_hits","coverage_count"] if c in diag_view.columns]
-        ascending_flags = []
-        for k in order_keys:
-            # Mantén el orden lógico: pass_all desc, hits desc, coverage desc
-            ascending_flags.append(False)
+        if cols_show:
+            order_keys = [k for k in ["pass_all","profit_hits","coverage_count"] if k in diag_view.columns]
+            if order_keys:
+                st.dataframe(
+                    diag_view[cols_show].sort_values(order_keys, ascending=[False]*len(order_keys)),
+                    use_container_width=True, hide_index=True
+                )
+            else:
+                st.dataframe(diag_view[cols_show], use_container_width=True, hide_index=True)
 
-        # Fallback si no hay claves de orden
-        if not order_keys:
-            st.dataframe(diag_view[cols_show], use_container_width=True, hide_index=True)
-        else:
-            st.dataframe(
-                diag_view[cols_show].sort_values(order_keys, ascending=ascending_flags),
-                use_container_width=True, hide_index=True
-            )
+        # --- Resumen de rechazos ---
+        if not diag.empty and "pass_all" in diag.columns:
+            total = len(diag)
+            fails = (~diag["pass_all"]).sum()
+            st.markdown(f"**Resumen de filtros** — fallan {fails} de {total}")
 
-        # --- Resumen de rechazos por regla ---
-        # --- Resumen de rechazos por regla (robusto) ---
-        if "guard_diag" in st.session_state:
-            diag = st.session_state["guard_diag"]
-            if not diag.empty and "pass_all" in diag.columns:
-                total = len(diag)
-                fails = (~diag["pass_all"]).sum()
-                st.markdown(f"**Resumen de filtros** — fallan {fails} de {total}")
+            token_map = {
+                "pass_profit":   "profit_floor",
+                "pass_issuance": "net_issuance",
+                "pass_assets":   "asset_growth",
+                "pass_accruals": "accruals_ta",
+                "pass_ndebt":    "netdebt_ebitda",
+                "pass_coverage": "vfq_coverage",
+            }
+            def _fail_rate(col):
+                if col in diag.columns:
+                    return (diag[col] == False).mean() * 100.0
+                if "reason" in diag.columns:
+                    tok = token_map.get(col, "")
+                    return diag["reason"].fillna("").str.contains(tok).mean() * 100.0 if tok else 0.0
+                return 0.0
 
-                token_map = {
-                    "pass_profit":   "profit_floor",
-                    "pass_issuance": "net_issuance",
-                    "pass_assets":   "asset_growth",
-                    "pass_accruals": "accruals_ta",
-                    "pass_ndebt":    "netdebt_ebitda",
-                    "pass_coverage": "vfq_coverage",
-                }
+            summary = pd.DataFrame({
+                "regla": list(token_map.values()),
+                "rechazos %": [
+                    _fail_rate("pass_profit"),
+                    _fail_rate("pass_issuance"),
+                    _fail_rate("pass_assets"),
+                    _fail_rate("pass_accruals"),
+                    _fail_rate("pass_ndebt"),
+                    _fail_rate("pass_coverage"),
+                ],
+            }).sort_values("rechazos %", ascending=False)
+            st.dataframe(summary, use_container_width=True, hide_index=True)
 
-                def _fail_rate(col):
-                    if col in diag.columns:
-                        return (diag[col] == False).mean() * 100.0
-                    if "reason" in diag.columns:
-                        token = token_map.get(col, "")
-                        if token:
-                            return diag["reason"].fillna("").str.contains(token).mean() * 100.0
-                    return 0.0
-
-                summary = pd.DataFrame({
-                    "regla": list(token_map.values()),
-                    "rechazos %": [
-                        _fail_rate("pass_profit"),
-                        _fail_rate("pass_issuance"),
-                        _fail_rate("pass_assets"),
-                        _fail_rate("pass_accruals"),
-                        _fail_rate("pass_ndebt"),
-                        _fail_rate("pass_coverage"),
-                    ],
-                }).sort_values("rechazos %", ascending=False)
-                st.dataframe(summary, use_container_width=True, hide_index=True)
-
-
-
-            st.caption("Notas: 'profit_hits' cuenta {EBIT, CFO, FCF} > 0. Emisión neta solo penaliza si es positiva.")
-
+        st.caption("Notas: 'profit_hits' cuenta {EBIT, CFO, FCF} > 0. Emisión neta solo penaliza si es positiva.")
     except Exception as e:
         st.error(f"Error en guardrails: {e}")
+
 
 # ====== Paso 3: VFQ ======
 # ====== Paso 3: VFQ (PARCHE COMPLETO + UI BONITA) ======
