@@ -1,4 +1,5 @@
 from __future__ import annotations
+import altair as alt
 
 # --- poner esto ARRIBA DE TODO ---
 import os
@@ -475,13 +476,12 @@ if "pipeline_ready" not in st.session_state:
     st.session_state["pipeline_ready"] = False
 
 # ==================== TABS ====================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab6, tab7 = st.tabs(
     [
         "Universo",
         "Guardrails",
         "VFQ",
         "Señales",
-        "QVM (growth-aware)",
         "Export",
         "Backtesting",
     ]
@@ -1057,18 +1057,6 @@ with tab4:
         "- Si están bajas o estás en RISK OFF ⚠️, reduces agresividad / tamaño de posición."
     )
 
-# ====== TAB 5: QVM (growth-aware) ======
-with tab5:
-    st.subheader("QVM (growth-aware)")
-    if not st.session_state.get("pipeline_ready", False):
-        st.info(
-            "Aún no hay datos finales. Termina VFQ primero."
-        )
-    else:
-        st.write(
-            "Placeholder QVM growth-aware. Aquí luego aplicas compute_qvm_scores() + apply_megacap_rules()."
-        )
-
 
 # ====== TAB 6: EXPORT ======
 with tab6:
@@ -1081,7 +1069,247 @@ with tab6:
 # ====== TAB 7: BACKTESTING ======
 with tab7:
     st.subheader("Backtesting")
-    st.write(
-        "Acá va la simulación histórica con backtest_many(), plus métricas con perf_summary_from_returns()."
+
+    # -------------------------------
+    # 0. Recuperar candidatos y rango temporal
+    # -------------------------------
+    # usamos lo que dejó tab3/tab4:
+    vfq_keep = st.session_state.get("vfq_keep", pd.DataFrame())
+    if vfq_keep is None or vfq_keep.empty or "symbol" not in vfq_keep.columns:
+        st.warning(
+            "No hay símbolos aprobados en VFQ + técnico. "
+            "Corre las pestañas anteriores primero."
+        )
+        st.stop()
+
+    # universo base para testear
+    all_syms_bt = (
+        vfq_keep["symbol"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
     )
 
+    if not all_syms_bt:
+        st.warning("No hay símbolos válidos para backtest.")
+        st.stop()
+
+    # -------------------------------
+    # 1. Controles del backtest
+    # -------------------------------
+    st.markdown("#### Parámetros de simulación")
+
+    c_bt1, c_bt2, c_bt3 = st.columns(3)
+
+    with c_bt1:
+        top_n_bt = st.slider(
+            "N° máx. de símbolos a probar",
+            min_value=5,
+            max_value=min(50, len(all_syms_bt)),
+            value=min(20, len(all_syms_bt)),
+            step=1,
+            help="Para no pedir miles de series si el universo está grande."
+        )
+
+    with c_bt2:
+        cost_bps = st.number_input(
+            "Costo de trading (bps por cambio de postura)",
+            min_value=0,
+            max_value=100,
+            value=10,
+            step=1,
+            help="10 bps = 0.10% cada vez que giras in/out."
+        )
+        lag_days = st.number_input(
+            "Lag ejecución (días)",
+            min_value=0,
+            max_value=5,
+            value=0,
+            step=1,
+            help="Retraso en la ejecución después de la señal."
+        )
+
+    with c_bt3:
+        use_and_condition = st.toggle(
+            "Exigir MA200 Y Mom12-1 > 0 (no OR)",
+            value=False,
+            help="Si está apagado: entrar si MA200 o Mom12-1 está OK. "
+                 "Si está prendido: exigir ambas."
+        )
+        rebalance_freq = st.selectbox(
+            "Frecuencia rebalance",
+            options=["M", "W"],
+            index=0,
+            help="M = mensual, W = semanal. El modelo asume long-only binario."
+        )
+
+    # acotamos el set final a testear
+    syms_bt = all_syms_bt[:top_n_bt]
+
+    st.caption(
+        f"Testeando {len(syms_bt)} símbolos: {', '.join(syms_bt[:10])}"
+        + ("…" if len(syms_bt) > 10 else "")
+    )
+
+    # -------------------------------
+    # 2. Traer precios históricos
+    # -------------------------------
+    # usamos las fechas que ya definiste en sidebar ("Régimen & Fechas")
+    # si por algún motivo acá no existen start/end en este scope, hacemos fallback
+    try:
+        start_dt = pd.to_datetime(start).date()
+        end_dt   = pd.to_datetime(end).date()
+    except NameError:
+        start_dt = pd.to_datetime(DEFAULT_START).date()
+        end_dt   = pd.to_datetime(DEFAULT_END).date()
+
+    # cargamos panel OHLC para todos los tickers
+    # _cached_load_prices_panel debe devolver dict-like:
+    #   { "AAPL": df_price, ... }
+    # donde df_price.index es datetime y df_price["close"] existe.
+    price_panel = _cached_load_prices_panel(
+        symbols=syms_bt,
+        start=start_dt,
+        end=end_dt,
+        cache_key=f"bt_{start_dt}_{end_dt}_{len(syms_bt)}"
+    )
+
+    if price_panel is None or price_panel == {}:
+        st.error("No pude cargar precios históricos para backtest.")
+        st.stop()
+
+    # -------------------------------
+    # 3. Ejecutar backtest
+    # -------------------------------
+    # backtest_many viene de tu archivo backtests.py
+    bt_metrics, bt_curves = backtest_many(
+        panel=price_panel,
+        symbols=syms_bt,
+        cost_bps=int(cost_bps),
+        lag_days=int(lag_days),
+        use_and_condition=bool(use_and_condition),
+        rebalance_freq=str(rebalance_freq)
+    )
+
+    # -------------------------------
+    # 4. Mostrar métricas agregadas
+    # -------------------------------
+    st.markdown("#### Resultados por símbolo")
+
+    if bt_metrics is None or bt_metrics.empty:
+        st.warning("No hubo data suficiente para calcular métricas.")
+    else:
+        # formateo bonito
+        show_cols = ["symbol", "CAGR", "Sharpe", "Sortino", "MaxDD", "Turnover", "Trades"]
+        show_cols = [c for c in show_cols if c in bt_metrics.columns]
+
+        fmt_df = bt_metrics.copy()
+
+        # porcentajes legibles
+        if "CAGR" in fmt_df.columns:
+            fmt_df["CAGR"] = (fmt_df["CAGR"] * 100).round(2)
+        if "MaxDD" in fmt_df.columns:
+            fmt_df["MaxDD"] = (fmt_df["MaxDD"] * 100).round(2)
+        if "Turnover" in fmt_df.columns:
+            # turnover viene ~0..1. lo pasamos a % promedio por rebalance
+            fmt_df["Turnover"] = (fmt_df["Turnover"] * 100).round(2)
+
+        st.dataframe(
+            fmt_df[show_cols],
+            hide_index=True,
+            use_container_width=True
+        )
+
+        st.caption(
+            "- CAGR: rendimiento anualizado del sistema long-only binario.\n"
+            "- Sharpe / Sortino: calidad de retornos.\n"
+            "- MaxDD: peor drawdown desde pico.\n"
+            "- Turnover (%): cuánto cambias postura en promedio cada rebalance.\n"
+            "- Trades: cuántas veces el sistema pasó de fuera→dentro o dentro→fuera."
+        )
+
+    st.markdown("---")
+
+    # -------------------------------
+    # 5. Curvas de equity normalizadas
+    # -------------------------------
+    st.markdown("#### Curvas de equity normalizadas (1.0 = inicio)")
+
+    if not bt_curves:
+        st.info("No hay curvas de equity para graficar.")
+    else:
+        # bt_curves: dict {sym: Series equity}
+        # Las unimos en un DataFrame ancho y luego derretimos para Altair
+        eq_df = []
+        for sym, curve in bt_curves.items():
+            if curve is None or curve.empty:
+                continue
+            tmp = (
+                curve
+                .rename("equity")
+                .to_frame()
+                .reset_index()
+                .rename(columns={"index": "date"})
+            )
+            tmp["symbol"] = sym
+            eq_df.append(tmp)
+
+        if len(eq_df) == 0:
+            st.info("No se pudo armar data suficiente para el gráfico.")
+        else:
+            long_eq = pd.concat(eq_df, ignore_index=True)
+
+            # normalizar cada equity a 1.0 en su primer punto
+            def _norm_grp(g):
+                first_val = g["equity"].iloc[0] if len(g) else np.nan
+                if first_val and first_val != 0:
+                    g["equity_norm"] = g["equity"] / first_val
+                else:
+                    g["equity_norm"] = np.nan
+                return g
+
+            long_eq = (
+                long_eq
+                .sort_values(["symbol", "date"])
+                .groupby("symbol", group_keys=False)
+                .apply(_norm_grp)
+            )
+
+            chart = (
+                alt.Chart(long_eq)
+                .mark_line()
+                .encode(
+                    x=alt.X("date:T", title="Fecha"),
+                    y=alt.Y("equity_norm:Q", title="Equidad normalizada"),
+                    color=alt.Color("symbol:N", title="Símbolo"),
+                    tooltip=[
+                        alt.Tooltip("date:T", title="Fecha"),
+                        alt.Tooltip("symbol:N", title="Ticker"),
+                        alt.Tooltip("equity_norm:Q", title="Equidad norm.", format=".2f")
+                    ]
+                )
+                .properties(height=320)
+                .interactive()
+            )
+
+            st.altair_chart(chart, use_container_width=True)
+
+            st.caption(
+                "Cada línea = 'estar dentro cuando la señal está ON, en cash cuando está OFF', "
+                "reinvertido. Sirve para ver estabilidad comparada de cada ticker."
+            )
+
+    st.markdown("---")
+
+    # -------------------------------
+    # 6. Nota operativa
+    # -------------------------------
+    st.info(
+        "Cómo leer esto:\n"
+        "- Este backtest es súper simple: long-only binario por ticker, sin portfolio construction.\n"
+        "- La señal es tendencia/momentum (MA200 y/o Mom 12–1 > 0).\n"
+        "- El costo en bps castiga girar la posición.\n"
+        "- Lo importante aquí es el orden relativo: ¿qué tickers aguantan bien el swing? "
+        "Esos son los candidatos que vale la pena sobreponderar cuando estés en RISK ON."
+    )
