@@ -422,6 +422,18 @@ with tab2:
                     min_vfq_coverage=min_cov_guard
                 )
 
+                diag = normalize_guard_diag(diag_raw, df_guard)         # ya la tienes
+                bool_cols = ["pass_profit","pass_issuance","pass_assets",
+                            "pass_accruals","pass_ndebt","pass_coverage","pass_all"]
+                for c in bool_cols:
+                    if c in diag.columns:
+                        diag[c] = pd.Series(diag[c], dtype="boolean").fillna(False)
+
+                # numéricos útiles para ordenar/resumen
+                for c in ["profit_hits","coverage_count","net_issuance","asset_growth","accruals_ta","netdebt_ebitda"]:
+                    if c in diag.columns:
+                        diag[c] = pd.to_numeric(diag[c], errors="coerce")
+
                 # 4) Normaliza diagnóstico y kept
                 diag = normalize_guard_diag(diag_raw, df_guard)
                 kept = diag.loc[diag["pass_all"], ["symbol"]].copy()
@@ -465,6 +477,19 @@ with tab2:
                 )
             else:
                 st.dataframe(diag_view[cols_show], use_container_width=True, hide_index=True)
+
+        diag_view = diag.copy()
+        if isinstance(uni, pd.DataFrame) and "symbol" in uni.columns:
+            diag_view = diag_view.merge(
+                uni[["symbol","sector"]].drop_duplicates("symbol"),
+                on="symbol", how="left"
+            )
+
+        for c in ["pass_profit","pass_issuance","pass_assets",
+                "pass_accruals","pass_ndebt","pass_coverage","pass_all"]:
+            if c in diag_view.columns:
+                # tras el merge, forzamos nuevamente a boolean nullable
+                diag_view[c] = pd.Series(diag_view[c], dtype="boolean").fillna(False)
 
         # --- Resumen de rechazos ---
         if not diag.empty and "pass_all" in diag.columns:
