@@ -336,12 +336,8 @@ vfq_cfg = dict(
 with tab1:
     st.subheader("Universo inicial")
 
-    # Aquí tú ya tienes tu screener original que genera df_universo_filtrado.
-    # Para este ejemplo voy a simularlo:
-    # df_universo_filtrado debe tener al menos symbol, sector, market_cap.
-
+    # si no hay universo todavía, lo generamos (mock por ahora)
     if "uni" not in st.session_state:
-        # MOCK: genera universo random
         mock_syms = [f"TCKR{i}" for i in range(800)]
         df_universo_filtrado = pd.DataFrame({
             "symbol": mock_syms,
@@ -351,14 +347,33 @@ with tab1:
             ),
             "market_cap": np.random.uniform(5e9, 5e11, size=len(mock_syms)),
         })
-        # puedes filtrar acá tus ETFs, penny stocks, etc:
-        # df_universo_filtrado = df_universo_filtrado[condiciones...]
+        # acá podrías filtrar IPO reciente, market cap mínimo, sacar ETFs, etc.
+        # df_universo_filtrado = filter_universe(...)
+
         st.session_state["uni"] = df_universo_filtrado.copy()
 
-    uni_df = st.session_state["uni"]
+    # en este punto SIEMPRE hay uni en session_state
+    uni_df = st.session_state["uni"].copy()
+
+    # nos aseguramos de que tenga solo las columnas core y sin NaN raros
+    needed_cols = ["symbol","sector","market_cap"]
+    for col in needed_cols:
+        if col not in uni_df.columns:
+            # si falta algo lo creamos vacío para no romper las tabs siguientes
+            if col == "symbol":
+                uni_df[col] = []
+            elif col == "sector":
+                uni_df[col] = "Unknown"
+            elif col == "market_cap":
+                uni_df[col] = np.nan
+
+    uni_df = uni_df[needed_cols].dropna(subset=["symbol"]).reset_index(drop=True)
+
+    # guardamos la versión "limpia" otra vez en session_state
+    st.session_state["uni"] = uni_df.copy()
 
     total_raw = len(uni_df)
-    total_filtrado = len(uni_df)  # ponle lógica real si haces filtros previos
+    total_filtrado = len(uni_df)  # acá luego puedes mostrar antes/después de filtros reales
 
     c1, c2 = st.columns(2)
     c1.metric("Screener", f"{total_raw}")
@@ -371,7 +386,7 @@ with tab1:
     )
 
     st.caption("Esta tabla se guarda como `st.session_state['uni']` y alimenta las demás pestañas.")
-    st.session_state["uni"] = df_universo_filtrado[["symbol","sector","market_cap"]].copy()
+
 
 
 ## ====== Paso 2: FUNDAMENTALES & GUARDRAILS ======
