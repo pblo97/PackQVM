@@ -365,118 +365,183 @@ with tab2:
     st.subheader("Guardrails")
 
     try:
+        # Universo ya filtrado en Tab1
         uni = st.session_state.get("uni", pd.DataFrame())
-        kept = pd.DataFrame(columns=["symbol"])
-        diag = pd.DataFrame()
-
-        if run_btn and not uni.empty and "symbol" in uni.columns:
-            syms = (
-                uni["symbol"]
-                .dropna().astype(str).unique().tolist()
-            )
-            if not syms:
-                st.info("No hay símbolos en el universo. Ejecuta el screener primero.")
-                st.stop()
-
-            # leemos los sliders actuales de la sidebar
-            profit_hits   = int(profit_hits)
-            max_issuance  = float(max_issuance)
-            max_assets    = float(max_assets)
-            max_accr      = float(max_accr)
-            max_ndeb      = float(max_ndeb)
-            min_cov_guard = int(min_cov_guard)
-
-            cache_tag = st.session_state.get("cache_tag", "v1")
-
-            with st.status("Descargando métricas de guardrails…", expanded=False) as status:
-                # 1) descargamos data fundamental cruda tipo guardrails
-                try:
-                    df_guard = _cached_download_guardrails(tuple(syms), cache_key=cache_tag)
-                except Exception:
-                    df_guard = download_guardrails_batch(syms, cache_key=cache_tag, force=False)
-
-                # 2) coverage_count (cuántas métricas value/quality tenemos para ese símbolo)
-                coverage_cols_guess = [
-                    "inv_ev_ebitda","fcf_yield",
-                    "gross_profitability","roic","roa","netMargin"
-                ]
-                cov_cols = [c for c in coverage_cols_guess if c in df_guard.columns]
-                if cov_cols:
-                    df_guard["coverage_count"] = df_guard[cov_cols].notna().sum(axis=1).astype(int)
-                else:
-                    df_guard["coverage_count"] = 0
-
-                # 3) aplicamos guardrails duros con TU función
-                kept_raw, diag_raw = apply_quality_guardrails(
-                    df_guard=df_guard,
-                    require_profit_floor=(profit_hits > 0),
-                    profit_floor_min_hits=profit_hits,
-                    max_net_issuance=max_issuance,
-                    max_asset_growth=max_assets,
-                    max_accruals_ta=max_accr,
-                    max_netdebt_ebitda=max_ndeb,
-                    min_vfq_coverage=min_cov_guard,
-                )
-
-                # normalizamos las columnas booleanas / numéricas
-                diag = normalize_guard_diag(diag_raw, df_guard)
-                for c in ["pass_profit","pass_issuance","pass_assets",
-                          "pass_accruals","pass_ndebt","pass_coverage","pass_all"]:
-                    if c in diag.columns:
-                        diag[c] = pd.Series(diag[c], dtype="boolean").fillna(False)
-
-                for c in ["profit_hits","coverage_count","net_issuance",
-                          "asset_growth","accruals_ta","netdebt_ebitda"]:
-                    if c in diag.columns:
-                        diag[c] = pd.to_numeric(diag[c], errors="coerce")
-
-                kept = diag.loc[diag["pass_all"], ["symbol"]].dropna().astype({"symbol":str}).drop_duplicates()
-
-                status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
-
-            # guardamos en sesión para las pestañas siguientes
-            st.session_state["kept"] = kept
-            st.session_state["guard_diag"] = diag
-            st.session_state["pipeline_ready"] = False
-
-        elif "kept" in st.session_state and "guard_diag" in st.session_state:
-            kept = st.session_state["kept"]
-            diag = normalize_guard_diag(st.session_state["guard_diag"])
-        else:
-            st.info("Primero ejecuta **Universo** (pestaña 1) y luego aprieta Ejecutar.")
+        if uni is None or uni.empty or "symbol" not in uni.columns:
+            st.info("Primero corre **Universo** (botón Ejecutar).")
             st.stop()
 
-        # métricas resumen
-        total_uni = len(st.session_state.get("uni", pd.DataFrame()))
-        c1, c2 = st.columns(2)
-        c1.metric("Pasan guardrails", f"{len(kept):,}")
-        c2.metric("Rechazados", f"{total_uni - len(kept):,}")
+        # Lista de símbolos candidata
+        syms = (
+            uni["symbol"]
+            .dropna().astype(str).unique().tolist()
+        )
+        if not syms:
+            st.info("No hay símbolos en el universo.")
+            st.stop()
 
-        # tabla diagnóstica
-        uni_df = st.session_state.get("uni", pd.DataFrame())
-        diag_view = diag.merge(
-            uni_df[["symbol","sector"]].drop_duplicates("symbol"),
-            on="symbol", how="left"
+        # sliders base que definen las reglas
+        profit_hits   = int(st.session_state.get("profit_hits",   2))
+        max_issuance  = float(st.session_state.get("max_issuance", 0.03))
+        max_assets    = float(st.session_state.get("max_assets",   0.20))
+        max_accr      = float(st.session_state.get("max_accr",     0.10))
+        max_ndeb      = float(st.session_state.get("max_ndeb",     3.0))
+        min_cov_guard = int(st.session_state.get("min_cov_guard",  2))
+
+        # cache tag
+        cache_tag = st.session_state.get("cache_tag", "v1")
+
+        # =========================
+        # 1. Descarga métricas crudas
+        # =========================
+        with st.status("Descargando métricas de guardrails…", expanded=False) as status:
+            try:
+                df_guard = _cached_download_guardrails(tuple(syms), cache_key=cache_tag)
+            except Exception:
+                # fallback sin caché
+                from fundamentals import download_guardrails_batch
+                df_guard = download_guardrails_batch(syms, cache_key=cache_tag, force=False)
+
+            # Asegurar que haya 'symbol'
+            if "symbol" not in df_guard.columns:
+                if df_guard.index.name == "symbol":
+                    df_guard = df_guard.reset_index()
+                else:
+                    df_guard = df_guard.reset_index().rename(columns={"index": "symbol"})
+            df_guard["symbol"] = df_guard["symbol"].astype(str)
+
+            # =========================
+            # 2. coverage_count ROBUSTO
+            # =========================
+            # idea: contar cuánta info fundamental útil tenemos por ticker.
+            # Tomamos TODAS las columnas numéricas relevantes si existen.
+            coverage_possible_cols = [
+                # value / calidad típicos
+                "evToEbitda","fcf_ttm","grossProfitTTM","roic","roa","netMargin",
+                "inv_ev_ebitda","fcf_yield","gross_profitability",
+                "netdebt_ebitda","accruals_ta","asset_growth",
+                "profit_hits",
+            ]
+            cols_exist = [c for c in coverage_possible_cols if c in df_guard.columns]
+
+            if cols_exist:
+                df_guard["coverage_count"] = (
+                    df_guard[cols_exist]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .notna()
+                    .sum(axis=1)
+                    .astype(int)
+                )
+            else:
+                # si no tenemos nada útil todavía, 0
+                df_guard["coverage_count"] = 0
+
+            # =========================
+            # 3. Relajar cobertura si TODOS salen 0
+            # =========================
+            dyn_min_cov = min_cov_guard
+            zeros_ratio = (df_guard["coverage_count"] == 0).mean()
+            if zeros_ratio >= 0.90:
+                # si el 90%+ no tiene cobertura VFQ suficiente,
+                # bajamos el requisito de cobertura a 0
+                dyn_min_cov = 0
+
+            # =========================
+            # 4. Aplicar reglas reales
+            # =========================
+            kept_raw, diag_raw = apply_quality_guardrails(
+                df_guard=df_guard,
+                require_profit_floor=bool(profit_hits > 0),
+                profit_floor_min_hits=profit_hits,
+                max_net_issuance=max_issuance,
+                max_asset_growth=max_assets,
+                max_accruals_ta=max_accr,
+                max_netdebt_ebitda=max_ndeb,
+                min_vfq_coverage=dyn_min_cov,
+            )
+            # -> kept_raw: DataFrame con símbolos que pasaron
+            # -> diag_raw: DataFrame diagnóstico con pass_* calculados internamente
+
+            status.update(
+                label=f"Guardrails OK: {len(kept_raw)} / {len(df_guard)}",
+                state="complete"
+            )
+
+        # =========================
+        # 5. Normalizar diag_raw SUAVEMENTE
+        # =========================
+        # Queremos:
+        #  - tener 'symbol'
+        #  - tener sector desde 'uni'
+        #  - NO reescribir pass_* con False a ciegas
+        diag_view = diag_raw.copy()
+
+        # asegurar 'symbol'
+        if "symbol" not in diag_view.columns:
+            if diag_view.index.name == "symbol":
+                diag_view = diag_view.reset_index()
+            else:
+                diag_view = diag_view.reset_index().rename(columns={"index": "symbol"})
+        diag_view["symbol"] = diag_view["symbol"].astype(str)
+
+        # mezcla sector desde universo
+        if "sector" in uni.columns:
+            diag_view = diag_view.merge(
+                uni[["symbol","sector"]].drop_duplicates("symbol"),
+                on="symbol",
+                how="left"
+            )
+        else:
+            diag_view["sector"] = "Unknown"
+
+        # queremos ver estas columnas si existen
+        ordered_cols = [
+            "symbol","sector",
+            "pass_all",
+            "profit_hits","coverage_count",
+            "asset_growth","accruals_ta","netdebt_ebitda",
+            "pass_profit","pass_issuance","pass_assets",
+            "pass_accruals","pass_ndebt","pass_coverage"
+        ]
+        cols_show = [c for c in ordered_cols if c in diag_view.columns]
+
+        # =========================
+        # 6. Guardar en sesión para Tab3
+        # =========================
+        st.session_state["kept"] = (
+            kept_raw[["symbol"]].drop_duplicates().copy()
+            if isinstance(kept_raw, pd.DataFrame) and "symbol" in kept_raw.columns
+            else pd.DataFrame(columns=["symbol"])
         )
 
-        cols_show = [
-            "symbol","sector","pass_all","profit_hits","coverage_count",
-            "net_issuance","asset_growth","accruals_ta","netdebt_ebitda",
-            "pass_profit","pass_issuance","pass_assets","pass_accruals",
-            "pass_ndebt","pass_coverage","reason"
-        ]
-        cols_show = [c for c in cols_show if c in diag_view.columns]
+        st.session_state["guard_diag"] = diag_view.copy()
+        st.session_state["pipeline_ready"] = False  # Tab3 recalcula a partir de acá
 
-        st.dataframe(
-            diag_view[cols_show].sort_values(
-                ["pass_all","profit_hits","coverage_count"], ascending=[False,False,False]
-            ),
-            use_container_width=True,
-            hide_index=True
+        # =========================
+        # 7. Métricas rápidas arriba
+        # =========================
+        c1, c2 = st.columns(2)
+        c1.metric("Pasan guardrails", f"{len(st.session_state['kept']):,}")
+        c2.metric("Rechazados", f"{len(df_guard) - len(st.session_state['kept']):,}")
+
+        # También mostramos ese número en un expander
+        with st.expander(f"Guardrails OK: {len(st.session_state['kept'])} / {len(df_guard)}", expanded=True):
+            st.dataframe(
+                diag_view[cols_show],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        # Nota interpretativa al pie
+        st.caption(
+            "pass_all = todas las barreras aprobadas simultáneamente. "
+            "Si ves 0 en coverage_count para casi todos, relajamos el umbral de cobertura "
+            "para que no bloquee todo el universo cuando aún no está descargada la data completa."
         )
 
     except Exception as e:
-        st.error(f"Error en guardrails: {e}")
+        st.error(f"Error en Guardrails: {e}")
+
 
 
 # ====== Paso 3: VFQ ======
