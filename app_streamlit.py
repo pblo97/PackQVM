@@ -59,9 +59,55 @@ from factors_growth_aware import compute_qvm_scores, apply_megacap_rules
 
 # ------------------ CACHÉ DE I/O ------------------
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_run_fmp_screener(limit: int) -> pd.DataFrame:
-    # fetch_profiles=True baja sector/industry del perfil en la misma pasada
-    return run_fmp_screener(limit=limit, fetch_profiles=True)
+def _cached_run_fmp_screener(
+    *,
+    limit: int,
+    mcap_min: float,
+    volume_min: int,
+    ipo_days: int,
+    cache_key: str,
+) -> pd.DataFrame:
+    """
+    Pide universo a FMP con filtros básicos (sin ETFs, sin fondos, activo),
+    luego aplica filtros post-request: market cap, volumen y antigüedad IPO.
+    """
+    df = run_fmp_screener(
+        limit=limit,
+        mcap_min=mcap_min,
+        volume_min=volume_min,
+        fetch_profiles=True,
+        cache_key=cache_key,
+        force=False,
+        # Asegúrate que run_fmp_screener ya está mandando:
+        #   isEtf=false
+        #   isFund=false
+        #   isActivelyTrading=true
+    )
+
+    # normalizamos nombres probables
+    if "marketCap" in df.columns and "market_cap" not in df.columns:
+        df["market_cap"] = pd.to_numeric(df["marketCap"], errors="coerce")
+
+    # filtro de market cap adicional (por si la API igual devuelve basura)
+    df = df[df["market_cap"] >= float(mcap_min)]
+
+    # filtro de volumen si la API trae "volume"
+    if "volume" in df.columns:
+        df = df[pd.to_numeric(df["volume"], errors="coerce") >= float(volume_min)]
+
+    # filtro IPO age si trae 'ipoDate'
+    if "ipoDate" in df.columns:
+        cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=int(ipo_days))
+        df["ipoDate"] = pd.to_datetime(df["ipoDate"], errors="coerce", utc=True)
+        df = df[df["ipoDate"] < cutoff]
+
+    # asegurar sector
+    if "sector" not in df.columns:
+        df["sector"] = "Unknown"
+    df["sector"] = df["sector"].astype(str).replace({"": "Unknown"}).fillna("Unknown")
+
+    # quedarnos con columnas core + lo que ya traiga
+    return df.reset_index(drop=True)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_download_guardrails(symbols: Tuple[str, ...], cache_key: str) -> pd.DataFrame:
@@ -242,8 +288,25 @@ with st.sidebar:
 
     with st.expander("Universo & Screener", expanded=True):
         limit = st.slider("Límite del universo", 50, 1000, 300, 50)
-        min_mcap = st.number_input("MarketCap mínimo (USD)", value=5e8, step=1e8, format="%.0f")
-        ipo_days = st.slider("Antigüedad IPO (días)", 90, 1500, 365, 30)
+
+        min_mcap = st.number_input(
+            "MarketCap mínimo (USD)",
+            value=5e8,
+            step=1e8,
+            format="%.0f"
+        )
+
+        volume_min = st.number_input(
+            "Volumen mínimo diario",
+            value=500_000,
+            step=50_000,
+            format="%.0f"
+        )
+
+        ipo_days = st.slider(
+            "Antigüedad IPO (días)",
+            90, 1500, 365, 30
+        )
 
     with st.expander("Fundamentales & Guardrails", expanded=False):
         min_cov_guard = st.slider("Cobertura VFQ mínima (# métricas)", 1, 4, 2)
@@ -336,44 +399,61 @@ vfq_cfg = dict(
 with tab1:
     st.subheader("Universo inicial")
 
-    # si no hay universo todavía, lo generamos (mock por ahora)
-    if "uni" not in st.session_state:
-        mock_syms = [f"TCKR{i}" for i in range(800)]
-        df_universo_filtrado = pd.DataFrame({
-            "symbol": mock_syms,
-            "sector": np.random.choice(
-                ["Technology","Healthcare","Financial Services","Energy","Industrials","nan"],
-                size=len(mock_syms)
-            ),
-            "market_cap": np.random.uniform(5e9, 5e11, size=len(mock_syms)),
-        })
-        # acá podrías filtrar IPO reciente, market cap mínimo, sacar ETFs, etc.
-        # df_universo_filtrado = filter_universe(...)
+    # ¿Necesitamos refrescar universo?
+    # Sí si:
+    #   - aún no existe en session_state
+    #   - o apretaste "Ejecutar"
+    if ("uni" not in st.session_state) or run_btn:
+        raw_universe = _cached_run_fmp_screener(
+            limit=limit,
+            mcap_min=min_mcap,
+            volume_min=volume_min,
+            ipo_days=ipo_days,
+            cache_key=cache_tag,
+        )
 
-        st.session_state["uni"] = df_universo_filtrado.copy()
+        # Aseguramos columnas mínimas:
+        # symbol (ticker), sector, market_cap
+        out = raw_universe.copy()
 
-    # en este punto SIEMPRE hay uni en session_state
+        if "symbol" not in out.columns:
+            # si FMP devolviera "ticker" en vez de "symbol"
+            if "ticker" in out.columns:
+                out["symbol"] = out["ticker"].astype(str)
+            else:
+                out["symbol"] = ""
+
+        if "market_cap" not in out.columns:
+            if "marketCap" in out.columns:
+                out["market_cap"] = pd.to_numeric(out["marketCap"], errors="coerce")
+            else:
+                out["market_cap"] = np.nan
+
+        if "sector" not in out.columns:
+            out["sector"] = "Unknown"
+        else:
+            s = out["sector"].astype(str)
+            s = s.replace({"": "Unknown"})
+            s = s.where(~s.isna(), "Unknown")
+            out["sector"] = s
+
+        # limpieza final de NaNs raros en symbol
+        out = (
+            out[["symbol", "sector", "market_cap"]]
+            .dropna(subset=["symbol"])
+            .reset_index(drop=True)
+        )
+
+        # Guardamos en session_state para que otras tabs usen lo mismo
+        st.session_state["uni"] = out.copy()
+
+    # ahora leemos lo que tengamos guardado
     uni_df = st.session_state["uni"].copy()
 
-    # nos aseguramos de que tenga solo las columnas core y sin NaN raros
-    needed_cols = ["symbol","sector","market_cap"]
-    for col in needed_cols:
-        if col not in uni_df.columns:
-            # si falta algo lo creamos vacío para no romper las tabs siguientes
-            if col == "symbol":
-                uni_df[col] = []
-            elif col == "sector":
-                uni_df[col] = "Unknown"
-            elif col == "market_cap":
-                uni_df[col] = np.nan
-
-    uni_df = uni_df[needed_cols].dropna(subset=["symbol"]).reset_index(drop=True)
-
-    # guardamos la versión "limpia" otra vez en session_state
-    st.session_state["uni"] = uni_df.copy()
-
     total_raw = len(uni_df)
-    total_filtrado = len(uni_df)  # acá luego puedes mostrar antes/después de filtros reales
+    # acá podrías aplicar más filtros (por ejemplo quitar OTC, penny, China ADR si quieres),
+    # y contar cuántos sobrevivieron. Por ahora son iguales:
+    total_filtrado = len(uni_df)
 
     c1, c2 = st.columns(2)
     c1.metric("Screener", f"{total_raw}")
@@ -385,7 +465,9 @@ with tab1:
         use_container_width=True
     )
 
-    st.caption("Esta tabla se guarda como `st.session_state['uni']` y alimenta las demás pestañas.")
+    st.caption(
+        "Esta tabla se guarda como st.session_state['uni'] y alimenta las demás pestañas."
+    )
 
 
 
