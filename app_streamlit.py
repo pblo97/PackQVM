@@ -570,167 +570,180 @@ def _numcol(df: pd.DataFrame, col: str) -> pd.Series:
 # ====== Paso 3: VFQ (PARCHE COMPLETO) ======
 # ====== Paso 3: VFQ (PARCHE COMPLETO) ======
 with tab3:
-    st.subheader("VFQ / Selección final")
+    st.subheader("VFQ (Value / Quality / Flow)")
 
     try:
-        # ========= 1. sliders VFQ =========
-        min_quality   = float(st.slider("Min Quality neut.", 0.0, 1.0, 0.0))
-        min_value     = float(st.slider("Min Value neut.",   0.0, 1.0, 0.0))
-        min_acc_pct   = float(st.slider("Accruals (NOA) percentil mínimo", 0.0, 100.0, 30.0))
-        max_ndebt     = float(st.slider("Max NetDebt/EBITDA", 0.0, 10.0, 1.5))
-        min_brk_score = float(st.slider("Min BreakoutScore", 0.0, 100.0, 60.0))
-        min_hits      = int(st.slider("Min hits", 0, 5, 2))
-        min_rvol20    = float(st.slider("Min RVOL20", 0.0, 5.0, 1.5))
-        beta_cut      = float(st.slider("β prob_up (logit)", 0.0, 10.0, 6.0))
-        topN          = int(st.slider("Top N por prob_up", 1, 100, 30))
-
-        # ========= 2. necesitamos la data base "candidatos" =========
-        # guard_diag viene de tab2; incluye symbol y métricas fundamentales limpias
+        # 1. necesitamos guardrails aprobados
         guard_diag = st.session_state.get("guard_diag", pd.DataFrame())
-        kept_syms_df = st.session_state.get("kept", pd.DataFrame())  # symbols que pasaron guardrails duros
-        uni          = st.session_state.get("uni", pd.DataFrame())   # universo con 'sector', 'market_cap', etc.
-        tech_features = st.session_state.get("tech_features", pd.DataFrame())
-        # NOTA: tú tienes que asegurarte ANTES (en tu pipeline) de guardar algo tipo:
-        # st.session_state["tech_features"] = df_tech  # df_tech con cols:
-        #   symbol, BreakoutScore, hits, RVOL20, prob_up, ClosePos, etc.
-        #
-        # Si ese nombre en tu código real es distinto (ej: st.session_state["signals"] o "rank_df"),
-        # reemplaza tech_features = ... con el correcto.
+        kept       = st.session_state.get("kept", pd.DataFrame())
 
-        # --- aseguramos que symbol sea string para merge estable
-        for _df in [guard_diag, kept_syms_df, uni, tech_features]:
-            if isinstance(_df, pd.DataFrame) and "symbol" in _df.columns:
-                _df["symbol"] = _df["symbol"].astype(str)
+        if guard_diag.empty or kept.empty:
+            st.info("Primero corre Guardrails.")
+            st.stop()
 
-        # --- df de fundamentales "limpios"
-        # asumo que guard_diag ya trae columnas tipo:
-        #   quality_adj_neut, value_adj_neut, ndebt_ebitda, acc_pct, etc.
-        fund_cols = [
-            "symbol",
-            "quality_adj_neut", "value_adj_neut",
-            "ndebt_ebitda", "acc_pct"
-        ]
-        fund_df = guard_diag[[c for c in fund_cols if c in guard_diag.columns]].drop_duplicates("symbol")
+        # --- asegurar columna 'symbol' en kept ---
+        if "symbol" not in kept.columns:
+            # a veces kept viene sin 'symbol' explícito y está en el índice
+            kept = kept.copy()
+            if kept.index.name == "symbol":
+                kept = kept.reset_index()
+            else:
+                kept["symbol"] = kept.index.astype(str)
 
-        # --- df con sector / market_cap
-        base_cols = ["symbol", "sector", "market_cap"]
-        base_df = uni[[c for c in base_cols if c in uni.columns]].drop_duplicates("symbol")
+        # limpiamos símbolos
+        kept_syms = (
+            kept["symbol"]
+            .dropna()
+            .astype(str)
+            .unique()
+            .tolist()
+        )
 
-        # --- df técnico / señales
-        tech_cols = [
-            "symbol",
-            "BreakoutScore","hits","RVOL20","prob_up",
-            "ClosePos","P52","UDVol20","ATR_pct","risk_on","signal_breakout"
-        ]
-        tech_df = tech_features[[c for c in tech_cols if c in tech_features.columns]].drop_duplicates("symbol")
+        if not kept_syms:
+            st.warning("Guardrails no dejó símbolos válidos.")
+            st.stop()
 
-        # --- combinamos todo en un dataframe de candidatos post-guardrails DUROS
-        # sólo consideramos símbolos que pasaron guardrails duros
-        if not kept_syms_df.empty and "symbol" in kept_syms_df.columns:
-            allowed_syms = kept_syms_df["symbol"].astype(str).unique().tolist()
-            df_cand = (
-                fund_df.merge(base_df, on="symbol", how="left")
-                       .merge(tech_df, on="symbol", how="left")
+        # 2. bajamos métricas de valor/calidad/whatever que uses en VFQ
+        cache_tag = st.session_state.get("cache_tag", "v1")
+
+        # Traemos métricas VFQ sin caché fancy.
+        # Intento 1: usa una función batch que tú tengas en fundamentals.
+        try:
+            from fundamentals import download_vfq_batch
+            df_vfq_raw = download_vfq_batch(
+                kept_syms,
+                cache_key=cache_tag,
+                force=False
             )
-            df_cand = df_cand[df_cand["symbol"].isin(allowed_syms)].copy()
+        except Exception as _err:
+            # Intento 2: fallback genérico. Creamos un DF mínimo con solo 'symbol'
+            # para que no reviente el flujo (esto evita crashear, pero va a mostrar casi todo vacío).
+            import pandas as pd
+            df_vfq_raw = pd.DataFrame({"symbol": kept_syms})
+
+        # --- asegurar columna 'symbol' en df_vfq_raw ---
+        if "symbol" not in df_vfq_raw.columns:
+            df_vfq_raw = df_vfq_raw.copy()
+            if df_vfq_raw.index.name == "symbol":
+                df_vfq_raw = df_vfq_raw.reset_index()
+            else:
+                df_vfq_raw["symbol"] = df_vfq_raw.index.astype(str)
+
+        # 3. merge con diag (para tener deuda neta, accruals, etc. si los quieres filtrar)
+        df_merge = df_vfq_raw.merge(
+            guard_diag[["symbol","netdebt_ebitda","accruals_ta","pass_all"]],
+            on="symbol",
+            how="left"
+        )
+
+        # 4. sliders de VFQ
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            min_quality = st.slider("Min Quality neut.", 0.0, 1.0, 0.0, 0.01)
+            min_value   = st.slider("Min Value neut.",   0.0, 1.0, 0.0, 0.01)
+            max_ndebt   = st.slider("Max NetDebt/EBITDA", 0.0, 5.0, 1.5, 0.1)
+        with c2:
+            min_acc_pct = st.slider("Accruals (NOA) percentil mínimo", 0, 100, 30, 1)
+            min_hits    = st.slider("Min hits", 0, 5, 2, 1)
+            min_rvol20  = st.slider("Min RVOL20", 0.0, 5.0, 1.5, 0.05)
+        with c3:
+            min_breakout = st.slider("Min BreakoutScore", 0, 100, 60, 1)
+            beta_prob    = st.slider("β prob_up (logit)", 0.0, 10.0, 6.0, 0.1)
+            topN_prob    = st.slider("Top N por prob_up", 5, 100, 30, 1)
+
+        # 5. aplicar filtros VFQ básicos
+        #   asumimos que df_vfq_raw trae columnas como:
+        #   'quality_adj_neut', 'value_adj_neut', 'acc_pct' (accrual rank %),
+        #   'hits', 'BreakoutScore', 'RVOL20', 'prob_up', etc.
+        df_vfq = df_merge.copy()
+
+        # BLINDAJE: crea columnas faltantes con defaults
+        defaults = {
+            "quality_adj_neut": 0.0,
+            "value_adj_neut":   0.0,
+            "acc_pct":          100.0,
+            "hits":             0,
+            "BreakoutScore":    0.0,
+            "RVOL20":           0.0,
+            "prob_up":          0.0,
+            "netdebt_ebitda":   None,
+        }
+        for col, val in defaults.items():
+            if col not in df_vfq.columns:
+                df_vfq[col] = val
+
+        # máscara sanitaria
+        mask = (
+            (df_vfq["quality_adj_neut"] >= float(min_quality)) &
+            (df_vfq["value_adj_neut"]   >= float(min_value))   &
+            (df_vfq["hits"].fillna(0)   >= int(min_hits))      &
+            (df_vfq["BreakoutScore"].fillna(0) >= int(min_breakout)) &
+            (df_vfq["RVOL20"].fillna(0) >= float(min_rvol20))
+        )
+
+        # NetDebt/EBITDA máximo (si hay NaN, los dejamos pasar)
+        ndebt_ok = (
+            df_vfq["netdebt_ebitda"].isna() |
+            (pd.to_numeric(df_vfq["netdebt_ebitda"], errors="coerce") <= float(max_ndebt))
+        )
+        mask &= ndebt_ok
+
+        # Accruals / NOA percentile mínimo:
+        # acá asumo que acc_pct = "qué tan sano estoy" (menor = peor);
+        # si en tu data es al revés, invierte la desigualdad.
+        mask &= (pd.to_numeric(df_vfq["acc_pct"], errors="coerce").fillna(100) >= float(min_acc_pct))
+
+        # guardamos la máscara para Tab4 (fallback clean)
+        st.session_state["mask_sane"] = mask.copy()
+
+        df_clean = df_vfq.loc[mask].copy()
+
+        # 6. ranking por prob_up (mayor mejor)
+        if "prob_up" in df_clean.columns:
+            df_clean = df_clean.sort_values("prob_up", ascending=False)
         else:
-            df_cand = pd.DataFrame()
+            # fallback: ordena por BreakoutScore si no tienes prob_up en este punto
+            df_clean = df_clean.sort_values("BreakoutScore", ascending=False)
 
-        # ========= 3. aplicar filtros VFQ (estos son tus sliders suaves) =========
-        def _passes_row(r):
-            """devuelve True si el símbolo pasa TODOS los sliders VFQ."""
-            # quality / value
-            if "quality_adj_neut" in r and pd.notna(r["quality_adj_neut"]):
-                if r["quality_adj_neut"] < min_quality:
-                    return False
-            if "value_adj_neut" in r and pd.notna(r["value_adj_neut"]):
-                if r["value_adj_neut"] < min_value:
-                    return False
+        # 7. limitar al Top N por prob_up
+        top_view = df_clean.head(int(topN_prob)).copy()
 
-            # accruals como percentil "acc_pct" = mientras MÁS alto mejor calidad (menos accrual raro)
-            # tú definiste ese slider como "percentil mínimo".
-            if "acc_pct" in r and pd.notna(r["acc_pct"]):
-                if r["acc_pct"]*100.0 < min_acc_pct:
-                    return False
+        # mostramos dos cosas:
+        st.markdown("### 🟢 Selección VFQ filtrada")
+        st.dataframe(
+            top_view,
+            use_container_width=True,
+            hide_index=True
+        )
 
-            # deuda neta / ebitda
-            if "ndebt_ebitda" in r and pd.notna(r["ndebt_ebitda"]):
-                if r["ndebt_ebitda"] > max_ndebt:
-                    return False
+        # y también mostramos los que quedaron fuera por guardrails,
+        # para diagnóstico (esto es lo que está en tu screenshot)
+        st.markdown("### 🧹 Rechazados por guardrails")
+        # símbolos dropeados = kept_syms que no están en df_clean
+        dropped_syms = sorted(set(kept_syms) - set(df_clean["symbol"].astype(str)))
+        dropped_view = df_vfq[df_vfq["symbol"].astype(str).isin(dropped_syms)].copy()
 
-            # técnica
-            if "BreakoutScore" in r and pd.notna(r["BreakoutScore"]):
-                if r["BreakoutScore"] < min_brk_score:
-                    return False
+        st.dataframe(
+            dropped_view[[
+                c for c in [
+                    "symbol","sector","market_cap",
+                    "quality_adj_neut","value_adj_neut",
+                    "netdebt_ebitda","acc_pct","BreakoutScore",
+                    "hits","RVOL20","prob_up"
+                ] if c in dropped_view.columns
+            ]],
+            use_container_width=True,
+            hide_index=True
+        )
 
-            if "hits" in r and pd.notna(r["hits"]):
-                if r["hits"] < min_hits:
-                    return False
+        # 8. guardamos lo que Tab4 necesita
+        #    trade_candidates = mi watchlist final real para señales
+        st.session_state["vfq"] = df_clean.reset_index(drop=True)
+        st.session_state["vfq_sel"] = top_view[["symbol"]].drop_duplicates()
+        st.session_state["trade_candidates"] = top_view[["symbol"]].drop_duplicates()
 
-            if "RVOL20" in r and pd.notna(r["RVOL20"]):
-                if r["RVOL20"] < min_rvol20:
-                    return False
-
-            # prob_up (tu modelo logit de upside / expected outperformance)
-            if "prob_up" in r and pd.notna(r["prob_up"]):
-                if r["prob_up"] < beta_cut:
-                    return False
-
-            # riesgo macro (opcional pero MUY lógico)
-            if "risk_on" in r and pd.notna(r["risk_on"]):
-                if not bool(r["risk_on"]):
-                    return False
-
-            if "signal_breakout" in r and pd.notna(r["signal_breakout"]):
-                if not bool(r["signal_breakout"]):
-                    return False
-
-            return True
-
-        df_cand["vfq_pass"] = df_cand.apply(_passes_row, axis=1)
-
-        vfq_keep = df_cand[df_cand["vfq_pass"]].copy()
-        vfq_drop = df_cand[~df_cand["vfq_pass"]].copy()
-
-        # ========= 4. rank final (topN por prob_up) =========
-        if "prob_up" in vfq_keep.columns:
-            vfq_keep = vfq_keep.sort_values("prob_up", ascending=False)
-        if len(vfq_keep) > topN:
-            vfq_keep = vfq_keep.head(topN).copy()
-
-        # guardo en sesión para otras pestañas o downstream (peso, Kelly, etc.)
-        st.session_state["vfq_keep"] = vfq_keep
-        st.session_state["vfq_drop"] = vfq_drop
-
-        # ========= 5. mostramos resultados bonitos =========
-
-        # --- cartera candidata ---
-        st.markdown("### ✅ Seleccionados (después de VFQ)")
-        show_cols_keep = [
-            "symbol","sector","market_cap",
-            "quality_adj_neut","value_adj_neut","acc_pct","ndebt_ebitda",
-            "BreakoutScore","hits","RVOL20","prob_up",
-            "ATR_pct","ClosePos","P52"
-        ]
-        show_cols_keep = [c for c in show_cols_keep if c in vfq_keep.columns]
-        if not vfq_keep.empty:
-            st.dataframe(vfq_keep[show_cols_keep], use_container_width=True, hide_index=True)
-        else:
-            st.info("Nadie pasó todos los filtros VFQ con los umbrales actuales.")
-
-        # --- rechazados con métricas reales ---
-        st.markdown("### 🪓 Rechazados por guardrails VFQ")
-        show_cols_drop = [
-            "symbol","sector","market_cap",
-            "quality_adj_neut","value_adj_neut","acc_pct","ndebt_ebitda",
-            "BreakoutScore","hits","RVOL20","prob_up",
-        ]
-        show_cols_drop = [c for c in show_cols_drop if c in vfq_drop.columns]
-        if not vfq_drop.empty:
-            st.dataframe(vfq_drop[show_cols_drop].sort_values("prob_up", ascending=False),
-                         use_container_width=True, hide_index=True)
-        else:
-            st.caption("No hay rechazados (todos pasaron VFQ). 🤯")
+        # bandera para pipeline siguiente
+        st.session_state["pipeline_ready"] = True
 
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
