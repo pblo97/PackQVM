@@ -408,7 +408,23 @@ with tab2:
                 else:
                     base_cov = [c for c in ["evToEbitda","fcf_ttm","grossProfitTTM","roic","roa","netMargin"] if c in df_guard.columns]
                     df_guard["coverage_count"] = df_guard[base_cov].notna().sum(axis=1).astype(int) if base_cov else 0
+                value_metrics   = st.session_state.get("value_metrics",   ["inv_ev_ebitda","fcf_yield"])
+                quality_metrics = st.session_state.get("quality_metrics", ["gross_profitability","roic"])
+                coverage_cols = [c for c in (list(value_metrics)+list(quality_metrics)) if c in df_guard.columns]
 
+                if coverage_cols:
+                    df_guard["coverage_count"] = df_guard[coverage_cols].notna().sum(axis=1).astype(int)
+                else:
+                    base_cov = [c for c in ["evToEbitda","fcf_ttm","grossProfitTTM","roic","roa","netMargin"] if c in df_guard.columns]
+                    if base_cov:
+                        df_guard["coverage_count"] = df_guard[base_cov].notna().sum(axis=1).astype(int)
+                    else:
+                        df_guard["coverage_count"] = 0
+
+                # Si 90%+ tiene 0 cobertura, no bloquees por coverage en esta corrida
+                _dyn_min_cov = min_cov_guard
+                if (df_guard["coverage_count"] == 0).mean() >= 0.90:
+                    _dyn_min_cov = 0
                 # 3) Aplica reglas (función correcta sin guión bajo)
                 from fundamentals import apply_quality_guardrails
                 kept_raw, diag_raw = apply_quality_guardrails(
@@ -419,7 +435,7 @@ with tab2:
                     max_asset_growth=max_assets,
                     max_accruals_ta=max_accr,
                     max_netdebt_ebitda=max_ndeb,
-                    min_vfq_coverage=min_cov_guard
+                    min_vfq_coverage=_dyn_min_cov
                 )
 
                 diag = normalize_guard_diag(diag_raw, df_guard)         # ya la tienes

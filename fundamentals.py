@@ -1071,14 +1071,17 @@ def apply_quality_guardrails(
     coverage = pd.to_numeric(df.get("coverage_count", 0), errors="coerce").fillna(0).astype(int)
 
     # --- profit hits ---
+    # --- profit hits ---
     df["profit_hits"] = _positive_hits(ebit, cfo, fcf)
 
-    # --- reglas (NaN no bloquea) ---
-    # Profit floor
+    # Caso especial: si los 3 están NaN, NO bloquees por profit_floor (NaN no debe bloquear)
+    _all_nan_profit = ebit.isna() & cfo.isna() & fcf.isna()
+
     if require_profit_floor:
-        pass_profit = df["profit_hits"] >= int(max(0, profit_floor_min_hits))
+        pass_profit = _all_nan_profit | (df["profit_hits"] >= int(max(0, profit_floor_min_hits)))
     else:
         pass_profit = pd.Series([True] * len(df), index=df.index)
+
 
     # Emisión neta (solo falla si es claramente > umbral)
     pass_issuance = (net_issuance <= max_net_issuance) | net_issuance.isna()
