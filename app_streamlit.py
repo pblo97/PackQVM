@@ -108,6 +108,7 @@ def perf_summary_from_returns(rets: pd.Series, periods_per_year: int) -> dict:
         "Periodos": int(len(r))
     }
 
+
 def _enrich_sector_industry(uni_df: pd.DataFrame, src_df: pd.DataFrame) -> pd.DataFrame:
     out = uni_df.copy()
     need_sector = ("sector" not in out.columns) or (out["sector"].isna().mean() > 0.8 if "sector" in out.columns else True)
@@ -409,6 +410,32 @@ with tab2:
                 diag_view[cols_show].sort_values(order_keys, ascending=ascending_flags),
                 use_container_width=True, hide_index=True
             )
+
+        # --- Resumen de rechazos por regla ---
+        if "guard_diag" in st.session_state:
+            diag = st.session_state["guard_diag"]
+            if not diag.empty and "pass_all" in diag.columns:
+                total = len(diag)
+                fails = (~diag["pass_all"]).sum()
+                st.markdown(f"**Resumen de filtros** — fallan {fails} de {total}")
+
+                def _fail_rate(col):  # % que fallan esa regla (entre todos)
+                    if col not in diag.columns: 
+                        return 0.0
+                    return (diag[col] == False).mean() * 100.0
+
+                summary = pd.DataFrame({
+                    "regla": ["profit_floor","net_issuance","asset_growth","accruals_ta","netdebt_ebitda","vfq_coverage"],
+                    "% que falla": [
+                        _fail_rate("pass_profit"),
+                        _fail_rate("pass_issuance"),
+                        _fail_rate("pass_assets"),
+                        _fail_rate("pass_accruals"),
+                        _fail_rate("pass_ndebt"),
+                        _fail_rate("pass_coverage"),
+                    ],
+                }).sort_values("% que falla", ascending=False)
+                st.dataframe(summary, use_container_width=True, hide_index=True)
 
 
         st.caption("Notas: 'profit_hits' cuenta {EBIT, CFO, FCF} > 0. Emisión neta solo penaliza si es positiva.")

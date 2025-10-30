@@ -153,3 +153,31 @@ def compute_breakout_features(
     if shares_float is not None and shares_float > 0 and med_dollar_vol_60 is not None:
         series_map["float_velocity"] = med_dollar_vol_60 / (shares_float * d['close'])
     return features, series_map
+
+def _num(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+def _col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def _safe_series(df: pd.DataFrame, colnames: list[str], default=np.nan) -> pd.Series:
+    c = _col(df, colnames)
+    if c is None:
+        return pd.Series([default] * len(df), index=df.index, dtype=float)
+    return pd.to_numeric(df[c], errors="coerce")
+
+def _positive_hits(ebit: pd.Series, cfo: pd.Series, fcf: pd.Series) -> pd.Series:
+    # Cuenta cuántas de las métricas disponibles son > 0
+    hits = (
+        (ebit > 0).astype(int).fillna(0) +
+        (cfo  > 0).astype(int).fillna(0) +
+        (fcf  > 0).astype(int).fillna(0)
+    )
+    # Si todas son NaN para un símbolo, el total quedaría 0: opcionalmente marca como 0 con flag aparte si quieres.
+    return hits.astype(int)

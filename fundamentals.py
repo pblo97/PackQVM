@@ -25,6 +25,34 @@ except Exception:
 # Helpers genéricos / numéricos robustos
 # ======================================================================
 
+def _col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Devuelve el primer nombre de columna presente en df que esté en candidates."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def _safe_series(df: pd.DataFrame, candidates: list[str], default=np.nan) -> pd.Series:
+    """
+    Devuelve una Serie numérica a partir de la primera columna existente en candidates.
+    Si ninguna existe, devuelve Serie con default.
+    """
+    c = _col(df, candidates)
+    if c is None:
+        return pd.Series([default] * len(df), index=df.index, dtype=float)
+    return pd.to_numeric(df[c], errors="coerce")
+
+def _positive_hits(ebit: pd.Series, cfo: pd.Series, fcf: pd.Series) -> pd.Series:
+    """
+    Cuenta cuántas métricas disponibles están > 0 entre EBIT, CFO y FCF.
+    NaN no penaliza (se cuenta como 0).
+    """
+    return (
+        (pd.to_numeric(ebit, errors="coerce") > 0).astype(int).fillna(0) +
+        (pd.to_numeric(cfo,  errors="coerce") > 0).astype(int).fillna(0) +
+        (pd.to_numeric(fcf,  errors="coerce") > 0).astype(int).fillna(0)
+    ).astype(int)
+
 CAP_Z = 3.0  # límite de seguridad para z-scores
 
 def _first_obj(x):
@@ -1005,126 +1033,110 @@ def _num_or_nan(d: pd.DataFrame, col: str) -> pd.Series:
 
 def apply_quality_guardrails(
     df_guard: pd.DataFrame,
-    *,
     require_profit_floor: bool = True,
-    profit_floor_min_hits: int = 2,      # # de hits entre EBIT/CFO/FCF > 0
-    max_net_issuance: float = 0.03,      # emisión neta máxima (solo positivos fallan)
-    max_asset_growth: float = 0.20,      # |crec. activos y/y| máximo (absoluto)
-    max_accruals_ta: float = 0.10,       # |accruals/TA| máximo (absoluto)
-    max_netdebt_ebitda: float = 3.0,     # NetDebt/EBITDA máximo
-    min_vfq_coverage: int = 1            # cobertura mínima (métricas value+quality disponibles)
+    profit_floor_min_hits: int = 2,
+    max_net_issuance: float = 0.03,     # +3% emisión neta máx
+    max_asset_growth: float = 0.20,     # +20% YoY
+    max_accruals_ta: float = 0.10,      # |accruals/TA| <= 0.10
+    max_netdebt_ebitda: float = 3.0,    # ND/EBITDA <= 3
+    min_vfq_coverage: int = 2,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Devuelve (kept, diag):
-       - kept: símbolos que pasan guardrails (al menos columna 'symbol')
-       - diag: tabla diagnóstica con flags y razones de rechazo/paso
     """
-    if df_guard is None or df_guard.empty or "symbol" not in df_guard.columns:
-        return pd.DataFrame(columns=["symbol"]), pd.DataFrame(columns=["symbol","reason"])
+    - NaN en una métrica de guardrail NO bloquea (se interpreta como 'no hay evidencia de violación').
+    - 'profit_hits' usa solo columnas disponibles.
+    - Devuelve:
+        kept: DataFrame de símbolos que pasan todos los filtros.
+        diag: DataFrame diagnóstico con pass_* y 'reason' (string de reglas falladas) + pass_all.
+    """
+    df = df_guard.copy()
 
-    g = df_guard.copy()
-    g["symbol"] = g["symbol"].astype(str)
+    # --- map columnas ---
+    # EBIT TTM / anual
+    ebit = _safe_series(df, ["ebit_ttm", "EBITDAttm", "ebit", "operatingIncomeTTM"])
+    # CFO (operating cash flow)
+    cfo  = _safe_series(df, ["operatingCashFlowTTM", "cashFlowFromOperationsTTM", "cfo_ttm"])
+    # FCF
+    fcf  = _safe_series(df, ["freeCashFlowTTM", "fcf_ttm"])
 
-    # Coerción numérica defensiva
-    def _num(c): 
-        return pd.to_numeric(g[c], errors="coerce") if c in g.columns else pd.Series(np.nan, index=g.index)
+    # Emisión neta (dilución): tasa positiva es malo
+    net_issuance = _safe_series(df, ["net_issuance", "sharesNetIssuanceRate", "shares_change_1y"])
+    # Crecimiento de activos
+    asset_growth = _safe_series(df, ["asset_growth", "totalAssetsGrowthYoY"])
+    # Accruals/TA (usa signo absoluto para tope)
+    accruals_ta  = _safe_series(df, ["accruals_ta", "accrualsToAssets"])
+    # Deuda neta / EBITDA
+    nd_ebitda    = _safe_series(df, ["netdebt_ebitda", "netDebtToEBITDA", "netDebtEbitda"])
 
-    ebit = _num("ebit_ttm")
-    cfo  = _num("cfo_ttm")
-    fcf  = _num("fcf_ttm")
+    # Cobertura VFQ (si no existe, 0)
+    coverage = pd.to_numeric(df.get("coverage_count", 0), errors="coerce").fillna(0).astype(int)
 
-    net_issuance  = _num("net_issuance")
-    asset_growth  = _num("asset_growth")
-    accruals_ta   = _num("accruals_ta")
-    nd_ebitda     = _num("netdebt_ebitda")
+    # --- profit hits ---
+    df["profit_hits"] = _positive_hits(ebit, cfo, fcf)
 
-    # Cobertura VFQ si no existe (cuenta columnas razonables de V y Q)
-    if "coverage_count" in g.columns:
-        coverage = pd.to_numeric(g["coverage_count"], errors="coerce").fillna(0).astype(int)
+    # --- reglas (NaN no bloquea) ---
+    # Profit floor
+    if require_profit_floor:
+        pass_profit = df["profit_hits"] >= int(max(0, profit_floor_min_hits))
     else:
-        cov_cols = [c for c in ["inv_ev_ebitda","fcf_yield","gross_profitability","roic","roa","netMargin"] if c in g.columns]
-        coverage = g[cov_cols].notna().sum(axis=1).astype(int) if cov_cols else pd.Series(0, index=g.index)
+        pass_profit = pd.Series([True] * len(df), index=df.index)
 
-    # 1) Profit floor (hits en {EBIT, CFO, FCF} > 0)
-    hits = (ebit > 0).astype(int) + (cfo > 0).astype(int) + (fcf > 0).astype(int)
-    ok_profit = hits >= int(profit_floor_min_hits) if require_profit_floor else pd.Series(True, index=g.index)
+    # Emisión neta (solo falla si es claramente > umbral)
+    pass_issuance = (net_issuance <= max_net_issuance) | net_issuance.isna()
 
-    # 2) Emisión neta (solo positivos fallan)
-    ok_issuance = (net_issuance.isna()) | (net_issuance <= float(max_net_issuance))
+    # Crecimiento de activos (excesivo)
+    pass_assets   = (asset_growth <= max_asset_growth) | asset_growth.isna()
 
-    # 3) Crecimiento de activos (valor absoluto)
-    ok_assets = (asset_growth.isna()) | (asset_growth.abs() <= float(max_asset_growth))
+    # Accruals/TA absoluto
+    pass_accruals = (accruals_ta.abs() <= max_accruals_ta) | accruals_ta.isna()
 
-    # 4) Accruals/TA (valor absoluto)
-    ok_accr = (accruals_ta.isna()) | (accruals_ta.abs() <= float(max_accruals_ta))
+    # ND/EBITDA
+    pass_ndebt    = (nd_ebitda <= max_netdebt_ebitda) | nd_ebitda.isna()
 
-    # 5) NetDebt/EBITDA
-    ok_ndeb = (nd_ebitda.isna()) | (nd_ebitda <= float(max_netdebt_ebitda))
+    # Cobertura mínima
+    pass_coverage = (coverage >= int(max(0, min_vfq_coverage))) | pd.Series(coverage.isna() if hasattr(coverage, "isna") else False, index=df.index)
 
-    # 6) Cobertura mínima
-    ok_cov = coverage >= int(min_vfq_coverage)
+    # --- combinada ---
+    df["pass_profit"]   = pass_profit.astype(bool)
+    df["pass_issuance"] = pass_issuance.astype(bool)
+    df["pass_assets"]   = pass_assets.astype(bool)
+    df["pass_accruals"] = pass_accruals.astype(bool)
+    df["pass_ndebt"]    = pass_ndebt.astype(bool)
+    df["pass_coverage"] = pass_coverage.astype(bool)
 
-    pass_all = ok_profit & ok_issuance & ok_assets & ok_accr & ok_ndeb & ok_cov
+    checks = ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]
+    df["pass_all"] = df[checks].all(axis=1)
 
-    # Diagnóstico de razones (primera razón relevante, si falla)
+    # Razones acumuladas (solo para los que fallan)
     reasons = []
-    for i in range(len(g)):
-        if pass_all.iloc[i]:
-            reasons.append("OK")
-            continue
+    for _, row in df.iterrows():
         r = []
-        if require_profit_floor and not ok_profit.iloc[i]:
-            r.append(f"profit_floor<{profit_floor_min_hits} (hits={int(hits.iloc[i])})")
-        if not ok_cov.iloc[i]:
-            r.append(f"low_coverage<{min_vfq_coverage} (cov={int(coverage.iloc[i])})")
-        if not ok_issuance.iloc[i]:
-            r.append(f"net_issuance>{max_net_issuance:.3f} (val={net_issuance.iloc[i]:.3f})")
-        if not ok_assets.iloc[i]:
-            r.append(f"|asset_growth|>{max_asset_growth:.2f} (val={asset_growth.iloc[i]:.3f})")
-        if not ok_accr.iloc[i]:
-            r.append(f"|accruals_ta|>{max_accruals_ta:.2f} (val={accruals_ta.iloc[i]:.3f})")
-        if not ok_ndeb.iloc[i]:
-            r.append(f"netdebt/EBITDA>{max_netdebt_ebitda:.2f} (val={nd_ebitda.iloc[i]:.3f})")
-        reasons.append("; ".join(r) if r else "reject")
+        if not row["pass_profit"]:   r.append("profit_floor")
+        if not row["pass_issuance"]: r.append("net_issuance")
+        if not row["pass_assets"]:   r.append("asset_growth")
+        if not row["pass_accruals"]: r.append("accruals_ta")
+        if not row["pass_ndebt"]:    r.append("netdebt_ebitda")
+        if not row["pass_coverage"]: r.append("vfq_coverage")
+        reasons.append(",".join(r) if r else "")
+    df["reason"] = reasons
 
-    diag = pd.DataFrame({
-        "symbol": g["symbol"],
-        "profit_hits": hits.astype(int),
-        "coverage_count": coverage.astype(int),
-        "net_issuance": net_issuance,
-        "asset_growth": asset_growth,
-        "accruals_ta": accruals_ta,
-        "netdebt_ebitda": nd_ebitda,
-        "pass_profit": ok_profit,
-        "pass_issuance": ok_issuance,
-        "pass_assets": ok_assets,
-        "pass_accruals": ok_accr,
-        "pass_ndebt": ok_ndeb,
-        "pass_coverage": ok_cov,
-        "pass_all": pass_all,
-        "reason": reasons,
-    })
+    # kept + diag
+    # Asegura columna symbol
+    symcol = _col(df, ["symbol","ticker","Symbol","Ticker"]) or "symbol"
+    if symcol not in df.columns:
+        df[symcol] = df_guard.index.astype(str)
 
-    kept = diag.loc[diag["pass_all"], ["symbol"]].reset_index(drop=True)
-    if df_guard is None or df_guard.empty or "symbol" not in df_guard.columns:
-        empty_kept = pd.DataFrame(columns=["symbol"])
-        empty_diag = pd.DataFrame({
-            "symbol": pd.Series(dtype=str),
-            "profit_hits": pd.Series(dtype="Int64"),
-            "coverage_count": pd.Series(dtype="Int64"),
-            "net_issuance": pd.Series(dtype=float),
-            "asset_growth": pd.Series(dtype=float),
-            "accruals_ta": pd.Series(dtype=float),
-            "netdebt_ebitda": pd.Series(dtype=float),
-            "pass_profit": pd.Series(dtype=bool),
-            "pass_issuance": pd.Series(dtype=bool),
-            "pass_assets": pd.Series(dtype=bool),
-            "pass_accruals": pd.Series(dtype=bool),
-            "pass_ndebt": pd.Series(dtype=bool),
-            "pass_coverage": pd.Series(dtype=bool),
-            "pass_all": pd.Series(dtype=bool),
-            "reason": pd.Series(dtype=str),
-        })
-    return empty_kept, empty_diag
+    diag_cols = [symcol, "profit_hits", "coverage_count", "net_issuance", "asset_growth",
+                 "accruals_ta", "netdebt_ebitda", "pass_profit","pass_issuance",
+                 "pass_assets","pass_accruals","pass_ndebt","pass_coverage","pass_all","reason"]
+    diag = df[[c for c in diag_cols if c in df.columns]].rename(columns={symcol:"symbol"})
+
+    kept = df[df["pass_all"]].copy()
+    if "reason" in kept.columns:
+        kept = kept.drop(columns=["reason"])  # opcional
+    if "symbol" not in kept.columns and symcol in kept.columns:
+        kept = kept.rename(columns={symcol:"symbol"})
+
+    return kept, diag
 
 
 # ======================================================================
