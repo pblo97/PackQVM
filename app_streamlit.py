@@ -165,151 +165,6 @@ def _ensure_sector_strings(df: pd.DataFrame, sector_col="sector", industry_col="
 def _as_list(x):
     return x if isinstance(x, (list, tuple, pd.Index, np.ndarray)) else [x]
 
-def _is_common_equity(row: pd.Series) -> bool:
-    """
-    Heurística simple para limpiar el universo.
-    Ajusta esto según las columnas reales que tengas:
-    - sector vacío + símbolos raros tipo SPY/JEPI/VOO -> fuera
-    - tickers de bono puro o ETF -> fuera
-    """
-    sym = str(row.get("symbol", "")).upper()
-
-    # ruido clásico que NO queremos en el pool de calidad fundamental
-    blacklist_prefix = (
-        "SP",   # SPY, SPLG, SPYG, etc.
-        "VO",   # VOO, VO, VONG, VO...
-        "VT",   # VT, VTI, VTIP...
-        "XL",   # XLK, XLE, XLU...
-        "JE",   # JEPI, JEPQ...
-        "TLT", "LQD", "MUB", "HYG", "BND", "IBIT", "GLD", "GBTC",
-    )
-
-    if sym.startswith(blacklist_prefix):
-        return False
-
-    # también quiero sacar cosas claramente de renta fija / money market
-    keywords_block = ["TREASURY", "BOND", "ETF", "ETF TRUST", "TRUST"]
-    sec = str(row.get("sector", "")).upper()
-    for kw in keywords_block:
-        if kw in sym or kw in sec:
-            return False
-
-    return True
-
-
-# ---------------------------------------------------------
-# 1. UNIVERSO DE CALIDAD (Tab2)
-# ---------------------------------------------------------
-def build_quality_universe_relajado(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Versión menos estricta:
-    - pasa rentabilidad ("pass_profit")
-    - no está diluyendo feo ("pass_issuance")
-    - no huele raro contablemente ("pass_accruals")
-    - deuda razonable ("pass_ndebt")
-    - tiene datos suficientes ("coverage_count" >= 4)
-    - no es ETF/fondo
-    """
-
-    if df_raw is None or df_raw.empty:
-        return pd.DataFrame()
-
-    df = df_raw.copy()
-
-    # casting defensivo booleans
-    for col in ["pass_profit", "pass_issuance", "pass_accruals", "pass_ndebt", "pass_coverage"]:
-        if col in df.columns:
-            df[col] = (
-                df[col]
-                .astype(str)
-                .str.lower()
-                .map({"true": True, "false": False})
-                .fillna(df[col])
-            ).astype(bool)
-
-    if "coverage_count" in df.columns:
-        df["coverage_count"] = pd.to_numeric(df["coverage_count"], errors="coerce").fillna(0)
-
-    # filtro fundamental core
-    must_have = ["pass_profit", "pass_issuance", "pass_accruals", "pass_ndebt"]
-    for col in must_have:
-        if col in df.columns:
-            df = df[df[col] == True]
-
-    # cobertura de datos
-    if "coverage_count" in df.columns:
-        df = df[df["coverage_count"] >= 4]
-
-    # fuera ETFs / bonos
-    df = df[df.apply(_is_common_equity, axis=1)]
-
-    # ordenar por prioridad básica
-    sort_cols = [c for c in ["profit_hits", "coverage_count"] if c in df.columns]
-    if sort_cols:
-        df = df.sort_values(by=sort_cols, ascending=[False]*len(sort_cols))
-
-    df = df.reset_index(drop=True)
-    return df
-
-
-# ---------------------------------------------------------
-# 2. CANDIDATOS OPERABLES (Tab3)
-# ---------------------------------------------------------
-def build_trade_candidates(df_quality: pd.DataFrame,
-                           technical_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Une calidad fundamental (df_quality) con señales técnicas (technical_df).
-    technical_df debería tener por ticker cosas como:
-      - trend_ok / uptrend (bool)
-      - breakout_ok (bool)
-      - vol_ok (bool)
-      - risk_on (bool global o por ticker)
-      - maybe ATR-stop, etc.
-
-    Devuelve SOLO los que cumplen el set-up técnico.
-    """
-
-    if df_quality is None or df_quality.empty:
-        return pd.DataFrame()
-
-    if technical_df is None or technical_df.empty:
-        # si todavía no calculaste las señales técnicas, devolvemos vacío
-        return pd.DataFrame()
-
-    # merge por 'symbol'
-    merged = pd.merge(
-        df_quality,
-        technical_df,
-        on="symbol",
-        how="inner",
-        suffixes=("", "_tech")
-    )
-
-    # supongamos que en technical_df definiste estas columnas booleanas:
-    # 'trend_ok': tendencia alcista válida
-    # 'setup_ok': señal de entrada (breakout, pullback controlado, etc.)
-    # 'liquidity_ok': suficiente liquidez / volumen
-    # 'risk_on': el régimen macro/volatilidad te deja tomar riesgo
-    required_cols = ["trend_ok", "setup_ok", "liquidity_ok", "risk_on"]
-    for col in required_cols:
-        if col not in merged.columns:
-            merged[col] = False  # fallback para que no explote
-
-    trade_df = merged[
-        (merged["trend_ok"] == True) &
-        (merged["setup_ok"] == True) &
-        (merged["liquidity_ok"] == True) &
-        (merged["risk_on"] == True)
-    ].copy()
-
-    # orden final: podés priorizar momentum reciente o score técnico propio.
-    # Ejemplo si tenés algo tipo 'tech_score':
-    if "tech_score" in trade_df.columns:
-        trade_df = trade_df.sort_values("tech_score", ascending=False)
-
-    trade_df = trade_df.reset_index(drop=True)
-    return trade_df
-
 # ==================== HEADER ====================
 l, r = st.columns([0.85, 0.15])
 with l:
@@ -536,77 +391,77 @@ with tab1:
 
 ## ====== Paso 2: FUNDAMENTALES & GUARDRAILS ======
 with tab2:
-    st.subheader("Pool de calidad estructural (fundamentals limpios)")
+    st.subheader("Guardrails")
 
-    universe_df: pd.DataFrame = st.session_state.get("universe_df", pd.DataFrame())
-    quality_df = build_quality_universe_relajado(universe_df)
+    uni = st.session_state.get("uni", pd.DataFrame())
+    if uni is None or uni.empty or "symbol" not in uni.columns:
+        st.info("Primero corre Universo (tab1).")
+        st.stop()
 
-    st.write(
-        "Acciones que pasan TODAS las banderas fundamentales "
-        "(rentabilidad real, deuda razonable, sin contabilidad rara, "
-        "sin dilución fea, cobertura de datos suficiente)."
+    syms = uni["symbol"].dropna().astype(str).unique().tolist()
+    if not syms:
+        st.info("No hay símbolos en el universo.")
+        st.stop()
+
+    # Recalcular todo acá (fuente única)
+    df_all = build_factor_frame(syms)
+
+    # injertar sector / market_cap desde universo
+    base_cols = ["symbol","sector","market_cap"]
+    df_all = (
+        df_all.drop(columns=["sector","market_cap"], errors="ignore")
+              .merge(
+                  uni[[c for c in base_cols if c in uni.columns]],
+                  on="symbol",
+                  how="left"
+              )
     )
 
-    if quality_df.empty:
-        st.warning("Ningún ticker pasó todos los filtros de calidad.")
-    else:
-        st.dataframe(
-            quality_df[
-                [
-                    "symbol",
-                    "sector",
-                    "profit_hits",
-                    "coverage_count",
-                    "asset_growth",
-                    "accruals_ta",
-                    "netdebt_ebitda",
-                    "pass_profit",
-                    "pass_issuance",
-                    "pass_assets",
-                    "pass_accruals",
-                    "pass_ndebt",
-                    "pass_coverage",
-                ]
-            ],
-            use_container_width=True,
-            height=500,
-        )
-
-    # guardamos para usar en tab3
-    st.session_state["quality_df"] = quality_df
-
-
-with tab3:
-    st.subheader("Setups listos para operar (calidad + técnica)")
-
-    quality_df: pd.DataFrame = st.session_state.get("quality_df", pd.DataFrame())
-    technical_df: pd.DataFrame = st.session_state.get("technical_df", pd.DataFrame())
-    # technical_df lo tienes que llenar tú antes en el flujo:
-    # columnas mínimas esperadas:
-    # symbol, trend_ok, setup_ok, liquidity_ok, risk_on, tech_score...
-
-    trade_df = build_trade_candidates(quality_df, technical_df)
-
-    st.write(
-        "Tickers que además de ser sanos fundamentalmente, "
-        "están en tendencia, con entrada técnica válida, "
-        "volumen suficiente y en régimen de riesgo habilitado."
+    # mascara estricta
+    strict_mask = df_all.get("pass_all", False) == True
+    kept_raw = (
+        df_all.loc[strict_mask, ["symbol"]]
+              .drop_duplicates()
+              .reset_index(drop=True)
     )
 
-    if trade_df.empty:
-        st.info("No hay setups óptimos ahora mismo según tus reglas técnicas.")
-    else:
-        cols_show = ["symbol", "sector", "profit_hits", "tech_score",
-                     "trend_ok", "setup_ok", "liquidity_ok", "risk_on"]
-        cols_show = [c for c in cols_show if c in trade_df.columns]
+    # guarda para otros tabs si quieres mantener ese flujo
+    st.session_state["kept"] = kept_raw
+    st.session_state["guard_diag"] = df_all.copy()
 
+    total = len(df_all)
+    pasan = int(strict_mask.sum())
+    rechaz = total - pasan
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pasan guardrails estrictos", f"{pasan}")
+    # 'relajado' por ahora lo igualo a pasan; luego lo puedes tunear
+    c2.metric("Candidatos saludables (relajado)", f"{pasan}")
+    c3.metric("Rechazados totales", f"{rechaz}")
+
+    cols_show = [
+        "symbol","sector","pass_all",
+        "profit_hits","coverage_count",
+        "asset_growth","accruals_ta","netdebt_ebitda",
+        "pass_profit","pass_issuance","pass_assets",
+        "pass_accruals","pass_ndebt","pass_coverage",
+    ]
+    cols_show = [c for c in cols_show if c in df_all.columns]
+
+    with st.expander(
+        f"Detalle guardrails (estricto): {pasan} / {total}",
+        expanded=True
+    ):
         st.dataframe(
-            trade_df[cols_show],
+            df_all[cols_show].sort_values("symbol"),
             use_container_width=True,
-            height=400,
+            hide_index=True
         )
 
-    st.session_state["trade_df"] = trade_df
+    st.caption(
+        "pass_all = pasó TODAS las barreras simultáneamente. "
+        "coverage_count = cuánta info fundamental tenemos disponible."
+    )
 
 # ====== Paso 3: VFQ ======
 # ====== Paso 3: VFQ (PARCHE COMPLETO + UI BONITA) ======
@@ -726,6 +581,7 @@ with tab3:
         use_container_width=True,
         hide_index=True
     )
+
 
 
 
