@@ -355,6 +355,70 @@ with tab2:
                         min_vfq_coverage=min_cov_guard
                     )
 
+                def _normalize_guard_diag(diag: pd.DataFrame, df_guard: pd.DataFrame) -> pd.DataFrame:
+                    d = diag.copy()
+
+                    # 1) Asegura 'symbol'
+                    if "symbol" not in d.columns:
+                        if d.index.name == "symbol":
+                            d = d.reset_index()
+                        else:
+                            # último recurso: intenta desde df_guard
+                            if isinstance(df_guard, pd.DataFrame):
+                                if "symbol" in df_guard.columns:
+                                    d["symbol"] = df_guard["symbol"].values[:len(d)]
+                                else:
+                                    d["symbol"] = pd.Index(range(len(d))).astype(str)
+                            else:
+                                d["symbol"] = pd.Index(range(len(d))).astype(str)
+
+                    # 2) Si no hay 'reason' pero sí 'pass_*', podemos reconstruirla
+                    def _mk_reason(row):
+                        r=[]
+                        if "pass_profit"   in d.columns and not bool(row.get("pass_profit", True)):     r.append("profit_floor")
+                        if "pass_issuance" in d.columns and not bool(row.get("pass_issuance", True)):   r.append("net_issuance")
+                        if "pass_assets"   in d.columns and not bool(row.get("pass_assets", True)):     r.append("asset_growth")
+                        if "pass_accruals" in d.columns and not bool(row.get("pass_accruals", True)):   r.append("accruals_ta")
+                        if "pass_ndebt"    in d.columns and not bool(row.get("pass_ndebt", True)):      r.append("netdebt_ebitda")
+                        if "pass_coverage" in d.columns and not bool(row.get("pass_coverage", True)):   r.append("vfq_coverage")
+                        return ",".join(r)
+
+                    # 3) Si faltan 'pass_*', infiérelo desde 'reason' (si existe) o márcalo NaN
+                    name_map = {
+                        "pass_profit":   "profit_floor",
+                        "pass_issuance": "net_issuance",
+                        "pass_assets":   "asset_growth",
+                        "pass_accruals": "accruals_ta",
+                        "pass_ndebt":    "netdebt_ebitda",
+                        "pass_coverage": "vfq_coverage",
+                    }
+
+                    has_reason = "reason" in d.columns
+                    for col, token in name_map.items():
+                        if col not in d.columns:
+                            if has_reason:
+                                d[col] = ~d["reason"].fillna("").str.contains(token)
+                            else:
+                                d[col] = np.nan  # sin información
+
+                    # 4) pass_all si falta
+                    checks = list(name_map.keys())
+                    if "pass_all" not in d.columns:
+                        if all(c in d.columns for c in checks):
+                            d["pass_all"] = d[checks].all(axis=1)
+                        else:
+                            d["pass_all"] = False
+
+                    # 5) Si no había 'reason' y ya tenemos pass_*, constrúyela
+                    if "reason" not in d.columns:
+                        d["reason"] = d.apply(_mk_reason, axis=1)
+
+                    return d
+                diag = _normalize_guard_diag(diag, df_guard)
+                st.session_state["guard_diag"] = diag
+                kept = diag.loc[diag["pass_all"], ["symbol"]].copy()
+                st.session_state["kept"] = kept
+
                 needed = {"pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage","pass_all","profit_hits"}
                 if not needed.issubset(set(diag.columns)):
                     # Vincula por símbolo para poder leer las columnas crudas desde df_guard
@@ -495,62 +559,45 @@ with tab2:
             )
 
         # --- Resumen de rechazos por regla ---
+        # --- Resumen de rechazos por regla (robusto) ---
         if "guard_diag" in st.session_state:
             diag = st.session_state["guard_diag"]
-            if isinstance(diag, pd.DataFrame) and not diag.empty:
-                # Asegurar dtypes booleanos
-                bool_cols = [c for c in [
-                    "pass_profit","pass_issuance","pass_assets",
-                    "pass_accruals","pass_ndebt","pass_coverage","pass_all"
-                ] if c in diag.columns]
-                for c in bool_cols:
-                    diag[c] = diag[c].astype(bool)
-
-                # Si faltara pass_all por algún motivo, lo recomputamos
-                if "pass_all" not in diag.columns:
-                    checks = [c for c in [
-                        "pass_profit","pass_issuance","pass_assets",
-                        "pass_accruals","pass_ndebt","pass_coverage"
-                    ] if c in diag.columns]
-                    if checks:
-                        diag["pass_all"] = diag[checks].all(axis=1)
-                    else:
-                        diag["pass_all"] = False
-
+            if not diag.empty and "pass_all" in diag.columns:
                 total = len(diag)
-                fails_df = diag.loc[~diag["pass_all"]].copy()
-                fails = len(fails_df)
-                st.markdown(f"**Resumen de filtros** — fallan **{fails}** de **{total}**")
+                fails = (~diag["pass_all"]).sum()
+                st.markdown(f"**Resumen de filtros** — fallan {fails} de {total}")
 
-                if fails == 0:
-                    st.success("Todos pasan los guardrails con los umbrales actuales.")
-                else:
-                    # Conteo por regla usando columnas pass_*
-                    def _cnt(col):
-                        return int((~fails_df[col]).sum()) if col in fails_df.columns else 0
+                token_map = {
+                    "pass_profit":   "profit_floor",
+                    "pass_issuance": "net_issuance",
+                    "pass_assets":   "asset_growth",
+                    "pass_accruals": "accruals_ta",
+                    "pass_ndebt":    "netdebt_ebitda",
+                    "pass_coverage": "vfq_coverage",
+                }
 
-                    summary = pd.DataFrame({
-                        "regla": ["profit_floor","net_issuance","asset_growth","accruals_ta","netdebt_ebitda","vfq_coverage"],
-                        "rechazos": [
-                            _cnt("pass_profit"),
-                            _cnt("pass_issuance"),
-                            _cnt("pass_assets"),
-                            _cnt("pass_accruals"),
-                            _cnt("pass_ndebt"),
-                            _cnt("pass_coverage"),
-                        ],
-                    }).sort_values("rechazos", ascending=False)
+                def _fail_rate(col):
+                    if col in diag.columns:
+                        return (diag[col] == False).mean() * 100.0
+                    if "reason" in diag.columns:
+                        token = token_map.get(col, "")
+                        if token:
+                            return diag["reason"].fillna("").str.contains(token).mean() * 100.0
+                    return 0.0
 
-                    st.dataframe(summary, use_container_width=True, hide_index=True)
+                summary = pd.DataFrame({
+                    "regla": list(token_map.values()),
+                    "rechazos %": [
+                        _fail_rate("pass_profit"),
+                        _fail_rate("pass_issuance"),
+                        _fail_rate("pass_assets"),
+                        _fail_rate("pass_accruals"),
+                        _fail_rate("pass_ndebt"),
+                        _fail_rate("pass_coverage"),
+                    ],
+                }).sort_values("rechazos %", ascending=False)
+                st.dataframe(summary, use_container_width=True, hide_index=True)
 
-                    # Breakdown adicional usando la columna 'reason' (si existe)
-                    if "reason" in fails_df.columns:
-                        rs = fails_df["reason"].fillna("").str.split(",").explode().str.strip()
-                        rs = rs[rs != ""]
-                        if not rs.empty:
-                            reason_counts = rs.value_counts(dropna=False).reset_index()
-                            reason_counts.columns = ["regla (reason)", "rechazos"]
-                            st.dataframe(reason_counts, use_container_width=True, hide_index=True)
 
 
             st.caption("Notas: 'profit_hits' cuenta {EBIT, CFO, FCF} > 0. Emisión neta solo penaliza si es positiva.")
