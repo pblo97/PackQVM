@@ -476,7 +476,7 @@ if "pipeline_ready" not in st.session_state:
     st.session_state["pipeline_ready"] = False
 
 # ==================== TABS ====================
-tab1, tab2, tab3, tab4, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab6, tab7, tab8 = st.tabs(
     [
         "Universo",
         "Guardrails",
@@ -484,6 +484,7 @@ tab1, tab2, tab3, tab4, tab6, tab7 = st.tabs(
         "Señales",
         "Export",
         "Backtesting",
+        "Tuning"
     ]
 )
 
@@ -1313,7 +1314,7 @@ with tab7:
         "- Lo importante aquí es el orden relativo: ¿qué tickers aguantan bien el swing? "
         "Esos son los candidatos que vale la pena sobreponderar cuando estés en RISK ON."
     )
-tab8 = st.tabs(["Tuning"])[0]
+
 
 with tab8:
     st.subheader("🔧 Tuning de umbrales (random search)")
