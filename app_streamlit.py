@@ -1313,3 +1313,174 @@ with tab7:
         "- Lo importante aquí es el orden relativo: ¿qué tickers aguantan bien el swing? "
         "Esos son los candidatos que vale la pena sobreponderar cuando estés en RISK ON."
     )
+tab8 = st.tabs(["Tuning"])[0]
+
+with tab8:
+    st.subheader("🔧 Tuning de umbrales (random search)")
+
+    # --- Datos base necesarios desde tabs previas ---
+    kept = st.session_state.get("kept", pd.DataFrame())
+    uni_cur = st.session_state.get("uni", pd.DataFrame())
+    df_vfq_all = st.session_state.get("vfq_all", pd.DataFrame())
+    if kept.empty or df_vfq_all.empty:
+        st.warning("Necesitas correr Guardrails y VFQ antes de tunear.")
+        st.stop()
+
+    # --------- Parámetros de búsqueda ----------
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        n_samples = st.number_input("N° combinaciones aleatorias", 20, 1000, 150, 10)
+        cost_bps  = st.number_input("Costos (bps por rebalance)", 0, 100, 10, 1)
+        use_and   = st.toggle("Tendencia: MA200 Y Mom12-1>0", value=False)
+    with c2:
+        start_tune = st.date_input("Inicio tuning", value=pd.to_datetime(DEFAULT_START).date())
+        end_tune   = st.date_input("Fin tuning", value=pd.to_datetime(DEFAULT_END).date())
+        min_names  = st.number_input("Mín. símbolos por cartera", 5, 200, 15, 1)
+    with c3:
+        seed = st.number_input("Semilla aleatoria", 0, 10_000, 1234, 1)
+        reb_freq = st.selectbox("Frecuencia rebalanceo", ["M","W","Q"], index=0)
+        go_btn = st.button("Ejecutar Tuning", use_container_width=True)
+
+    # Rangos razonables (puedes editarlos)
+    ranges = dict(
+        min_quality=(0.30, 0.70),
+        min_value=(0.30, 0.70),
+        min_acc_pct=(40, 85),           # %
+        max_ndebt=(1.5, 3.0),
+        min_hits_req=(1, 4),            # entero
+        min_breakout=(60, 85),
+        min_rvol20=(1.05, 1.6),
+        topN_prob=(15, 60),             # solo para mostrar/recortar tabla
+    )
+
+    def _sample_params(rng: np.random.RandomState) -> dict:
+        # Real-valued
+        p = {
+            "min_quality": float(rng.uniform(*ranges["min_quality"])),
+            "min_value":   float(rng.uniform(*ranges["min_value"])),
+            "min_acc_pct": int(rng.uniform(*ranges["min_acc_pct"])),
+            "max_ndebt":   float(rng.uniform(*ranges["max_ndebt"])),
+            "min_breakout":int(rng.uniform(*ranges["min_breakout"])),
+            "min_rvol20":  float(rng.uniform(*ranges["min_rvol20"])),
+            "min_hits_req":int(rng.randint(*ranges["min_hits_req"])),
+            "topN_prob":   int(rng.randint(*ranges["topN_prob"])),
+        }
+        # correcciones de borde
+        p["min_hits_req"] = max(0, p["min_hits_req"])
+        p["topN_prob"] = max(min_names, p["topN_prob"])
+        return p
+
+    def _apply_filters(df: pd.DataFrame, p: dict) -> list[str]:
+        """Aplica los mismos filtros que tab3, con parámetros p, y devuelve tickers."""
+        m = pd.Series(True, index=df.index)
+        m &= (df["quality_adj_neut"].fillna(0) >= p["min_quality"])
+        m &= (df["value_adj_neut"].fillna(0)   >= p["min_value"])
+        m &= (df["hits"].fillna(0)             >= p["min_hits_req"])
+        m &= (df["BreakoutScore"].fillna(0)    >= p["min_breakout"])
+        m &= (df["RVOL20"].fillna(0)           >= p["min_rvol20"])
+        m &= (df["acc_pct"].isna() | (df["acc_pct"] >= p["min_acc_pct"]))
+        m &= (df["netdebt_ebitda"].isna() | (df["netdebt_ebitda"] <= p["max_ndebt"]))
+        picks = df.loc[m, "symbol"].dropna().astype(str).unique().tolist()
+        return picks
+
+    def _portfolio_metrics_from_curves(curves: dict[str, pd.Series]) -> dict:
+        """Promedia retornos de las curvas y calcula métricas con helper existente."""
+        if not curves:
+            return {"CAGR":0,"Sharpe":0,"Sortino":0,"MaxDD":0,"N":0,"Turnover":0}
+        eq_df = pd.DataFrame(curves).dropna(how="all")
+        if eq_df.empty:
+            return {"CAGR":0,"Sharpe":0,"Sortino":0,"MaxDD":0,"N":0,"Turnover":0}
+        rets = eq_df.pct_change().mean(axis=1).fillna(0.0)
+        perf = perf_summary_from_returns(rets, periods_per_year={"M":12,"W":52,"Q":4}[reb_freq])
+        perf["N"] = eq_df.shape[1]
+        return perf
+
+    results = []
+    details = []  # guarda picks por combinación
+    if go_btn:
+        rng = np.random.RandomState(int(seed))
+        pbar = st.progress(0, text="Buscando combinaciones…")
+        for i in range(int(n_samples)):
+            p = _sample_params(rng)
+            picks = _apply_filters(df_vfq_all, p)
+            if len(picks) < int(min_names):
+                pbar.progress(int((i+1)/n_samples*100), text=f"Descartado (pocos símbolos): {len(picks)}")
+                continue
+
+            # Datos de precios y backtest
+            panel = _cached_load_prices_panel(
+                picks,
+                start=pd.to_datetime(start_tune),
+                end=pd.to_datetime(end_tune),
+                cache_key=f"TUNE_{i}"
+            )
+            if not isinstance(panel, dict) or len(panel) == 0:
+                continue
+
+            # Backtest por símbolo y curvas
+            metrics_df, curves = backtest_many(
+                panel,
+                symbols=list(panel.keys()),
+                cost_bps=int(cost_bps),
+                lag_days=0,
+                use_and_condition=bool(use_and),
+                rebalance_freq=reb_freq
+            )
+            # Promedio turnover para tener referencia
+            avg_turn = float(metrics_df["Turnover"].mean()) if not metrics_df.empty else 0.0
+
+            port_perf = _portfolio_metrics_from_curves(curves)
+            row = dict(
+                Sharpe=port_perf.get("Sharpe",0.0),
+                Sortino=port_perf.get("Sortino",0.0),
+                CAGR=port_perf.get("CAGR",0.0),
+                MaxDD=port_perf.get("MaxDD",0.0),
+                N=port_perf.get("N",0),
+                Turnover=avg_turn,
+            )
+            row.update(p)
+            results.append(row)
+            details.append({"params": p, "picks": picks})
+            pbar.progress(int((i+1)/n_samples*100), text=f"Evaluadas {i+1}/{n_samples}")
+
+        pbar.empty()
+
+    if results:
+        res_df = pd.DataFrame(results).sort_values(["Sharpe","CAGR"], ascending=False).reset_index(drop=True)
+        st.markdown("### 🏁 Top combinaciones")
+        st.dataframe(res_df.head(25), use_container_width=True, hide_index=True)
+
+        # Seleccionar una fila y mostrar picks
+        st.markdown("#### 📌 Detalle de selección")
+        idx = st.number_input("Fila (Top-k) a inspeccionar", 0, max(0, len(res_df)-1), 0, 1)
+        chosen = res_df.iloc[int(idx)].to_dict()
+        st.json({k: chosen[k] for k in [
+            "Sharpe","CAGR","Sortino","MaxDD","Turnover","N",
+            "min_quality","min_value","min_acc_pct","max_ndebt",
+            "min_hits_req","min_breakout","min_rvol20","topN_prob"
+        ]})
+
+        picks = details[int(idx)]["picks"]
+        st.caption(f"Tickers ({len(picks)}): " + ", ".join(sorted(picks[:120])) + (" …" if len(picks)>120 else ""))
+
+        if st.button("👉 Adoptar este preset", use_container_width=True):
+            st.session_state["vfq_best_preset"] = {
+                "from_tuning": True,
+                "rebalance": reb_freq,
+                "use_and": bool(use_and),
+                "cost_bps": int(cost_bps),
+                "date_range": (str(start_tune), str(end_tune)),
+                "params": {k: chosen[k] for k in [
+                    "min_quality","min_value","min_acc_pct","max_ndebt",
+                    "min_hits_req","min_breakout","min_rvol20","topN_prob"
+                ]},
+                "metrics": {k: chosen[k] for k in ["Sharpe","CAGR","Sortino","MaxDD","Turnover","N"]},
+                "picks": picks,
+            }
+            st.success("Preset guardado en st.session_state['vfq_best_preset']. Puedes copiar los valores a los sliders de VFQ.")
+
+    st.markdown("---")
+    st.caption(
+        "Nota: este tuning usa métricas VFQ de **hoy** para filtrar y luego backtestea la cesta en el intervalo elegido. "
+        "Sirve como _proxy_ rápido, pero puede tener **look-ahead**. Para rigor completo, migra a un walk-forward con fundamentales históricos."
+    )
