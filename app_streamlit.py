@@ -1,6 +1,7 @@
 from __future__ import annotations
 import altair as alt
-
+import hashlib
+import pandas as pd
 # --- poner esto ARRIBA DE TODO ---
 import os
 os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"  # o "none" si prefieres desactivar
@@ -44,6 +45,31 @@ from factors_growth_aware import (
     compute_qvm_scores,
     apply_megacap_rules,
 )
+
+# === utils_vfq_snapshot.py (o en tu módulo común) ===
+
+
+SNAP_KEY = "vfq_snapshot"        # clave en st.session_state
+SNAP_META = "vfq_snapshot_meta"  # metadatos (huella del universo)
+
+def _universe_fingerprint(df_universe: pd.DataFrame) -> str:
+    syms = df_universe.get("symbol", pd.Series([], dtype=str)).astype(str).sort_values()
+    raw = ("|".join(syms.tolist())).encode("utf-8")
+    return hashlib.md5(raw).hexdigest()
+
+def compute_vfq_snapshot(uni_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    1) Calcula factores crudos para TODO el universo
+    2) (opcional) neutraliza/escala sobre el universo
+    3) Devuelve DF final con columnas *_neut, acc_pct, hits, RVOL20, BreakoutScore, prob_up, sector, market_cap…
+    """
+    universe_syms = uni_df["symbol"].dropna().astype(str).unique().tolist()
+    feats = build_factor_frame(universe_syms)  # tu función actual
+    feats = feats.drop(columns=["sector", "market_cap"], errors="ignore").merge(
+        uni_df[["symbol", "sector", "market_cap"]], on="symbol", how="left"
+    )
+    return feats
+
 
 # ==================== CONFIG BÁSICO ====================
 st.set_page_config(
@@ -710,7 +736,7 @@ with tab2:
 with tab3:
     st.subheader("VFQ (Value / Quality / Flow)")
 
-    kept = st.session_state.get("kept", pd.DataFrame())
+    kept   = st.session_state.get("kept", pd.DataFrame())
     uni_cur = st.session_state.get("uni", pd.DataFrame())
 
     if kept is None or kept.empty or "symbol" not in kept.columns:
@@ -718,46 +744,76 @@ with tab3:
         st.stop()
 
     kept_syms = (
-        kept["symbol"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+        kept["symbol"].dropna().astype(str).unique().tolist()
     )
     if not kept_syms:
         st.warning("La lista kept está vacía.")
         st.stop()
 
-    # reconstruimos factores SOLO de los kept (para consistencia visual)
-    df_vfq_all = build_factor_frame(kept_syms)
+    # ───────────────────────── Snapshot congelado del UNIVERSO ─────────────────────────
+    # Evita recalcular/renormalizar factores al mover sliders.
+    SNAP_KEY  = "vfq_snapshot"
+    SNAP_META = "vfq_snapshot_meta"
 
-    # agregamos columnas de universo base
-    df_vfq_all = (
-        df_vfq_all.drop(columns=["sector", "market_cap"], errors="ignore")
-        .merge(
-            uni_cur[["symbol", "sector", "market_cap"]],
-            on="symbol",
-            how="left",
+    def _universe_fingerprint(df_universe: pd.DataFrame) -> str:
+        import hashlib
+        syms = df_universe.get("symbol", pd.Series([], dtype=str)).astype(str).dropna().unique().tolist()
+        syms = sorted(syms)
+        return hashlib.md5(("|".join(syms)).encode("utf-8")).hexdigest()
+
+    def _compute_vfq_snapshot(uni_df: pd.DataFrame) -> pd.DataFrame:
+        # Construye factores del UNIVERSO una sola vez
+        universe_syms = (
+            uni_df["symbol"].dropna().astype(str).unique().tolist()
         )
+        feats = build_factor_frame(universe_syms)  # ← tu función actual
+        # Trae sector y market_cap del universo
+        feats = (
+            feats.drop(columns=["sector", "market_cap"], errors="ignore")
+                 .merge(uni_df[["symbol", "sector", "market_cap"]], on="symbol", how="left")
+        )
+        return feats
+
+    fp         = _universe_fingerprint(uni_cur)
+    recalc_btn = st.button("🔄 Recalcular snapshot VFQ (universo)", use_container_width=False)
+
+    need_build = (
+        recalc_btn
+        or (SNAP_KEY not in st.session_state)
+        or (SNAP_META not in st.session_state)
+        or (st.session_state[SNAP_META].get("fp") != fp)
     )
 
-    # sliders VFQ locales a esta vista
+    if need_build:
+        snap = _compute_vfq_snapshot(uni_cur)
+        st.session_state[SNAP_KEY]  = snap
+        st.session_state[SNAP_META] = {"fp": fp}
+
+    df_snapshot = st.session_state.get(SNAP_KEY, pd.DataFrame()).copy()
+    if df_snapshot.empty:
+        st.error("No fue posible construir el snapshot VFQ.")
+        st.stop()
+
+    # Trabajamos sólo con los 'kept' pero SIN reescalar nada
+    df_vfq_all = df_snapshot[df_snapshot["symbol"].isin(kept_syms)].copy()
+
+    # ───────────────────────────────── Sliders VFQ ────────────────────────────────────
     c1v, c2v, c3v = st.columns(3)
     with c1v:
-        min_quality = st.slider("Min Quality neut.", 0.0, 1.0, 0.3, 0.01)
-        min_value = st.slider("Min Value neut.", 0.0, 1.0, 0.3, 0.01)
-        max_ndebt = st.slider("Max NetDebt/EBITDA", 0.0, 5.0, 2.0, 0.1)
+        min_quality = st.slider("Min Quality neut.", 0.0, 1.0, 0.30, 0.01)
+        min_value   = st.slider("Min Value neut.",   0.0, 1.0, 0.30, 0.01)
+        max_ndebt   = st.slider("Max NetDebt/EBITDA", 0.0, 5.0, 2.00, 0.1)
 
     with c2v:
-        min_acc_pct = st.slider("Accruals limpios (% mínimo)", 0, 100, 30, 1)
-        min_hits_req = st.slider("Min hits (breakout hits)", 0, 5, 1, 1)
-        min_rvol20 = st.slider("Min RVOL20", 0.0, 5.0, 1.2, 0.05)
+        min_acc_pct   = st.slider("Accruals limpios (% mínimo)", 0, 100, 30, 1)
+        min_hits_req  = st.slider("Min hits (breakout hits)",    0,   5,  1, 1)
+        min_rvol20    = st.slider("Min RVOL20",                 0.0, 5.0, 1.20, 0.05)
 
     with c3v:
         min_breakout = st.slider("Min BreakoutScore", 0, 100, 50, 1)
-        topN_prob = st.slider("Top N por prob_up", 5, 100, 30, 1)
+        topN_prob    = st.slider("Top N por prob_up", 5, 100, 30, 1)
 
-    # --------- filtros VFQ + técnico ----------
+    # ─────────────────────────── Filtros VFQ + técnico ────────────────────────────────
     mask = pd.Series(True, index=df_vfq_all.index, dtype=bool)
 
     # floors de quality / value
@@ -765,90 +821,63 @@ with tab3:
     mask &= (df_vfq_all["value_adj_neut"].fillna(0)   >= float(min_value))
 
     # técnica básica: hits, breakoutscore, rvol
-    mask &= (df_vfq_all["hits"].fillna(0)            >= int(min_hits_req))
-    mask &= (df_vfq_all["BreakoutScore"].fillna(0)   >= float(min_breakout))
-    mask &= (df_vfq_all["RVOL20"].fillna(0)          >= float(min_rvol20))
+    mask &= (df_vfq_all["hits"].fillna(0)          >= int(min_hits_req))
+    mask &= (df_vfq_all["BreakoutScore"].fillna(0) >= float(min_breakout))
+    mask &= (df_vfq_all["RVOL20"].fillna(0)        >= float(min_rvol20))
 
     # endeudamiento
-    mask &= (
-        df_vfq_all["netdebt_ebitda"].isna()
-        | (df_vfq_all["netdebt_ebitda"] <= float(max_ndebt))
-    )
+    mask &= (df_vfq_all["netdebt_ebitda"].isna() |
+             (df_vfq_all["netdebt_ebitda"] <= float(max_ndebt)))
 
-    # accruals limpios (% alto es mejor en tu escala actual)
-    mask &= (
-        df_vfq_all["acc_pct"].isna()
-        | (df_vfq_all["acc_pct"] >= float(min_acc_pct))
-    )
+    # accruals limpios (tu escala actual: más alto = mejor)
+    mask &= (df_vfq_all["acc_pct"].isna() |
+             (df_vfq_all["acc_pct"] >= float(min_acc_pct)))
 
     df_keep_vfq = df_vfq_all.loc[mask].copy()
 
-    # ranking final: prob_up si existe, si no BreakoutScore
-    if df_keep_vfq["prob_up"].notna().any():
-        df_keep_vfq = df_keep_vfq.sort_values("prob_up", ascending=False)
+    # Orden estable con desempates (evita "saltos" visuales)
+    if not df_keep_vfq.empty:
+        order_cols = ["prob_up","BreakoutScore","RVOL20","quality_adj_neut","value_adj_neut","market_cap"]
+        order_cols = [c for c in order_cols if c in df_keep_vfq.columns]
+        df_keep_vfq = df_keep_vfq.sort_values(order_cols,
+                                              ascending=[False]*len(order_cols),
+                                              kind="mergesort")
     else:
-        df_keep_vfq = df_keep_vfq.sort_values("BreakoutScore", ascending=False)
+        st.info("No hay símbolos que cumplan los umbrales actuales.")
 
     vfq_top = df_keep_vfq.head(int(topN_prob)).copy()
 
+    # ──────────────────────────── Tablas de salida ────────────────────────────────────
     st.markdown("### 🟢 Selección VFQ filtrada")
     cols_vfq_show = [
-        "symbol",
-        "netdebt_ebitda",
-        "accruals_ta",
-        "sector",
-        "market_cap",
-        "quality_adj_neut",
-        "value_adj_neut",
-        "acc_pct",
-        "hits",
-        "BreakoutScore",
-        "RVOL20",
-        "prob_up",
+        "symbol","netdebt_ebitda","accruals_ta","sector","market_cap",
+        "quality_adj_neut","value_adj_neut","acc_pct","hits","BreakoutScore","RVOL20","prob_up",
     ]
     cols_vfq_show = [c for c in cols_vfq_show if c in vfq_top.columns]
 
-    st.dataframe(
-        vfq_top[cols_vfq_show],
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(vfq_top[cols_vfq_show], use_container_width=True, hide_index=True)
 
-    # ------- rechazados (para watchlist técnica) -------
+    # Rechazados
     st.markdown("### 🧹 Rechazados por VFQ / técnica")
     rejected_syms = sorted(set(kept_syms) - set(df_keep_vfq["symbol"]))
     rej_view = df_vfq_all[df_vfq_all["symbol"].isin(rejected_syms)].copy()
 
     cols_rej_show = [
-        "symbol",
-        "sector",
-        "market_cap",
-        "quality_adj_neut",
-        "value_adj_neut",
-        "netdebt_ebitda",
-        "acc_pct",
-        "BreakoutScore",
-        "hits",
-        "RVOL20",
-        "prob_up",
+        "symbol","sector","market_cap","quality_adj_neut","value_adj_neut",
+        "netdebt_ebitda","acc_pct","BreakoutScore","hits","RVOL20","prob_up",
     ]
     cols_rej_show = [c for c in cols_rej_show if c in rej_view.columns]
+    st.dataframe(rej_view[cols_rej_show], use_container_width=True, hide_index=True)
 
-    st.dataframe(
-        rej_view[cols_rej_show],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    # ------- guardar en session_state para las otras tabs -------
-    st.session_state["vfq_top"] = vfq_top[["symbol"]].drop_duplicates()
-    st.session_state["vfq_table"] = vfq_top.reset_index(drop=True)
+    # ─────────────────── Persistencia para otras tabs ─────────────────────
+    st.session_state["vfq_top"]      = vfq_top[["symbol"]].drop_duplicates()
+    st.session_state["vfq_table"]    = vfq_top.reset_index(drop=True)
     st.session_state["pipeline_ready"] = True
 
-    st.session_state["vfq_all"] = df_vfq_all.copy()        # todos los kept con métricas
-    st.session_state["vfq_keep"] = df_keep_vfq.copy()      # los que pasaron filtros VFQ+técnico
-    st.session_state["vfq_rejected"] = rej_view.copy()     # los que quedaron fuera
-    st.session_state["vfq_params"] = {
+    st.session_state["vfq_all"]      = df_vfq_all.copy()   # kept con métricas (snapshot)
+    st.session_state["vfq_keep"]     = df_keep_vfq.copy()  # pasaron filtros VFQ+técnico
+    st.session_state["vfq_rejected"] = rej_view.copy()
+    st.session_state["vfq_params"]   = {
         "min_hits": int(min_hits_req),
         "min_rvol20": float(min_rvol20),
         "min_breakout": float(min_breakout),

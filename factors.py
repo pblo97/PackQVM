@@ -181,3 +181,5 @@ def _positive_hits(ebit: pd.Series, cfo: pd.Series, fcf: pd.Series) -> pd.Series
     )
     # Si todas son NaN para un símbolo, el total quedaría 0: opcionalmente marca como 0 con flag aparte si quieres.
     return hits.astype(int)
+
+
