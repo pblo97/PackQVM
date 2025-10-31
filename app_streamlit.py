@@ -1315,22 +1315,104 @@ with tab7:
         "Esos son los candidatos que vale la pena sobreponderar cuando estés en RISK ON."
     )
 
-
 with tab8:
+    import numpy as np
+    import pandas as pd
+    import streamlit as st
+
+    # --- Defaults por si no existen en tu app ---
+    DEFAULT_START = "2020-01-01"
+    DEFAULT_END   = pd.Timestamp.today().strftime("%Y-%m-%d")
+
+    # --- Helpers métricas (para no depender de otros módulos) ---
+    def _cagr(returns: pd.Series, freq_per_year=12) -> float:
+        if returns is None or returns.empty:
+            return 0.0
+        eq = (1 + returns.fillna(0)).cumprod()
+        years = len(returns) / float(freq_per_year)
+        if years <= 0 or eq.iloc[-1] <= 0:
+            return 0.0
+        return eq.iloc[-1] ** (1.0 / years) - 1.0
+
+    def _sharpe(returns: pd.Series, freq_per_year=12) -> float:
+        mu = returns.mean() * freq_per_year
+        sd = returns.std(ddof=0) * np.sqrt(freq_per_year)
+        return 0.0 if sd == 0 or np.isnan(sd) else float(mu / sd)
+
+    def _sortino(returns: pd.Series, freq_per_year=12) -> float:
+        dn = returns[returns < 0]
+        sd = dn.std(ddof=0) * np.sqrt(freq_per_year)
+        mu = returns.mean() * freq_per_year
+        return 0.0 if sd == 0 or np.isnan(sd) else float(mu / sd)
+
+    def _maxdd(equity: pd.Series) -> float:
+        if equity is None or equity.empty:
+            return 0.0
+        dd = equity / equity.cummax() - 1.0
+        return float(dd.min())
+
+    def _perf_from_rets(rets: pd.Series, periods_per_year: int) -> dict:
+        if rets is None or rets.empty:
+            return {"CAGR":0.0,"Sharpe":0.0,"Sortino":0.0,"MaxDD":0.0,"Turnover":0.0}
+        equity = (1 + rets.fillna(0)).cumprod()
+        return {
+            "CAGR":   _cagr(rets, periods_per_year),
+            "Sharpe": _sharpe(rets, periods_per_year),
+            "Sortino":_sortino(rets, periods_per_year),
+            "MaxDD":  _maxdd(equity),
+        }
+
+    # -------- Loader/Caché de precios (ajusta a tu código de datos) --------
+    @st.cache_data(show_spinner=False)
+    def _cached_load_prices_panel(symbols: list[str], start: pd.Timestamp, end: pd.Timestamp) -> dict[str, pd.DataFrame]:
+        """
+        Intenta usar un loader existente de tu app. Si no está, muestra error claro.
+        Debe devolver: {symbol: DataFrame con index fecha y columna 'close'}.
+        """
+        # 1) Si ya traes un panel en session_state (por ejemplo desde otra tab)
+        panel = st.session_state.get("price_panel")
+        if isinstance(panel, dict) and panel:
+            # filtra al set pedido
+            return {s: df.loc[str(start):str(end)] for s, df in panel.items() if s in symbols and not df.empty}
+
+        # 2) Busca loaders comunes en session_state (inyectados en tu app)
+        loader = st.session_state.get("fetch_price_history") or st.session_state.get("load_price_history")
+        if callable(loader):
+            out = {}
+            for s in symbols:
+                df = loader(s, start=start, end=end)  # tu función debe existir
+                if isinstance(df, pd.DataFrame) and "close" in df.columns and not df.empty:
+                    out[s] = df.sort_index()
+            return out
+
+        # 3) Si nada existe, forzamos un error explicativo
+        raise RuntimeError(
+            "No encuentro un loader de precios. Define en st.session_state['fetch_price_history'] "
+            "una función (symbol, start, end) -> DataFrame con columna 'close', o provee 'price_panel'."
+        )
+
+    # ==================== UI ====================
     st.subheader("🔧 Tuning de umbrales (random search)")
 
-    # --- Datos base necesarios desde tabs previas ---
-    kept = st.session_state.get("kept", pd.DataFrame())
-    uni_cur = st.session_state.get("uni", pd.DataFrame())
+    kept       = st.session_state.get("kept", pd.DataFrame())
+    uni_cur    = st.session_state.get("uni", pd.DataFrame())
     df_vfq_all = st.session_state.get("vfq_all", pd.DataFrame())
+
     if kept.empty or df_vfq_all.empty:
         st.warning("Necesitas correr Guardrails y VFQ antes de tunear.")
         st.stop()
 
+    # Asegura 'acc_pct' si falta (a partir de 'accruals_ta')
+    if "acc_pct" not in df_vfq_all.columns and "accruals_ta" in df_vfq_all.columns:
+        s = df_vfq_all["accruals_ta"].astype(float)
+        # más cerca de 0 es mejor → usar percentil del |accrual| e invertir
+        pct = (s.abs().rank(pct=True, method="average"))
+        df_vfq_all["acc_pct"] = (1.0 - pct) * 100.0
+
     # --------- Parámetros de búsqueda ----------
     c1, c2, c3 = st.columns(3)
     with c1:
-        n_samples = st.number_input("N° combinaciones aleatorias", 20, 1000, 150, 10)
+        n_samples = st.number_input("N° combinaciones aleatorias", 20, 2000, 150, 10)
         cost_bps  = st.number_input("Costos (bps por rebalance)", 0, 100, 10, 1)
         use_and   = st.toggle("Tendencia: MA200 Y Mom12-1>0", value=False)
     with c2:
@@ -1340,39 +1422,36 @@ with tab8:
     with c3:
         seed = st.number_input("Semilla aleatoria", 0, 10_000, 1234, 1)
         reb_freq = st.selectbox("Frecuencia rebalanceo", ["M","W","Q"], index=0)
-        go_btn = st.button("Ejecutar Tuning", use_container_width=True)
+        go_btn = st.button("Ejecutar Tuning", use_container_width=True, type="primary")
 
-    # Rangos razonables (puedes editarlos)
+    # Rangos razonables (puedes ajustarlos)
     ranges = dict(
         min_quality=(0.30, 0.70),
         min_value=(0.30, 0.70),
         min_acc_pct=(40, 85),           # %
         max_ndebt=(1.5, 3.0),
-        min_hits_req=(1, 4),            # entero
-        min_breakout=(60, 85),
-        min_rvol20=(1.05, 1.6),
-        topN_prob=(15, 60),             # solo para mostrar/recortar tabla
+        min_hits_req=(0, 5),            # entero
+        min_breakout=(50, 95),
+        min_rvol20=(1.00, 2.50),
+        topN_prob=(10, 60),
     )
 
     def _sample_params(rng: np.random.RandomState) -> dict:
-        # Real-valued
         p = {
-            "min_quality": float(rng.uniform(*ranges["min_quality"])),
-            "min_value":   float(rng.uniform(*ranges["min_value"])),
-            "min_acc_pct": int(rng.uniform(*ranges["min_acc_pct"])),
-            "max_ndebt":   float(rng.uniform(*ranges["max_ndebt"])),
-            "min_breakout":int(rng.uniform(*ranges["min_breakout"])),
-            "min_rvol20":  float(rng.uniform(*ranges["min_rvol20"])),
-            "min_hits_req":int(rng.randint(*ranges["min_hits_req"])),
-            "topN_prob":   int(rng.randint(*ranges["topN_prob"])),
+            "min_quality":  float(np.round(rng.uniform(*ranges["min_quality"]), 2)),
+            "min_value":    float(np.round(rng.uniform(*ranges["min_value"]), 2)),
+            "min_acc_pct":  int(rng.randint(*ranges["min_acc_pct"])),
+            "max_ndebt":    float(np.round(rng.uniform(*ranges["max_ndebt"]), 1)),
+            "min_breakout": int(rng.randint(*ranges["min_breakout"])),
+            "min_rvol20":   float(np.round(rng.uniform(*ranges["min_rvol20"]), 2)),
+            "min_hits_req": int(rng.randint(*ranges["min_hits_req"])),
+            "topN_prob":    int(rng.randint(*ranges["topN_prob"])),
         }
-        # correcciones de borde
-        p["min_hits_req"] = max(0, p["min_hits_req"])
-        p["topN_prob"] = max(min_names, p["topN_prob"])
+        p["topN_prob"] = max(int(min_names), p["topN_prob"])
         return p
 
-    def _apply_filters(df: pd.DataFrame, p: dict) -> list[str]:
-        """Aplica los mismos filtros que tab3, con parámetros p, y devuelve tickers."""
+    def _rank_and_pick(df: pd.DataFrame, p: dict) -> list[str]:
+        """Aplica filtros y rankea por prob_up (o BreakoutScore) devolviendo topN_prob."""
         m = pd.Series(True, index=df.index)
         m &= (df["quality_adj_neut"].fillna(0) >= p["min_quality"])
         m &= (df["value_adj_neut"].fillna(0)   >= p["min_value"])
@@ -1381,77 +1460,91 @@ with tab8:
         m &= (df["RVOL20"].fillna(0)           >= p["min_rvol20"])
         m &= (df["acc_pct"].isna() | (df["acc_pct"] >= p["min_acc_pct"]))
         m &= (df["netdebt_ebitda"].isna() | (df["netdebt_ebitda"] <= p["max_ndebt"]))
-        picks = df.loc[m, "symbol"].dropna().astype(str).unique().tolist()
-        return picks
+
+        df_f = df.loc[m].copy()
+        if df_f.empty:
+            return []
+        if "prob_up" in df_f.columns and df_f["prob_up"].notna().any():
+            df_f = df_f.sort_values("prob_up", ascending=False)
+        else:
+            df_f = df_f.sort_values("BreakoutScore", ascending=False)
+
+        return (
+            df_f["symbol"].dropna().astype(str).unique().tolist()[: int(p["topN_prob"])]
+        )
 
     def _portfolio_metrics_from_curves(curves: dict[str, pd.Series]) -> dict:
-        """Promedia retornos de las curvas y calcula métricas con helper existente."""
+        """Cesta igual-ponderada a partir de curvas por símbolo."""
         if not curves:
             return {"CAGR":0,"Sharpe":0,"Sortino":0,"MaxDD":0,"N":0,"Turnover":0}
-        eq_df = pd.DataFrame(curves).dropna(how="all")
-        if eq_df.empty:
+        eq = pd.DataFrame(curves).dropna(how="all")
+        if eq.empty:
             return {"CAGR":0,"Sharpe":0,"Sortino":0,"MaxDD":0,"N":0,"Turnover":0}
-        rets = eq_df.pct_change().mean(axis=1).fillna(0.0)
-        perf = perf_summary_from_returns(rets, periods_per_year={"M":12,"W":52,"Q":4}[reb_freq])
-        perf["N"] = eq_df.shape[1]
+        rets = eq.pct_change().mean(axis=1).fillna(0.0)
+        perf = _perf_from_rets(rets, {"M":12,"W":52,"Q":4}[reb_freq])
+        perf["N"] = int(eq.shape[1])
         return perf
 
-    results = []
-    details = []  # guarda picks por combinación
+    results, details = [], []
+
     if go_btn:
-        rng = np.random.RandomState(int(seed))
-        pbar = st.progress(0, text="Buscando combinaciones…")
-        for i in range(int(n_samples)):
-            p = _sample_params(rng)
-            picks = _apply_filters(df_vfq_all, p)
-            if len(picks) < int(min_names):
-                pbar.progress(int((i+1)/n_samples*100), text=f"Descartado (pocos símbolos): {len(picks)}")
-                continue
+        try:
+            rng = np.random.RandomState(int(seed))
+            pbar = st.progress(0.0, text="Buscando combinaciones…")
 
-            # Datos de precios y backtest
-            panel = _cached_load_prices_panel(
-                picks,
-                start=pd.to_datetime(start_tune),
-                end=pd.to_datetime(end_tune),
-                cache_key=f"TUNE_{i}"
-            )
-            if not isinstance(panel, dict) or len(panel) == 0:
-                continue
+            from backtests import backtest_many  # tu módulo agregado
 
-            # Backtest por símbolo y curvas
-            metrics_df, curves = backtest_many(
-                panel,
-                symbols=list(panel.keys()),
-                cost_bps=int(cost_bps),
-                lag_days=0,
-                use_and_condition=bool(use_and),
-                rebalance_freq=reb_freq
-            )
-            # Promedio turnover para tener referencia
-            avg_turn = float(metrics_df["Turnover"].mean()) if not metrics_df.empty else 0.0
+            for i in range(int(n_samples)):
+                p = _sample_params(rng)
+                picks = _rank_and_pick(df_vfq_all, p)
+                pbar.progress((i+1)/float(n_samples), text=f"Eval {i+1}/{n_samples}")
 
-            port_perf = _portfolio_metrics_from_curves(curves)
-            row = dict(
-                Sharpe=port_perf.get("Sharpe",0.0),
-                Sortino=port_perf.get("Sortino",0.0),
-                CAGR=port_perf.get("CAGR",0.0),
-                MaxDD=port_perf.get("MaxDD",0.0),
-                N=port_perf.get("N",0),
-                Turnover=avg_turn,
-            )
-            row.update(p)
-            results.append(row)
-            details.append({"params": p, "picks": picks})
-            pbar.progress(int((i+1)/n_samples*100), text=f"Evaluadas {i+1}/{n_samples}")
+                if len(picks) < int(min_names):
+                    continue
 
-        pbar.empty()
+                # Precios y backtest
+                panel = _cached_load_prices_panel(
+                    picks,
+                    start=pd.to_datetime(start_tune),
+                    end=pd.to_datetime(end_tune),
+                )
+                if not isinstance(panel, dict) or not panel:
+                    continue
+
+                metrics_df, curves = backtest_many(
+                    panel=panel,
+                    symbols=list(panel.keys()),
+                    cost_bps=int(cost_bps),
+                    lag_days=0,
+                    use_and_condition=bool(use_and),
+                    rebalance_freq=reb_freq,
+                )
+                avg_turn = float(metrics_df["Turnover"].mean()) if isinstance(metrics_df, pd.DataFrame) and not metrics_df.empty else 0.0
+
+                port_perf = _portfolio_metrics_from_curves(curves)
+                row = dict(
+                    Sharpe=float(port_perf.get("Sharpe",0.0)),
+                    Sortino=float(port_perf.get("Sortino",0.0)),
+                    CAGR=float(port_perf.get("CAGR",0.0)),
+                    MaxDD=float(port_perf.get("MaxDD",0.0)),
+                    N=int(port_perf.get("N",0)),
+                    Turnover=avg_turn,
+                )
+                row.update(p)
+                results.append(row)
+                details.append({"params": p, "picks": picks})
+
+            pbar.empty()
+
+        except Exception as e:
+            st.error("Error durante el tuning.")
+            st.exception(e)
 
     if results:
         res_df = pd.DataFrame(results).sort_values(["Sharpe","CAGR"], ascending=False).reset_index(drop=True)
         st.markdown("### 🏁 Top combinaciones")
         st.dataframe(res_df.head(25), use_container_width=True, hide_index=True)
 
-        # Seleccionar una fila y mostrar picks
         st.markdown("#### 📌 Detalle de selección")
         idx = st.number_input("Fila (Top-k) a inspeccionar", 0, max(0, len(res_df)-1), 0, 1)
         chosen = res_df.iloc[int(idx)].to_dict()
@@ -1478,10 +1571,10 @@ with tab8:
                 "metrics": {k: chosen[k] for k in ["Sharpe","CAGR","Sortino","MaxDD","Turnover","N"]},
                 "picks": picks,
             }
-            st.success("Preset guardado en st.session_state['vfq_best_preset']. Puedes copiar los valores a los sliders de VFQ.")
+            st.success("Preset guardado en st.session_state['vfq_best_preset']. Copia estos valores a los sliders de VFQ.")
 
     st.markdown("---")
     st.caption(
-        "Nota: este tuning usa métricas VFQ de **hoy** para filtrar y luego backtestea la cesta en el intervalo elegido. "
-        "Sirve como _proxy_ rápido, pero puede tener **look-ahead**. Para rigor completo, migra a un walk-forward con fundamentales históricos."
+        "Este tuning usa **las métricas VFQ actuales** para filtrar y luego backtestea la cesta en el intervalo elegido. "
+        "Es un _proxy_ rápido y puede tener **look-ahead**. Para rigor total, migra a walk-forward con fundamentales históricos."
     )
