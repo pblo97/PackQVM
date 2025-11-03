@@ -504,6 +504,13 @@ with tab2:
     )
 
 # ====== TAB 3: VFQ ======
+def _num_or_default(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    s = df.get(col)
+    if s is None:
+        return pd.Series(default, index=df.index, dtype=float)
+    return pd.to_numeric(s, errors="coerce").fillna(default)
+
+
 with tab3:
     st.subheader("VFQ (Value / Quality / Flow)")
 
@@ -532,33 +539,30 @@ with tab3:
     snap_key = SNAP_KEY
     meta_key = SNAP_META
 
-    # Botón manual para forzar recálculo
     recalc = st.button("♻️ Recalcular snapshot VFQ (universo)", use_container_width=False)
 
-    # 1) Firma compuesta del universo/kept
     universe_norm_params = st.session_state.get("universe_norm_params", {})
     uni_sig = st.session_state.get("uni_sig", "")
     cur_sig = _kept_signature(kept_syms, extra={"universe": universe_norm_params, "uni_sig": uni_sig})
 
-    # 2) ¿Debemos reconstruir?
     need_rebuild = recalc or (snap_key not in st.session_state)
     if not need_rebuild:
         prev_meta = st.session_state.get(meta_key, {})
         need_rebuild = (prev_meta.get("kept_sig") != cur_sig)
 
     if need_rebuild:
-        # --- Construye snapshot nuevo con el UNIVERSO ACTUAL filtrado a kept ---
+        # Universo actual filtrado a kept
         uni_kept = uni_cur[uni_cur["symbol"].astype(str).isin(kept_syms)].copy()
 
-        # 🔐 Cacheado por firma de universo
+        # Snapshot VFQ cacheado por firma de universo
         df_vfq_all = _cached_vfq_snapshot(uni_kept, uni_sig)
 
-        # Orden determinista (llaves “core”)
+        # Orden determinista por llaves de prioridad
         df_vfq_all = df_vfq_all.assign(
-            _p=df_vfq_all.get("prob_up", pd.Series(-9e9, index=df_vfq_all.index)).fillna(-9e9),
-            _b=df_vfq_all.get("BreakoutScore", pd.Series(-9e9, index=df_vfq_all.index)).fillna(-9e9),
-            _q=df_vfq_all.get("quality_adj_neut", pd.Series(-9e9, index=df_vfq_all.index)).fillna(-9e9),
-            _v=df_vfq_all.get("value_adj_neut", pd.Series(-9e9, index=df_vfq_all.index)).fillna(-9e9),
+            _p=_num_or_default(df_vfq_all, "prob_up", -9e9),
+            _b=_num_or_default(df_vfq_all, "BreakoutScore", -9e9),
+            _q=_num_or_default(df_vfq_all, "quality_adj_neut", -9e9),
+            _v=_num_or_default(df_vfq_all, "value_adj_neut", -9e9),
         ).sort_values(
             ["_p", "_b", "_q", "_v", "symbol"],
             ascending=[False, False, False, False, True],
@@ -567,7 +571,7 @@ with tab3:
 
         # Percentil por tamaño (carril mega-cap)
         if "market_cap" in df_vfq_all.columns:
-            df_vfq_all["cap_pct"] = df_vfq_all["market_cap"].rank(pct=True)
+            df_vfq_all["cap_pct"] = pd.to_numeric(df_vfq_all["market_cap"], errors="coerce").rank(pct=True)
 
         st.session_state[snap_key] = df_vfq_all.copy()
         st.session_state[meta_key] = {
@@ -604,9 +608,15 @@ with tab3:
     # -----------------------------------------------------------------
     # C) 🧪 Filtros sin re-normalizar + orden estable + carril mega-cap
     # -----------------------------------------------------------------
-    is_mega = df_vfq_all.get("cap_pct", pd.Series(0, index=df_vfq_all.index)) >= 0.90  # top 10% por market cap
+    if "cap_pct" not in df_vfq_all.columns:
+        if "market_cap" in df_vfq_all.columns:
+            df_vfq_all["cap_pct"] = pd.to_numeric(df_vfq_all["market_cap"], errors="coerce").rank(pct=True)
+        else:
+            df_vfq_all["cap_pct"] = 0.0
 
-    # Reglas técnicas “size-aware” (si activas el toggle)
+    is_mega = df_vfq_all["cap_pct"] >= 0.90  # top 10%
+
+    # Reglas técnicas “size-aware”
     if relax_mega:
         hits_req = np.where(is_mega, np.maximum(1,  min_hits_req-1), min_hits_req)
         rvol_req = np.where(is_mega, np.maximum(1.1, min_rvol20-0.3), min_rvol20)
@@ -616,22 +626,36 @@ with tab3:
         rvol_req = min_rvol20
         brk_req  = min_breakout
 
-    m = pd.Series(True, index=df_vfq_all.index, dtype=bool)
-    m &= df_vfq_all.get("quality_adj_neut", pd.Series(0, index=df_vfq_all.index)).fillna(0) >= float(min_quality)
-    m &= df_vfq_all.get("value_adj_neut",   pd.Series(0, index=df_vfq_all.index)).fillna(0) >= float(min_value)
-    m &= (df_vfq_all.get("acc_pct", pd.Series(np.nan, index=df_vfq_all.index)).isna()
-          | (df_vfq_all.get("acc_pct").fillna(0) >= float(min_acc_pct)))
-    m &= (df_vfq_all.get("netdebt_ebitda", pd.Series(np.nan, index=df_vfq_all.index)).isna()
-          | (df_vfq_all.get("netdebt_ebitda").fillna(0) <= float(max_ndebt)))
+    # Series numéricas seguras
+    q_s       = _num_or_default(df_vfq_all, "quality_adj_neut", 0.0)
+    v_s       = _num_or_default(df_vfq_all, "value_adj_neut",   0.0)
+    acc_pct_s = pd.to_numeric(df_vfq_all.get("acc_pct"), errors="coerce")            # NaN se respeta para "isna OR ..."
+    ndebt_s   = pd.to_numeric(df_vfq_all.get("netdebt_ebitda"), errors="coerce")     # idem
+    hits_s    = _num_or_default(df_vfq_all, "hits",           0.0)
+    rvol_s    = _num_or_default(df_vfq_all, "RVOL20",         0.0)
+    brk_s     = _num_or_default(df_vfq_all, "BreakoutScore",  0.0)
 
-    # Técnica (ya size-aware si relax_mega=True)
-    m &= df_vfq_all.get("hits", pd.Series(0, index=df_vfq_all.index)).fillna(0)          >= hits_req
-    m &= df_vfq_all.get("RVOL20", pd.Series(0, index=df_vfq_all.index)).fillna(0)        >= rvol_req
-    m &= df_vfq_all.get("BreakoutScore", pd.Series(0, index=df_vfq_all.index)).fillna(0) >= brk_req
+    # Máscara compuesta (nota la semántica isna() OR umbral)
+    m  = (q_s >= float(min_quality))
+    m &= (v_s >= float(min_value))
+    m &= (acc_pct_s.isna() | (acc_pct_s >= float(min_acc_pct)))
+    m &= (ndebt_s.isna()   | (ndebt_s   <= float(max_ndebt)))
+
+    # hits_req / rvol_req / brk_req pueden ser escalares o arrays; alineamos con índice
+    if np.isscalar(hits_req):
+        hits_req = np.full(len(df_vfq_all), hits_req, dtype=float)
+    if np.isscalar(rvol_req):
+        rvol_req = np.full(len(df_vfq_all), rvol_req, dtype=float)
+    if np.isscalar(brk_req):
+        brk_req  = np.full(len(df_vfq_all), brk_req,  dtype=float)
+
+    m &= (hits_s  >= hits_req)
+    m &= (rvol_s  >= rvol_req)
+    m &= (brk_s   >= brk_req)
 
     df_keep_vfq = df_vfq_all.loc[m].copy()
 
-    # Orden estable ya viene del snapshot; reforzamos por las llaves de prioridad
+    # Orden estable (reforzamos por las llaves)
     df_keep_vfq = df_keep_vfq.sort_values(
         ["_p", "_b", "_q", "_v", "symbol"],
         ascending=[False, False, False, False, True],
@@ -650,7 +674,6 @@ with tab3:
     cols_vfq_show = [c for c in cols_vfq_show if c in vfq_top.columns]
     st.dataframe(vfq_top[cols_vfq_show], use_container_width=True, hide_index=True)
 
-    # Rechazados
     st.markdown("### 🧹 Rechazados por VFQ / técnica")
     rejected_syms = sorted(set(df_vfq_all["symbol"]) - set(df_keep_vfq["symbol"]))
     rej_view = df_vfq_all[df_vfq_all["symbol"].isin(rejected_syms)].copy()
@@ -677,7 +700,7 @@ with tab3:
     }
 
     # ------------------------------------------------------------
-    # D) 🔎 Inspector “¿por qué no sale X?” (al final del tab)
+    # D) 🔎 Inspector “¿por qué no sale X?”
     # ------------------------------------------------------------
     with st.expander("🔎 ¿Por qué no aparece un símbolo?"):
         q = st.text_input("Ticker", "GOOG").strip().upper()
@@ -687,7 +710,6 @@ with tab3:
                 st.info("No está en el universo kept del snapshot.")
             else:
                 r = row.iloc[0]
-                # técnica size-aware consistente con el filtro
                 _is_mega = bool(r.get("cap_pct", 0) >= 0.90)
                 _hits_req = max(1, min_hits_req-1) if (relax_mega and _is_mega) else min_hits_req
                 _rvol_req = max(1.1, min_rvol20-0.3) if (relax_mega and _is_mega) else min_rvol20
@@ -696,15 +718,14 @@ with tab3:
                 checks = {
                     "quality_adj_neut": r.get("quality_adj_neut", 0) >= float(min_quality),
                     "value_adj_neut":   r.get("value_adj_neut", 0)   >= float(min_value),
-                    "acc_pct":          (pd.isna(r.get("acc_pct")) or r.get("acc_pct") >= float(min_acc_pct)),
-                    "netdebt_ebitda":   (pd.isna(r.get("netdebt_ebitda")) or r.get("netdebt_ebitda") <= float(max_ndebt)),
-                    "hits":             r.get("hits", 0)            >= _hits_req,
-                    "RVOL20":           r.get("RVOL20", 0)          >= _rvol_req,
-                    "BreakoutScore":    r.get("BreakoutScore", 0)   >= _brk_req,
+                    "acc_pct":          (pd.isna(r.get("acc_pct"))        or r.get("acc_pct", 0)        >= float(min_acc_pct)),
+                    "netdebt_ebitda":   (pd.isna(r.get("netdebt_ebitda")) or r.get("netdebt_ebitda", 0) <= float(max_ndebt)),
+                    "hits":             r.get("hits", 0)       >= _hits_req,
+                    "RVOL20":           r.get("RVOL20", 0)     >= _rvol_req,
+                    "BreakoutScore":    r.get("BreakoutScore", 0) >= _brk_req,
                 }
                 st.write({k: ("✅" if v else "❌") for k, v in checks.items()})
                 st.dataframe(row.T, use_container_width=True)
-
 
 # ====== TAB 4: SEÑALES (placeholder por ahora) ======
 # ====== TAB 4: SEÑALES ======
