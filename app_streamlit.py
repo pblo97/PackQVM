@@ -214,6 +214,12 @@ def _coalesce(*series):
             return pd.to_numeric(s, errors="coerce")
     return pd.Series(np.nan, index=series[0].index if series and series[0] is not None else None)
 
+def _num_or_default(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    s = df.get(col)
+    if s is None:
+        return pd.Series(default, index=df.index, dtype=float)
+    return pd.to_numeric(s, errors="coerce").fillna(default)
+
 
 
 # ==================== CONFIG BÁSICO ====================
@@ -504,11 +510,7 @@ with tab2:
     )
 
 # ====== TAB 3: VFQ ======
-def _num_or_default(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
-    s = df.get(col)
-    if s is None:
-        return pd.Series(default, index=df.index, dtype=float)
-    return pd.to_numeric(s, errors="coerce").fillna(default)
+
 
 
 with tab3:
