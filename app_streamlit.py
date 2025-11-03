@@ -220,7 +220,12 @@ def _num_or_default(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Seri
         return pd.Series(default, index=df.index, dtype=float)
     return pd.to_numeric(s, errors="coerce").fillna(default)
 
-
+def _series_or_nan(df: pd.DataFrame, col: str) -> pd.Series:
+    s = df.get(col)
+    if isinstance(s, pd.Series):
+        return pd.to_numeric(s, errors="coerce")
+    # si no existe la columna, devolvemos Serie NaN alineada
+    return pd.Series(np.nan, index=df.index, dtype=float)
 
 # ==================== CONFIG BÁSICO ====================
 st.set_page_config(
@@ -631,8 +636,8 @@ with tab3:
     # Series numéricas seguras
     q_s       = _num_or_default(df_vfq_all, "quality_adj_neut", 0.0)
     v_s       = _num_or_default(df_vfq_all, "value_adj_neut",   0.0)
-    acc_pct_s = pd.to_numeric(df_vfq_all.get("acc_pct"), errors="coerce")            # NaN se respeta para "isna OR ..."
-    ndebt_s   = pd.to_numeric(df_vfq_all.get("netdebt_ebitda"), errors="coerce")     # idem
+    acc_pct_s = _series_or_nan(df_vfq_all, "acc_pct")
+    ndebt_s   = _series_or_nan(df_vfq_all, "netdebt_ebitda")
     hits_s    = _num_or_default(df_vfq_all, "hits",           0.0)
     rvol_s    = _num_or_default(df_vfq_all, "RVOL20",         0.0)
     brk_s     = _num_or_default(df_vfq_all, "BreakoutScore",  0.0)
@@ -642,6 +647,9 @@ with tab3:
     m &= (v_s >= float(min_value))
     m &= (acc_pct_s.isna() | (acc_pct_s >= float(min_acc_pct)))
     m &= (ndebt_s.isna()   | (ndebt_s   <= float(max_ndebt)))
+    m &= (hits_s >= hits_req)
+    m &= (rvol_s >= rvol_req)
+    m &= (brk_s  >= brk_req)
 
     # hits_req / rvol_req / brk_req pueden ser escalares o arrays; alineamos con índice
     if np.isscalar(hits_req):
