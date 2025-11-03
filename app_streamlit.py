@@ -1,75 +1,201 @@
 from __future__ import annotations
-import altair as alt
-import hashlib
-import pandas as pd
-# --- poner esto ARRIBA DE TODO ---
+from altair import alt
+# --- watcher de archivos (evita recargas agresivas en dev) ---
 import os
 os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"  # o "none" si prefieres desactivar
-# ---------------------------------
+
+# ================== IMPORTS BASE ==================
+import hashlib
+import json
+import time
+from datetime import datetime
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from datetime import datetime
-from typing import Tuple
 
 # ============== IMPORTS DE TU PIPELINE ==============
 from pipeline_factors import build_factor_frame
 from fundamentals import (
     download_fundamentals,
-    build_vfq_scores_dynamic,
+    build_vfq_scores_dynamic,          # (importado si luego lo usas)
     download_guardrails_batch,
-    apply_quality_guardrails,
+    apply_quality_guardrails,          # (importado si luego lo usas)
 )
 from scoring import (
-    blend_breakout_qvm,
-    build_momentum_proxy,
+    blend_breakout_qvm,                # (importado si luego lo usas)
+    build_momentum_proxy,              # (importado si luego lo usas)
 )
 from data_io import (
     run_fmp_screener,
-    filter_universe,
+    filter_universe,                   # (importado si luego lo usas)
     load_prices_panel,
     load_benchmark,
     DEFAULT_START,
     DEFAULT_END,
 )
 from pipeline import (
-    apply_trend_filter,
-    enrich_with_breakout,
-    market_regime_on,
+    apply_trend_filter,                # (importado si luego lo usas)
+    enrich_with_breakout,              # (importado si luego lo usas)
+    market_regime_on,                  # (importado si luego lo usas)
 )
 from backtests import backtest_many
 
 # Opcional (growth-aware). No se usan aún en la UI, pero los dejamos importables.
 from factors_growth_aware import (
-    compute_qvm_scores,
-    apply_megacap_rules,
+    compute_qvm_scores,                # (importado si luego lo usas)
+    apply_megacap_rules,               # (importado si luego lo usas)
 )
 
-# === utils_vfq_snapshot.py (o en tu módulo común) ===
+# ================== KEYS SNAPSHOT ==================
+SNAP_KEY  = "vfq_snapshot"
+SNAP_META = "vfq_snapshot_meta"
 
-
-SNAP_KEY = "vfq_snapshot"        # clave en st.session_state
-SNAP_META = "vfq_snapshot_meta"  # metadatos (huella del universo)
-
+# ============== UTILS UNIVERSO & SNAPSHOT ==============
 def _universe_fingerprint(df_universe: pd.DataFrame) -> str:
-    syms = df_universe.get("symbol", pd.Series([], dtype=str)).astype(str).sort_values()
+    """Firma determinista orden-agnóstica del universo por símbolos."""
+    syms = (
+        df_universe.get("symbol", pd.Series([], dtype=str))
+        .dropna()
+        .astype(str)
+        .sort_values()
+    )
     raw = ("|".join(syms.tolist())).encode("utf-8")
     return hashlib.md5(raw).hexdigest()
 
 def compute_vfq_snapshot(uni_df: pd.DataFrame) -> pd.DataFrame:
     """
-    1) Calcula factores crudos para TODO el universo
-    2) (opcional) neutraliza/escala sobre el universo
-    3) Devuelve DF final con columnas *_neut, acc_pct, hits, RVOL20, BreakoutScore, prob_up, sector, market_cap…
+    Calcula todos los factores VFQ sobre el universo dado
+    y reinyecta sector/market_cap desde el universo actual.
     """
-    universe_syms = uni_df["symbol"].dropna().astype(str).unique().tolist()
-    feats = build_factor_frame(universe_syms)  # tu función actual
-    feats = feats.drop(columns=["sector", "market_cap"], errors="ignore").merge(
-        uni_df[["symbol", "sector", "market_cap"]], on="symbol", how="left"
+    universe_syms = (
+        uni_df["symbol"].dropna().astype(str).unique().tolist()
+    )
+    feats = build_factor_frame(universe_syms)
+    feats = (
+        feats.drop(columns=["sector", "market_cap"], errors="ignore")
+        .merge(uni_df[["symbol", "sector", "market_cap"]], on="symbol", how="left")
     )
     return feats
 
+# ------------------ CACHES ------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_run_fmp_screener(
+    *,
+    limit: int,
+    mcap_min: float,
+    volume_min: int,
+    ipo_days: int,
+    cache_key: str,
+) -> pd.DataFrame:
+    """
+    1) Pide universo base a FMP con filtros básicos.
+    2) Normaliza columnas core (symbol, sector, market_cap).
+    3) Aplica filtros post-request por volumen y antigüedad IPO.
+    """
+    df = run_fmp_screener(
+        limit=limit,
+        mcap_min=mcap_min,
+        volume_min=volume_min,
+        fetch_profiles=True,
+        cache_key=cache_key,
+        force=False,  # importante para respetar cache_key
+    )
+    if df is None:
+        return pd.DataFrame(columns=["symbol", "sector", "market_cap"])
+
+    df = df.copy()
+
+    # market cap normalizada → market_cap
+    if "market_cap" not in df.columns:
+        if "marketCap" in df.columns:
+            df["market_cap"] = pd.to_numeric(df["marketCap"], errors="coerce")
+        else:
+            df["market_cap"] = np.nan
+
+    # sector seguro
+    if "sector" not in df.columns:
+        df["sector"] = "Unknown"
+    else:
+        s = df["sector"].astype(str)
+        s = s.replace({"": "Unknown"})
+        s = s.where(~s.isna(), "Unknown")
+        df["sector"] = s
+
+    # volumen numérico
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+    # ipoDate a datetime
+    if "ipoDate" in df.columns:
+        df["ipoDate"] = pd.to_datetime(df["ipoDate"], errors="coerce", utc=True)
+    else:
+        df["ipoDate"] = pd.NaT
+
+    # -------- filtros post-request --------
+    df = df[df["market_cap"] >= float(mcap_min)]
+    if "volume" in df.columns:
+        df = df[df["volume"] >= float(volume_min)]
+    if df["ipoDate"].notna().any():
+        cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=int(ipo_days))
+        df = df[df["ipoDate"] < cutoff]
+
+    # columnas mínimas
+    core_cols = ["symbol", "sector", "market_cap"]
+    if "symbol" not in df.columns:
+        if "ticker" in df.columns:
+            df["symbol"] = df["ticker"].astype(str)
+        else:
+            df["symbol"] = ""
+
+    out = (
+        df[core_cols]
+        .dropna(subset=["symbol"])
+        .reset_index(drop=True)
+    )
+    return out
+
+@st.cache_data(show_spinner=False)
+def _cached_vfq_snapshot(uni_df: pd.DataFrame, uni_sig: str) -> pd.DataFrame:
+    """
+    Cachea el snapshot VFQ completo ligado a la firma del universo.
+    Cualquier cambio de `uni_sig` invalida este cache automáticamente.
+    """
+    _ = uni_sig  # se usa solo para invalidar el caché cuando cambia
+    return compute_vfq_snapshot(uni_df)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_download_guardrails(symbols: Tuple[str, ...], cache_key: str) -> pd.DataFrame:
+    return download_guardrails_batch(list(symbols), cache_key=cache_key, force=False)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_download_fundamentals(
+    symbols: Tuple[str, ...],
+    cache_key: str,
+    mc_pairs: Tuple[Tuple[str, float], ...] | None = None,
+) -> pd.DataFrame:
+    mc_map = dict(mc_pairs or ())
+    return download_fundamentals(list(symbols), market_caps=mc_map, cache_key=cache_key, force=False)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_load_prices_panel(symbols, start, end, cache_key=""):
+    return load_prices_panel(symbols, start, end, cache_key=cache_key, force=False)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_load_benchmark(bench, start, end):
+    return load_benchmark(bench, start, end)
+
+# ------------------ HELPERS FORMATO ------------------
+def _fmt_mcap(x):
+    try:
+        x = float(x)
+        if x >= 1e12: return f"${x/1e12:.2f}T"
+        if x >= 1e9:  return f"${x/1e9:.2f}B"
+        if x >= 1e6:  return f"${x/1e6:.2f}M"
+        return f"${x:,.0f}"
+    except Exception:
+        return ""
 
 # ==================== CONFIG BÁSICO ====================
 st.set_page_config(
@@ -86,299 +212,12 @@ st.markdown(
 .block-container { padding-top: 1.25rem; padding-bottom: 2rem; }
 h1, h2, h3 { letter-spacing: .2px; }
 hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1rem 0; }
-[data-testid="stDataFrame"] tbody tr:hover {
-    background: rgba(59,130,246,.08) !important;
-}
+[data-testid="stDataFrame"] tbody tr:hover { background: rgba(59,130,246,.08) !important; }
 [data-testid="stCaptionContainer"] { opacity: .85; }
 </style>
 """,
     unsafe_allow_html=True,
 )
-
-# ------------------ HELPERS DE CACHÉ ------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_run_fmp_screener(
-    *,
-    limit: int,
-    mcap_min: float,
-    volume_min: int,
-    ipo_days: int,
-    cache_key: str,
-) -> pd.DataFrame:
-    """
-    1. Pide universo base al screener de FMP con filtros básicos.
-    2. Normaliza nombres.
-    3. Aplica filtros extra por market cap, volumen y edad IPO.
-    """
-    df = run_fmp_screener(
-        limit=limit,
-        mcap_min=mcap_min,
-        volume_min=volume_min,
-        fetch_profiles=True,
-        cache_key=cache_key,
-        force=False,
-        # IMPORTANTE:
-        # run_fmp_screener debe ya mandar:
-        #   isEtf=false
-        #   isFund=false
-        #   isActivelyTrading=true
-    )
-
-    if df is None:
-        return pd.DataFrame(columns=["symbol", "sector", "market_cap"])
-
-    df = df.copy()
-
-    # market cap normalizado -> "market_cap"
-    if "market_cap" not in df.columns:
-        if "marketCap" in df.columns:
-            df["market_cap"] = pd.to_numeric(df["marketCap"], errors="coerce")
-        else:
-            df["market_cap"] = np.nan
-
-    # sector seguro
-    if "sector" not in df.columns:
-        df["sector"] = "Unknown"
-    df["sector"] = (
-        df["sector"]
-        .astype(str)
-        .replace({"": "Unknown"})
-        .fillna("Unknown")
-    )
-
-    # volumen numérico
-    if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-
-    # ipoDate a datetime
-    if "ipoDate" in df.columns:
-        df["ipoDate"] = pd.to_datetime(df["ipoDate"], errors="coerce", utc=True)
-    else:
-        df["ipoDate"] = pd.NaT
-
-    # -------- filtros post-request --------
-    # market cap
-    df = df[df["market_cap"] >= float(mcap_min)]
-
-    # volumen
-    if "volume" in df.columns:
-        df = df[df["volume"] >= float(volume_min)]
-
-    # antigüedad IPO
-    if df["ipoDate"].notna().any():
-        cutoff = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=int(ipo_days))
-        df = df[df["ipoDate"] < cutoff]
-
-    # columnas mínimas
-    core_cols = ["symbol", "sector", "market_cap"]
-    for col in core_cols:
-        if col not in df.columns:
-            if col == "symbol":
-                df["symbol"] = ""
-            elif col == "sector":
-                df["sector"] = "Unknown"
-            elif col == "market_cap":
-                df["market_cap"] = np.nan
-
-    # limpiar symbol vacío
-    df = (
-        df[core_cols]
-        .dropna(subset=["symbol"])
-        .reset_index(drop=True)
-    )
-
-    return df
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_download_guardrails(symbols: Tuple[str, ...], cache_key: str) -> pd.DataFrame:
-    return download_guardrails_batch(
-        list(symbols),
-        cache_key=cache_key,
-        force=False,
-    )
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_download_fundamentals(
-    symbols: Tuple[str, ...],
-    cache_key: str,
-    mc_pairs: Tuple[Tuple[str, float], ...] | None = None,
-) -> pd.DataFrame:
-    """
-    Si en algún momento quieres pasarle market caps estimadas para mejorar hints,
-    puedes usar mc_pairs=[(sym, mcap), ...].
-    """
-    mc_map = dict(mc_pairs or ())
-    return download_fundamentals(
-        list(symbols),
-        market_caps=mc_map,
-        cache_key=cache_key,
-        force=False,
-    )
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_load_prices_panel(symbols, start, end, cache_key=""):
-    return load_prices_panel(
-        symbols,
-        start,
-        end,
-        cache_key=cache_key,
-        force=False,
-    )
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_load_benchmark(bench, start, end):
-    return load_benchmark(bench, start, end)
-
-
-# ------------------ MÉTRICAS DE PERFORMANCE ------------------
-def perf_summary_from_returns(rets: pd.Series, periods_per_year: int) -> dict:
-    r = rets.dropna().astype(float)
-    if r.empty:
-        return {}
-
-    eq = (1 + r).cumprod()
-
-    yrs = len(r) / periods_per_year if periods_per_year else np.nan
-    if yrs and yrs > 0:
-        cagr = eq.iloc[-1] ** (1 / yrs) - 1
-    else:
-        cagr = np.nan
-
-    vol = r.std() * np.sqrt(periods_per_year) if r.std() > 0 else np.nan
-    sharpe = (r.mean() * periods_per_year) / r.std() if r.std() > 0 else np.nan
-
-    dd = eq / eq.cummax() - 1
-    maxdd = dd.min()
-
-    hit = (r > 0).mean()
-
-    avg_win = r[r > 0].mean() if (r > 0).any() else np.nan
-    avg_loss = r[r < 0].mean() if (r < 0).any() else np.nan
-
-    if avg_win and avg_loss:
-        payoff = avg_win / abs(avg_loss)
-    else:
-        payoff = np.nan
-
-    if not np.isnan(hit) and avg_win is not None and avg_loss is not None:
-        expct = hit * avg_win + (1 - hit) * avg_loss
-    else:
-        expct = np.nan
-
-    return {
-        "CAGR": float(cagr),
-        "Vol_anual": float(vol),
-        "Sharpe": float(sharpe),
-        "MaxDD": float(maxdd),
-        "HitRate": float(hit),
-        "AvgWin": float(avg_win),
-        "AvgLoss": float(avg_loss),
-        "Payoff": float(payoff),
-        "Expectancy": float(expct),
-        "Periodos": int(len(r)),
-    }
-
-
-# ------------------ NORMALIZADORES / UTILIDADES ------------------
-def normalize_guard_diag(diag: pd.DataFrame, df_guard: pd.DataFrame | None = None) -> pd.DataFrame:
-    """
-    Toma el diagnóstico crudo de guardrails (pass_profit, pass_issuance, etc.)
-    y garantiza columnas consistentes aunque falten en origen.
-    """
-    d = diag.copy() if isinstance(diag, pd.DataFrame) else pd.DataFrame()
-    if d.empty:
-        cols = [
-            "symbol",
-            "profit_hits",
-            "coverage_count",
-            "net_issuance",
-            "asset_growth",
-            "accruals_ta",
-            "netdebt_ebitda",
-            "pass_profit",
-            "pass_issuance",
-            "pass_assets",
-            "pass_accruals",
-            "pass_ndebt",
-            "pass_coverage",
-            "pass_all",
-            "reason",
-        ]
-        return pd.DataFrame(columns=cols)
-
-    # asegurar 'symbol'
-    if "symbol" not in d.columns:
-        if d.index.name == "symbol":
-            d = d.reset_index()
-        elif isinstance(df_guard, pd.DataFrame) and "symbol" in df_guard.columns:
-            d["symbol"] = df_guard["symbol"].values[: len(d)]
-        else:
-            d["symbol"] = pd.Index(range(len(d))).astype(str)
-
-    token_map = {
-        "pass_profit": "profit_floor",
-        "pass_issuance": "net_issuance",
-        "pass_assets": "asset_growth",
-        "pass_accruals": "accruals_ta",
-        "pass_ndebt": "netdebt_ebitda",
-        "pass_coverage": "vfq_coverage",
-    }
-
-    has_reason = "reason" in d.columns
-    for col, tok in token_map.items():
-        if col not in d.columns:
-            if has_reason:
-                d[col] = ~d["reason"].fillna("").str.contains(tok)
-            else:
-                d[col] = np.nan
-
-    checks = list(token_map.keys())
-    if "pass_all" not in d.columns:
-        if all(c in d.columns for c in checks):
-            d["pass_all"] = d[checks].all(axis=1)
-        else:
-            d["pass_all"] = False
-
-    if "reason" not in d.columns:
-        def _mk_reason(row):
-            r = []
-            if "pass_profit" in d.columns and not bool(row.get("pass_profit", True)):
-                r.append("profit_floor")
-            if "pass_issuance" in d.columns and not bool(row.get("pass_issuance", True)):
-                r.append("net_issuance")
-            if "pass_assets" in d.columns and not bool(row.get("pass_assets", True)):
-                r.append("asset_growth")
-            if "pass_accruals" in d.columns and not bool(row.get("pass_accruals", True)):
-                r.append("accruals_ta")
-            if "pass_ndebt" in d.columns and not bool(row.get("pass_ndebt", True)):
-                r.append("netdebt_ebitda")
-            if "pass_coverage" in d.columns and not bool(row.get("pass_coverage", True)):
-                r.append("vfq_coverage")
-            return ",".join(r)
-
-        d["reason"] = d.apply(_mk_reason, axis=1)
-
-    return d
-
-
-def _fmt_mcap(x):
-    """bonito para mostrar market cap"""
-    try:
-        x = float(x)
-        if x >= 1e12:
-            return f"${x/1e12:.2f}T"
-        if x >= 1e9:
-            return f"${x/1e9:.2f}B"
-        if x >= 1e6:
-            return f"${x/1e6:.2f}M"
-        return f"${x:,.0f}"
-    except Exception:
-        return ""
-
 
 # ==================== HEADER ====================
 l, r = st.columns([0.85, 0.15])
@@ -403,98 +242,64 @@ with st.sidebar:
         limit = st.slider("Límite del universo", 50, 1000, 300, 50)
 
         min_mcap = st.number_input(
-            "MarketCap mínimo (USD)",
-            value=5e8,
-            step=1e8,
-            format="%.0f",
+            "MarketCap mínimo (USD)", value=5e8, step=1e8, format="%.0f"
         )
 
         volume_min = st.number_input(
-            "Volumen mínimo diario",
-            value=500_000,
-            step=50_000,
-            format="%.0f",
+            "Volumen mínimo diario", value=500_000, step=50_000, format="%.0f"
         )
 
-        ipo_days = st.slider(
-            "Antigüedad IPO (días)",
-            90,
-            1500,
-            365,
-            30,
-        )
+        ipo_days = st.slider("Antigüedad IPO (días)", 90, 1500, 365, 30)
 
     # ---- Fundamentales & Guardrails ----
     with st.expander("Fundamentales & Guardrails", expanded=False):
-        min_cov_guard = st.slider(
-            "Cobertura VFQ mínima (# métricas)", 1, 4, 2
-        )
-        profit_hits = st.slider(
-            "Pisos de rentabilidad (hits EBIT/CFO/FCF)", 0, 3, 2
-        )
-        max_issuance = st.slider(
-            "Net issuance máx.", 0.00, 0.10, 0.03, 0.01
-        )
-        max_assets = st.slider(
-            "Asset growth |y/y| máx.", 0.00, 0.50, 0.20, 0.01
-        )
-        max_accr = st.slider(
-            "Accruals/TA | | máx.", 0.00, 0.25, 0.10, 0.01
-        )
-        max_ndeb = st.slider(
-            "NetDebt/EBITDA máx.", 0.0, 6.0, 3.0, 0.5
-        )
+        min_cov_guard = st.slider("Cobertura VFQ mínima (# métricas)", 1, 4, 2)
+        profit_hits   = st.slider("Pisos de rentabilidad (hits EBIT/CFO/FCF)", 0, 3, 2)
+        max_issuance  = st.slider("Net issuance máx.", 0.00, 0.10, 0.03, 0.01)
+        max_assets    = st.slider("Asset growth |y/y| máx.", 0.00, 0.50, 0.20, 0.01)
+        max_accr      = st.slider("Accruals/TA | | máx.", 0.00, 0.25, 0.10, 0.01)
+        max_ndeb      = st.slider("NetDebt/EBITDA máx.", 0.0, 6.0, 3.0, 0.5)
 
     # ---- Técnico ----
     with st.expander("Técnico — Tendencia & Breakout", expanded=True):
-        use_and = st.toggle("MA200 Y Mom 12–1", value=False)
+        use_and          = st.toggle("MA200 Y Mom 12–1", value=False)
         require_breakout = st.toggle("Exigir Breakout para ENTRY", value=False)
-        rvol_th = st.slider("RVOL (20d) mín.", 0.8, 2.5, 1.2, 0.1)
-        closepos_th = st.slider("ClosePos mín.", 0.0, 1.0, 0.60, 0.05)
-        p52_th = st.slider("Cercanía 52W High", 0.80, 1.00, 0.95, 0.01)
-        updown_vol_th = st.slider("Up/Down Vol Ratio (20d)", 0.8, 3.0, 1.2, 0.1)
-        min_hits_brk = st.slider("Mínimo checks breakout (K de 4)", 1, 4, 3)
-        atr_pct_min = st.slider("ATR pct (6–12m) mín.", 0.0, 1.0, 0.6, 0.05)
-        use_rs_slope = st.toggle("Exigir RS slope > 0 (MA20)", value=False)
+        rvol_th          = st.slider("RVOL (20d) mín.", 0.8, 2.5, 1.2, 0.1)
+        closepos_th      = st.slider("ClosePos mín.", 0.0, 1.0, 0.60, 0.05)
+        p52_th           = st.slider("Cercanía 52W High", 0.80, 1.00, 0.95, 0.01)
+        updown_vol_th    = st.slider("Up/Down Vol Ratio (20d)", 0.8, 3.0, 1.2, 0.1)
+        min_hits_brk     = st.slider("Mínimo checks breakout (K de 4)", 1, 4, 3)
+        atr_pct_min      = st.slider("ATR pct (6–12m) mín.", 0.0, 1.0, 0.6, 0.05)
+        use_rs_slope     = st.toggle("Exigir RS slope > 0 (MA20)", value=False)
 
     # ---- Régimen & Fechas ----
     with st.expander("Régimen & Fechas", expanded=False):
-        bench = st.selectbox(
-            "Benchmark", ["SPY", "QQQ", "^GSPC"], index=0
-        )
+        bench   = st.selectbox("Benchmark", ["SPY", "QQQ", "^GSPC"], index=0)
         risk_on = st.toggle("Exigir mercado Risk-ON", value=True)
-        start = st.date_input(
-            "Inicio", value=pd.to_datetime(DEFAULT_START).date()
-        )
-        end = st.date_input(
-            "Fin", value=pd.to_datetime(DEFAULT_END).date()
-        )
+        start   = st.date_input("Inicio", value=pd.to_datetime(DEFAULT_START).date())
+        end     = st.date_input("Fin",    value=pd.to_datetime(DEFAULT_END).date())
 
     # ---- Ranking avanzado ----
     with st.expander("Ranking avanzado", expanded=False):
-        beta_prob = st.slider(
-            "Sensibilidad probabilidad (β)", 1.0, 12.0, 6.0, 0.5
-        )
-        top_n_show = st.slider(
-            "Top N a resaltar", 10, 100, 25, 5
-        )
+        beta_prob   = st.slider("Sensibilidad probabilidad (β)", 1.0, 12.0, 6.0, 0.5)
+        top_n_show  = st.slider("Top N a resaltar", 10, 100, 25, 5)
 
     st.markdown("---")
     run_btn = st.button("Ejecutar", use_container_width=True)
 
 # Presets que ajustan umbrales técnicos, sin pisar lo que ya moviste manualmente demasiado
 if preset == "Laxo":
-    rvol_th = min(rvol_th, 1.0)
+    rvol_th     = min(rvol_th, 1.0)
     closepos_th = min(closepos_th, 0.55)
-    p52_th = min(p52_th, 0.92)
+    p52_th      = min(p52_th, 0.92)
     min_hits_brk = min(min_hits_brk, 2)
 elif preset == "Estricto":
-    rvol_th = max(rvol_th, 1.5)
+    rvol_th     = max(rvol_th, 1.5)
     closepos_th = max(closepos_th, 0.65)
-    p52_th = max(p52_th, 0.97)
+    p52_th      = max(p52_th, 0.97)
     min_hits_brk = max(min_hits_brk, 3)
 
-# cache tag que depende de entradas clave del universo
+# Cache tag que depende de entradas clave del universo
 cache_tag = f"{int(min_mcap)}_{ipo_days}_{limit}_{int(volume_min)}"
 
 # Estado del pipeline
@@ -503,35 +308,18 @@ if "pipeline_ready" not in st.session_state:
 
 # ==================== TABS ====================
 tab1, tab2, tab3, tab4, tab6, tab7, tab8 = st.tabs(
-    [
-        "Universo",
-        "Guardrails",
-        "VFQ",
-        "Señales",
-        "Export",
-        "Backtesting",
-        "Tuning"
-    ]
+    ["Universo", "Guardrails", "VFQ", "Señales", "Export", "Backtesting", "Tuning"]
 )
 
 # ==================== VFQ sidebar extra ====================
 with st.sidebar:
     st.markdown("⚙️ Fundamentos (VFQ)")
 
-    value_metrics_opts = ["inv_ev_ebitda", "fcf_yield"]
+    value_metrics_opts   = ["inv_ev_ebitda", "fcf_yield"]
     quality_metrics_opts = ["gross_profitability", "roic", "roa", "netMargin"]
 
-    sel_value = st.multiselect(
-        "Métricas Value",
-        options=value_metrics_opts,
-        default=["inv_ev_ebitda", "fcf_yield"],
-    )
-
-    sel_quality = st.multiselect(
-        "Métricas Quality",
-        options=quality_metrics_opts,
-        default=["gross_profitability", "roic"],
-    )
+    sel_value = st.multiselect("Métricas Value", options=value_metrics_opts, default=["inv_ev_ebitda", "fcf_yield"])
+    sel_quality = st.multiselect("Métricas Quality", options=quality_metrics_opts, default=["gross_profitability", "roic"])
 
     c1x, c2x = st.columns(2)
     with c1x:
@@ -539,21 +327,12 @@ with st.sidebar:
     with c2x:
         w_quality = st.slider("Peso Quality", 0.0, 1.0, 0.5, 0.05)
 
-    method_intra = st.radio(
-        "Agregación intra-bloque",
-        ["mean", "median", "weighted_mean"],
-        index=0,
-        horizontal=True,
-    )
-    winsor_p = st.slider("Winsor p (cola)", 0.0, 0.10, 0.01, 0.005)
+    method_intra = st.radio("Agregación intra-bloque", ["mean", "median", "weighted_mean"], index=0, horizontal=True)
+    winsor_p     = st.slider("Winsor p (cola)", 0.0, 0.10, 0.01, 0.005)
     size_buckets = st.slider("Buckets por tamaño", 1, 5, 3, 1)
-    group_mode = st.selectbox(
-        "Agrupar por", ["sector", "sector|size"], index=1
-    )
-    min_cov = st.slider("Cobertura mín. (# métricas)", 0, 8, 1, 1)
-    min_pct = st.slider(
-        "VFQ pct (intra-sector) mín.", 0.00, 1.00, 0.00, 0.01
-    )
+    group_mode   = st.selectbox("Agrupar por", ["sector", "sector|size"], index=1)
+    min_cov      = st.slider("Cobertura mín. (# métricas)", 0, 8, 1, 1)
+    min_pct      = st.slider("VFQ pct (intra-sector) mín.", 0.00, 1.00, 0.00, 0.01)
 
     st.session_state["min_cov"] = int(min_cov)
     st.session_state["min_pct"] = float(min_pct)
@@ -568,7 +347,6 @@ vfq_cfg = dict(
     size_buckets=int(size_buckets),
     group_mode=group_mode,
 )
-
 
 # ====== TAB 1: UNIVERSO ======
 with tab1:
@@ -587,38 +365,7 @@ with tab1:
             ipo_days=ipo_days,
             cache_key=cache_tag,
         )
-
-        # garantizamos columnas core
-        out = raw_universe.copy()
-        if "symbol" not in out.columns:
-            if "ticker" in out.columns:
-                out["symbol"] = out["ticker"].astype(str)
-            else:
-                out["symbol"] = ""
-
-        if "market_cap" not in out.columns:
-            if "marketCap" in out.columns:
-                out["market_cap"] = pd.to_numeric(
-                    out["marketCap"], errors="coerce"
-                )
-            else:
-                out["market_cap"] = np.nan
-
-        if "sector" not in out.columns:
-            out["sector"] = "Unknown"
-        else:
-            s = out["sector"].astype(str)
-            s = s.replace({"": "Unknown"})
-            s = s.where(~s.isna(), "Unknown")
-            out["sector"] = s
-
-        out = (
-            out[["symbol", "sector", "market_cap"]]
-            .dropna(subset=["symbol"])
-            .reset_index(drop=True)
-        )
-
-        st.session_state["uni"] = out.copy()
+        st.session_state["uni"] = raw_universe.copy()
 
     # leer versión estable en memoria
     uni_df = st.session_state["uni"].copy()
@@ -630,17 +377,19 @@ with tab1:
     c1m.metric("Screener", f"{total_raw}")
     c2m.metric("Tras filtros básicos", f"{total_filtrado}")
 
-    st.dataframe(
-        uni_df.head(50),
-        hide_index=True,
-        use_container_width=True,
-    )
+    st.dataframe(uni_df.head(50), hide_index=True, use_container_width=True)
+    st.caption("Esta tabla vive en st.session_state['uni'] y alimenta las demás pestañas.")
 
-    st.caption(
-        "Esta tabla vive en st.session_state['uni'] y alimenta las demás pestañas."
-    )
-    
+    # Firma del universo basada en símbolos (orden-agnóstica)
+    st.session_state["uni_sig"] = _universe_fingerprint(uni_df)
 
+    # (Opcional y recomendado) Parám. que definen el universo: usa tus controles REALES
+    st.session_state["universe_norm_params"] = {
+        "n_universe": int(limit),          # slider de tamaño de universo real
+        "winsor_p": float(winsor_p),       # slider VFQ
+        "buckets": int(size_buckets),      # slider VFQ
+        "group_by": group_mode,            # selector VFQ
+    }
 
 # ====== TAB 2: GUARDRAILS ======
 with tab2:
@@ -651,14 +400,7 @@ with tab2:
         st.info("Primero genera el universo en la pestaña Universo.")
         st.stop()
 
-    syms = (
-        uni["symbol"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
+    syms = uni["symbol"].dropna().astype(str).unique().tolist()
     if not syms:
         st.info("No hay símbolos en el universo.")
         st.stop()
@@ -670,11 +412,7 @@ with tab2:
     base_cols = ["symbol", "sector", "market_cap"]
     df_all = (
         df_all.drop(columns=["sector", "market_cap"], errors="ignore")
-        .merge(
-            uni[[c for c in base_cols if c in uni.columns]],
-            on="symbol",
-            how="left",
-        )
+        .merge(uni[[c for c in base_cols if c in uni.columns]], on="symbol", how="left")
     )
 
     # máscara 'estricta': pass_all True
@@ -700,27 +438,14 @@ with tab2:
     c3g.metric("Rechazados totales", f"{rechaz}")
 
     cols_show = [
-        "symbol",
-        "sector",
-        "pass_all",
-        "profit_hits",
-        "coverage_count",
-        "asset_growth",
-        "accruals_ta",
-        "netdebt_ebitda",
-        "pass_profit",
-        "pass_issuance",
-        "pass_assets",
-        "pass_accruals",
-        "pass_ndebt",
-        "pass_coverage",
+        "symbol", "sector", "pass_all", "profit_hits", "coverage_count",
+        "asset_growth", "accruals_ta", "netdebt_ebitda",
+        "pass_profit", "pass_issuance", "pass_assets",
+        "pass_accruals", "pass_ndebt", "pass_coverage",
     ]
     cols_show = [c for c in cols_show if c in df_all.columns]
 
-    with st.expander(
-        f"Detalle guardrails (estricto): {pasan} / {total}",
-        expanded=True,
-    ):
+    with st.expander(f"Detalle guardrails (estricto): {pasan} / {total}", expanded=True):
         st.dataframe(
             df_all[cols_show].sort_values("symbol"),
             use_container_width=True,
@@ -732,92 +457,71 @@ with tab2:
         "coverage_count = cuánta info fundamental tenemos disponible."
     )
 
-    
-
-
-# ====== TAB 3: VFQ ======
-# ====== TAB 3: VFQ ======
 # ====== TAB 3: VFQ ======
 with tab3:
     st.subheader("VFQ (Value / Quality / Flow)")
 
-    kept = st.session_state.get("kept", pd.DataFrame())
+    kept   = st.session_state.get("kept", pd.DataFrame())
     uni_cur = st.session_state.get("uni", pd.DataFrame())
 
     if kept is None or kept.empty or "symbol" not in kept.columns:
         st.warning("No hay símbolos aprobados por Guardrails. Ajusta la pestaña Guardrails.")
         st.stop()
 
-    kept_syms = (
-        kept["symbol"].dropna().astype(str).unique().tolist()
-    )
+    kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
     if not kept_syms:
         st.warning("La lista kept está vacía.")
         st.stop()
 
     # ------------------------------------------------------------
-    # A) 🔒 SNAPSHOT VFQ FIJO (se recalcula solo cuando lo pides)
-    #     Reemplaza CUALQUIER creación previa de df_vfq_all por esto
+    # A) 🔒 SNAPSHOT VFQ FIJO con auto-invalidate por cambio de universo
     # ------------------------------------------------------------
-    # --- A) SNAPSHOT VFQ FIJO con auto-invalidate cuando cambia el universo ---
-    import hashlib, json, time
-
     def _kept_signature(kept_syms: list[str], extra: dict | None = None) -> str:
-        """
-        Firma determinista del universo kept. Si quieres, puedes incluir parámetros extra
-        (ej. winsor/buckets del tab Universo) para que también invaliden el snapshot.
-        """
         payload = {"kept": sorted(map(str, kept_syms))}
         if extra:
             payload["extra"] = extra
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.md5(raw).hexdigest()
 
-    snap_key  = "vfq_snapshot"
-    meta_key  = "vfq_snapshot_meta"
+    snap_key = SNAP_KEY
+    meta_key = SNAP_META
 
-    # Botón manual por si quieres forzar el recálculo
+    # Botón manual para forzar recálculo
     recalc = st.button("♻️ Recalcular snapshot VFQ (universo)", use_container_width=False)
 
-    # 1) Calcula firma del universo actual (después de Guardrails)
-    kept_syms = (
-        kept.get("symbol", pd.Series(dtype=str))
-            .dropna().astype(str).unique().tolist()
-    )
-    # Si tienes parámetros del tab Universo que afectan a build_factor_frame (winsor, buckets, group_by, etc)
-    # ponlos aquí para que su cambio también fuerce la invalidación:
-    universe_norm_params = st.session_state.get("universe_norm_params", {})  # opcional
-    cur_sig = _kept_signature(kept_syms, extra=universe_norm_params)
+    # 1) Firma compuesta del universo/kept
+    universe_norm_params = st.session_state.get("universe_norm_params", {})
+    uni_sig = st.session_state.get("uni_sig", "")
+    cur_sig = _kept_signature(kept_syms, extra={"universe": universe_norm_params, "uni_sig": uni_sig})
 
-    # 2) ¿Debemos reconstruir? (botón, no existe snapshot, o firma distinta)
+    # 2) ¿Debemos reconstruir?
     need_rebuild = recalc or (snap_key not in st.session_state)
     if not need_rebuild:
         prev_meta = st.session_state.get(meta_key, {})
         need_rebuild = (prev_meta.get("kept_sig") != cur_sig)
 
     if need_rebuild:
-        # --- Construye snapshot nuevo con el universo ACTUAL ---
-        df_vfq_all = build_factor_frame(kept_syms)
+        # --- Construye snapshot nuevo con el UNIVERSO ACTUAL filtrado a kept ---
+        uni_kept = uni_cur[uni_cur["symbol"].astype(str).isin(kept_syms)].copy()
 
-        df_vfq_all = (
-            df_vfq_all.drop(columns=["sector", "market_cap"], errors="ignore")
-            .merge(uni_cur[["symbol", "sector", "market_cap"]], on="symbol", how="left")
-        )
+        # 🔐 Cacheado por firma de universo
+        df_vfq_all = _cached_vfq_snapshot(uni_kept, uni_sig)
 
-        # Orden base determinista
+        # Orden determinista (llaves “core”)
         df_vfq_all = df_vfq_all.assign(
-            _p=df_vfq_all["prob_up"].fillna(-9e9),
-            _b=df_vfq_all["BreakoutScore"].fillna(-9e9),
-            _q=df_vfq_all["quality_adj_neut"].fillna(-9e9),
-            _v=df_vfq_all["value_adj_neut"].fillna(-9e9),
+            _p=df_vfq_all.get("prob_up", pd.Series(-9e9, index=df_vfq_all.index)).fillna(-9e9),
+            _b=df_vfq_all.get("BreakoutScore", pd.Series(-9e9, index=df_vfq_all.index)).fillna(-9e9),
+            _q=df_vfq_all.get("quality_adj_neut", pd.Series(-9e9, index=df_vfq_all.index)).fillna(-9e9),
+            _v=df_vfq_all.get("value_adj_neut", pd.Series(-9e9, index=df_vfq_all.index)).fillna(-9e9),
         ).sort_values(
             ["_p", "_b", "_q", "_v", "symbol"],
             ascending=[False, False, False, False, True],
             kind="mergesort",
         )
 
-        # Percentil por tamaño (para carril mega-cap)
-        df_vfq_all["cap_pct"] = df_vfq_all["market_cap"].rank(pct=True)
+        # Percentil por tamaño (carril mega-cap)
+        if "market_cap" in df_vfq_all.columns:
+            df_vfq_all["cap_pct"] = df_vfq_all["market_cap"].rank(pct=True)
 
         st.session_state[snap_key] = df_vfq_all.copy()
         st.session_state[meta_key] = {
@@ -826,12 +530,12 @@ with tab3:
             "ts": time.time(),
         }
 
-    # 3) Usa SIEMPRE el snapshot fijo
+    # 3) Consumimos SIEMPRE el snapshot fijo
     df_vfq_all = st.session_state[snap_key].copy()
     meta = st.session_state.get(meta_key, {})
     st.caption(
-        f"Snapshot fijo: {meta.get('n_kept','?')} filas en kept. "
-        f"(ts={meta.get('ts','—')}). Solo se actualiza si cambia el universo o presionas el botón."
+        f"Snapshot fijo: {meta.get('n_kept','?')} símbolos en kept. "
+        f"(ts={meta.get('ts','—')}). Se actualiza solo si cambia el universo/kept o presionas el botón."
     )
 
     # -------------------------------------
@@ -854,45 +558,48 @@ with tab3:
     # -----------------------------------------------------------------
     # C) 🧪 Filtros sin re-normalizar + orden estable + carril mega-cap
     # -----------------------------------------------------------------
-    # --- MÁSCARAS MONOTÓNICAS sobre el snapshot (sin re-normalizar nada) ---
-    is_mega = df_vfq_all["cap_pct"] >= 0.90  # top 10% por market cap
+    is_mega = df_vfq_all.get("cap_pct", pd.Series(0, index=df_vfq_all.index)) >= 0.90  # top 10% por market cap
 
     # Reglas técnicas “size-aware” (si activas el toggle)
     if relax_mega:
-        # más suave para mega-caps
-        hits_req   = np.where(is_mega, np.maximum(1,  min_hits_req-1), min_hits_req)
-        rvol_req   = np.where(is_mega, np.maximum(1.1, min_rvol20-0.3), min_rvol20)
-        brk_req    = np.where(is_mega, np.maximum(60,  min_breakout-10), min_breakout)
+        hits_req = np.where(is_mega, np.maximum(1,  min_hits_req-1), min_hits_req)
+        rvol_req = np.where(is_mega, np.maximum(1.1, min_rvol20-0.3), min_rvol20)
+        brk_req  = np.where(is_mega, np.maximum(60,  min_breakout-10), min_breakout)
     else:
         hits_req = min_hits_req
         rvol_req = min_rvol20
         brk_req  = min_breakout
 
     m = pd.Series(True, index=df_vfq_all.index, dtype=bool)
-    m &= df_vfq_all["quality_adj_neut"].fillna(0) >= float(min_quality)
-    m &= df_vfq_all["value_adj_neut"].fillna(0)   >= float(min_value)
-    m &= (df_vfq_all["acc_pct"].isna() | (df_vfq_all["acc_pct"] >= float(min_acc_pct)))
-    m &= (df_vfq_all["netdebt_ebitda"].isna() | (df_vfq_all["netdebt_ebitda"] <= float(max_ndebt)))
+    m &= df_vfq_all.get("quality_adj_neut", pd.Series(0, index=df_vfq_all.index)).fillna(0) >= float(min_quality)
+    m &= df_vfq_all.get("value_adj_neut",   pd.Series(0, index=df_vfq_all.index)).fillna(0) >= float(min_value)
+    m &= (df_vfq_all.get("acc_pct", pd.Series(np.nan, index=df_vfq_all.index)).isna()
+          | (df_vfq_all.get("acc_pct").fillna(0) >= float(min_acc_pct)))
+    m &= (df_vfq_all.get("netdebt_ebitda", pd.Series(np.nan, index=df_vfq_all.index)).isna()
+          | (df_vfq_all.get("netdebt_ebitda").fillna(0) <= float(max_ndebt)))
 
     # Técnica (ya size-aware si relax_mega=True)
-    m &= df_vfq_all["hits"].fillna(0)          >= hits_req
-    m &= df_vfq_all["RVOL20"].fillna(0)        >= rvol_req
-    m &= df_vfq_all["BreakoutScore"].fillna(0) >= brk_req
+    m &= df_vfq_all.get("hits", pd.Series(0, index=df_vfq_all.index)).fillna(0)          >= hits_req
+    m &= df_vfq_all.get("RVOL20", pd.Series(0, index=df_vfq_all.index)).fillna(0)        >= rvol_req
+    m &= df_vfq_all.get("BreakoutScore", pd.Series(0, index=df_vfq_all.index)).fillna(0) >= brk_req
 
     df_keep_vfq = df_vfq_all.loc[m].copy()
 
-    # Orden estable ya viene del snapshot; si quieres reforzarlo:
-    df_keep_vfq = df_keep_vfq.sort_values(["_p","_b","_q","_v","symbol"],
-                                          ascending=[False,False,False,False,True],
-                                          kind="mergesort")
+    # Orden estable ya viene del snapshot; reforzamos por las llaves de prioridad
+    df_keep_vfq = df_keep_vfq.sort_values(
+        ["_p", "_b", "_q", "_v", "symbol"],
+        ascending=[False, False, False, False, True],
+        kind="mergesort",
+    )
 
     vfq_top = df_keep_vfq.head(int(topN_prob)).copy()
 
-    # --- Render tablas como antes ---
+    # --- Render tablas ---
     st.markdown("### 🟢 Selección VFQ filtrada")
     cols_vfq_show = [
-        "symbol","netdebt_ebitda","accruals_ta","sector","market_cap",
-        "quality_adj_neut","value_adj_neut","acc_pct","hits","BreakoutScore","RVOL20","prob_up",
+        "symbol", "netdebt_ebitda", "accruals_ta", "sector", "market_cap",
+        "quality_adj_neut", "value_adj_neut", "acc_pct",
+        "hits", "BreakoutScore", "RVOL20", "prob_up",
     ]
     cols_vfq_show = [c for c in cols_vfq_show if c in vfq_top.columns]
     st.dataframe(vfq_top[cols_vfq_show], use_container_width=True, hide_index=True)
@@ -902,13 +609,13 @@ with tab3:
     rejected_syms = sorted(set(df_vfq_all["symbol"]) - set(df_keep_vfq["symbol"]))
     rej_view = df_vfq_all[df_vfq_all["symbol"].isin(rejected_syms)].copy()
     cols_rej_show = [
-        "symbol","sector","market_cap","quality_adj_neut","value_adj_neut",
-        "netdebt_ebitda","acc_pct","BreakoutScore","hits","RVOL20","prob_up",
+        "symbol", "sector", "market_cap", "quality_adj_neut", "value_adj_neut",
+        "netdebt_ebitda", "acc_pct", "BreakoutScore", "hits", "RVOL20", "prob_up",
     ]
     cols_rej_show = [c for c in cols_rej_show if c in rej_view.columns]
     st.dataframe(rej_view[cols_rej_show], use_container_width=True, hide_index=True)
 
-    # Guardar en session_state (igual que antes, pero toma el snapshot)
+    # Guardar en session_state
     st.session_state["vfq_top"]      = vfq_top[["symbol"]].drop_duplicates()
     st.session_state["vfq_table"]    = vfq_top.reset_index(drop=True)
     st.session_state["vfq_all"]      = df_vfq_all.copy()   # snapshot entero (¡fijo!)
@@ -934,326 +641,206 @@ with tab3:
                 st.info("No está en el universo kept del snapshot.")
             else:
                 r = row.iloc[0]
-                checks = {
-                    "quality_adj_neut": r.get("quality_adj_neut",0) >= float(min_quality),
-                    "value_adj_neut":   r.get("value_adj_neut",0)   >= float(min_value),
-                    "acc_pct":          (pd.isna(r.get("acc_pct")) or r.get("acc_pct") >= float(min_acc_pct)),
-                    "netdebt_ebitda":   (pd.isna(r.get("netdebt_ebitda")) or r.get("netdebt_ebitda") <= float(max_ndebt)),
-                }
-                # técnica (size-aware consistente con el filtro)
-                _is_mega = bool(r.get("cap_pct",0) >= 0.90)
+                # técnica size-aware consistente con el filtro
+                _is_mega = bool(r.get("cap_pct", 0) >= 0.90)
                 _hits_req = max(1, min_hits_req-1) if (relax_mega and _is_mega) else min_hits_req
                 _rvol_req = max(1.1, min_rvol20-0.3) if (relax_mega and _is_mega) else min_rvol20
                 _brk_req  = max(60,  min_breakout-10) if (relax_mega and _is_mega) else min_breakout
-                checks.update({
-                    "hits":           r.get("hits",0)            >= _hits_req,
-                    "RVOL20":         r.get("RVOL20",0)          >= _rvol_req,
-                    "BreakoutScore":  r.get("BreakoutScore",0)   >= _brk_req,
-                })
-                st.write({k: ("✅" if v else "❌") for k,v in checks.items()})
+
+                checks = {
+                    "quality_adj_neut": r.get("quality_adj_neut", 0) >= float(min_quality),
+                    "value_adj_neut":   r.get("value_adj_neut", 0)   >= float(min_value),
+                    "acc_pct":          (pd.isna(r.get("acc_pct")) or r.get("acc_pct") >= float(min_acc_pct)),
+                    "netdebt_ebitda":   (pd.isna(r.get("netdebt_ebitda")) or r.get("netdebt_ebitda") <= float(max_ndebt)),
+                    "hits":             r.get("hits", 0)            >= _hits_req,
+                    "RVOL20":           r.get("RVOL20", 0)          >= _rvol_req,
+                    "BreakoutScore":    r.get("BreakoutScore", 0)   >= _brk_req,
+                }
+                st.write({k: ("✅" if v else "❌") for k, v in checks.items()})
                 st.dataframe(row.T, use_container_width=True)
 
+
 # ====== TAB 4: SEÑALES (placeholder por ahora) ======
+# ====== TAB 4: SEÑALES ======
 with tab4:
     st.subheader("Señales técnicas / Breakout")
 
-    # =========================
-    # Recuperar de session_state lo que dejó tab3
-    # =========================
-    uni_df = st.session_state.get("uni", pd.DataFrame())
-    vfq_all = st.session_state.get("vfq_all", pd.DataFrame())
-    vfq_keep = st.session_state.get("vfq_keep", pd.DataFrame())
-    vfq_rej = st.session_state.get("vfq_rejected", pd.DataFrame())
+    # -------------------------
+    # Recuperos del Tab 3
+    # -------------------------
+    uni_df     = st.session_state.get("uni", pd.DataFrame())
+    vfq_all    = st.session_state.get("vfq_all", pd.DataFrame())
+    vfq_keep   = st.session_state.get("vfq_keep", pd.DataFrame())
+    vfq_rej    = st.session_state.get("vfq_rejected", pd.DataFrame())
     vfq_params = st.session_state.get("vfq_params", {})
 
     if vfq_all is None or vfq_all.empty:
         st.info("Todavía no hay datos técnicos / VFQ. Corre la pestaña VFQ primero.")
         st.stop()
 
-    # thresholds que definiste en tab3 y guardaste en vfq_params
-    min_hits_thr = vfq_params.get("min_hits", 1)
-    min_breakout_thr = vfq_params.get("min_breakout", 50.0)
-    min_rvol20_thr = vfq_params.get("min_rvol20", 1.2)
-    require_breakout_flag = vfq_params.get("require_breakout", False)
+    # Umbrales desde VFQ con fallbacks seguros
+    min_hits_thr       = int(vfq_params.get("min_hits", 1))
+    min_breakout_thr   = float(vfq_params.get("min_breakout", 50.0))
+    min_rvol20_thr     = float(vfq_params.get("min_rvol20", 1.2))
+    require_breakout_flag = bool(vfq_params.get("require_breakout", False))
 
-    # toggle 'risk_on' viene de la sidebar (Régimen & Fechas)
-    # si por algún motivo no existe acá en tab4 (scope), lo pisamos a False
+    # Risk-ON: intenta leer de ámbito local; si no, de session_state; si no, False
     try:
-        global_risk_on = bool(risk_on)
+        global_risk_on = bool(risk_on)  # del sidebar (scope superior)
     except NameError:
-        global_risk_on = False
+        global_risk_on = bool(st.session_state.get("_risk_on", False))
 
-    # =========================
-    # 1. Estado de mercado (proxy amplitud)
-    # =========================
+    # -------------------------
+    # 1) Estado de mercado
+    # -------------------------
     st.markdown("### 1. Estado de mercado")
 
-    # proxy amplitud:
-    #   pct_hits_ok        = % tickers cuyo 'hits' >= min_hits_thr
-    #   pct_breakout_ok    = % tickers cuyo 'BreakoutScore' >= min_breakout_thr
-    #   global_risk_on     = tu semáforo macro/táctico (toggle Risk-ON)
+    hits_ser = pd.to_numeric(vfq_all.get("hits", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    bks_ser  = pd.to_numeric(vfq_all.get("BreakoutScore", pd.Series(dtype=float)), errors="coerce").fillna(0)
 
-    if "hits" in vfq_all.columns:
-        pct_hits_ok = (
-            pd.to_numeric(vfq_all["hits"], errors="coerce")
-            .fillna(0)
-            .ge(min_hits_thr)
-            .mean()
-        )
-    else:
-        pct_hits_ok = np.nan
-
-    if "BreakoutScore" in vfq_all.columns:
-        pct_breakout_ok = (
-            pd.to_numeric(vfq_all["BreakoutScore"], errors="coerce")
-            .fillna(0)
-            .ge(min_breakout_thr)
-            .mean()
-        )
-    else:
-        pct_breakout_ok = np.nan
+    pct_hits_ok = hits_ser.ge(min_hits_thr).mean() if len(hits_ser) else np.nan
+    pct_breakout_ok = bks_ser.ge(min_breakout_thr).mean() if len(bks_ser) else np.nan
 
     c1, c2, c3 = st.columns(3)
-
-    c1.metric(
-        "% setups técnicos OK",
-        f"{pct_hits_ok*100:.1f}%" if not np.isnan(pct_hits_ok) else "n/d",
-        help="≈ % del universo con suficientes 'hits' (checks técnicos cumplidos)."
-    )
-
-    c2.metric(
-        "% ruptura/momentum OK",
-        f"{pct_breakout_ok*100:.1f}%" if not np.isnan(pct_breakout_ok) else "n/d",
-        help="≈ % del universo con BreakoutScore ≥ umbral (momentum fuerte / ruptura)."
-    )
-
-    c3.metric(
-        "Régimen mercado",
-        "RISK ON ✅" if global_risk_on else "RISK OFF ⚠️",
-        help="Tu switch macro/táctico desde la barra lateral."
-    )
+    c1.metric("% setups técnicos OK", f"{pct_hits_ok*100:.1f}%" if not np.isnan(pct_hits_ok) else "n/d",
+              help="≈ % del universo con suficientes 'hits' (checks técnicos cumplidos).")
+    c2.metric("% ruptura/momentum OK", f"{pct_breakout_ok*100:.1f}%" if not np.isnan(pct_breakout_ok) else "n/d",
+              help="≈ % del universo con BreakoutScore ≥ umbral.")
+    c3.metric("Régimen mercado", "RISK ON ✅" if global_risk_on else "RISK OFF ⚠️",
+              help="Switch macro/táctico desde la barra lateral.")
 
     st.caption(
-        "- % setups técnicos OK ≈ amplitud de tendencia/volumen en verde según tus 'hits'.\n"
-        "- % ruptura/momentum OK ≈ cuántas están rompiendo con fuerza según BreakoutScore.\n"
-        "- RISK ON viene de tu toggle (si está OFF, las entradas nuevas son más frágiles).\n"
+        "- % setups técnicos OK ≈ amplitud por 'hits'.  \n"
+        "- % ruptura/momentum OK ≈ cuántas rompen con fuerza (BreakoutScore).  \n"
+        "- Con RISK ON + amplitud alta → mejor clima para entradas nuevas."
     )
-
     st.markdown("---")
 
-    # =========================
-    # 2. Checklist técnico actual
-    # =========================
+    # -------------------------
+    # 2) Checklist técnico activo
+    # -------------------------
     st.markdown("### 2. Checklist técnico activo")
-
-    # Mostramos los thresholds que están gobernando las señales técnicas
     col_a, col_b, col_c, col_d = st.columns(4)
     col_a.metric("Hits mínimos", f"{min_hits_thr}")
     col_b.metric("BreakoutScore mín.", f"{min_breakout_thr:.1f}")
     col_c.metric("RVOL20 mín.", f"{min_rvol20_thr:.2f}")
-    col_d.metric("Requiere breakout?", "Sí" if require_breakout_flag else "No")
+    col_d.metric("¿Requiere breakout?", "Sí" if require_breakout_flag else "No")
 
-    st.caption(
-        "Estos parámetros vienen de tu pestaña VFQ / técnico. "
-        "Cualquier papel que no cumpla esto, queda fuera."
-    )
-
+    st.caption("Parámetros heredados de VFQ/técnico (tab 3).")
     st.markdown("---")
 
-    # =========================
-    # 3. Watchlist técnica (los que quedaron después de VFQ+técnico)
-    # =========================
+    # -------------------------
+    # 3) Watchlist técnica
+    # -------------------------
     st.markdown("### 3. Watchlist técnica (post-VFQ + técnico)")
-
     if vfq_keep is None or vfq_keep.empty:
         st.warning("Ningún ticker pasó VFQ + técnico con los filtros actuales.")
     else:
         cols_keep_show = [
-            "symbol",
-            "sector",
-            "market_cap",
-            "quality_adj_neut",
-            "value_adj_neut",
-            "acc_pct",
-            "hits",
-            "BreakoutScore",
-            "RVOL20",
-            "prob_up",
+            "symbol","sector","market_cap","quality_adj_neut","value_adj_neut",
+            "acc_pct","hits","BreakoutScore","RVOL20","prob_up",
         ]
-        cols_keep_show = [
-            c for c in cols_keep_show if c in vfq_keep.columns
-        ]
-
+        cols_keep_show = [c for c in cols_keep_show if c in vfq_keep.columns]
         st.dataframe(
-            vfq_keep[cols_keep_show]
-                .sort_values(
-                    ["prob_up", "BreakoutScore"],
-                    ascending=False,
-                    na_position="last"
-                ),
-            hide_index=True,
-            use_container_width=True,
+            vfq_keep[cols_keep_show].sort_values(
+                ["prob_up","BreakoutScore"], ascending=[False, False], na_position="last"
+            ),
+            hide_index=True, use_container_width=True
         )
 
     st.caption(
-        "Watchlist técnica = candidatos activos que ya pasaron Guardrails y VFQ "
-        "y además cumplen señales de tendencia/momentum/volumen."
+        "Candidatos que pasaron Guardrails + VFQ y cumplen señales de tendencia/momentum/volumen."
     )
-
     st.markdown("---")
 
-    # =========================
-    # 4. Rechazados técnicos (fallaron momentum / volumen / hits)
-    # =========================
+    # -------------------------
+    # 4) Rechazados técnicos
+    # -------------------------
     st.markdown("### 4. Rechazados técnicos")
-
     if vfq_rej is None or vfq_rej.empty:
         st.info("No hay rechazados técnicos adicionales (o no se guardaron).")
     else:
         cols_rej_show = [
-            "symbol",
-            "sector",
-            "market_cap",
-            "quality_adj_neut",
-            "value_adj_neut",
-            "netdebt_ebitda",
-            "acc_pct",
-            "hits",
-            "BreakoutScore",
-            "RVOL20",
-            "prob_up",
+            "symbol","sector","market_cap","quality_adj_neut","value_adj_neut",
+            "netdebt_ebitda","acc_pct","hits","BreakoutScore","RVOL20","prob_up",
         ]
-        cols_rej_show = [
-            c for c in cols_rej_show if c in vfq_rej.columns
-        ]
-
+        cols_rej_show = [c for c in cols_rej_show if c in vfq_rej.columns]
         st.dataframe(
-            vfq_rej[cols_rej_show]
-                .sort_values(
-                    ["BreakoutScore", "prob_up"],
-                    ascending=False,
-                    na_position="last"
-                ),
-            hide_index=True,
-            use_container_width=True,
+            vfq_rej[cols_rej_show].sort_values(
+                ["BreakoutScore","prob_up"], ascending=[False, False], na_position="last"
+            ),
+            hide_index=True, use_container_width=True
         )
 
-    st.caption(
-        "Estos tickers pasaron calidad/valor básico pero no cumplen aún las "
-        "condiciones mínimas de momentum, volumen o ruptura. Se pueden vigilar "
-        "para ver si 'encienden' luego."
-    )
-
-    # =========================
-    # 5. Nota final
-    # =========================
+    # -------------------------
+    # 5) Nota final
+    # -------------------------
     st.info(
-        "Resumen rápido:\n"
-        "- El % setups técnicos OK y el % ruptura/momentum OK funcionan como 'amplitud interna' del mercado.\n"
-        "- Si ambas amplitudes son altas Y estás en RISK ON ✅, el entorno está listo para tomar trades nuevos.\n"
-        "- Si están bajas o estás en RISK OFF ⚠️, reduces agresividad / tamaño de posición."
+        "Guía rápida:\n"
+        "- Amplitud alta + RISK ON ✅ → entorno favorable.\n"
+        "- Amplitud baja o RISK OFF ⚠️ → reduce agresividad/tamaño."
     )
 
 
-# ====== TAB 6: EXPORT ======
+# ====== TAB 6: EXPORT (placeholder) ======
 with tab6:
     st.subheader("Export")
-    st.write(
-        "Acá puedes hacer st.download_button() del universo filtrado, VFQ_top, etc."
-    )
+    st.caption("Descarga tus vistas actuales.")
+    cex1, cex2, cex3 = st.columns(3)
+
+    # Versiones actuales en memoria
+    v_uni  = st.session_state.get("uni", pd.DataFrame())
+    v_all  = st.session_state.get("vfq_all", pd.DataFrame())
+    v_keep = st.session_state.get("vfq_keep", pd.DataFrame())
+    v_rej  = st.session_state.get("vfq_rejected", pd.DataFrame())
+
+    def _csv_bytes(df: pd.DataFrame) -> bytes:
+        return df.to_csv(index=False).encode("utf-8") if isinstance(df, pd.DataFrame) and not df.empty else b""
+
+    with cex1:
+        st.download_button("⬇️ Universo (uni)", data=_csv_bytes(v_uni), file_name="universe.csv", mime="text/csv", use_container_width=True)
+    with cex2:
+        st.download_button("⬇️ Snapshot VFQ (all)", data=_csv_bytes(v_all), file_name="vfq_all.csv", mime="text/csv", use_container_width=True)
+    with cex3:
+        st.download_button("⬇️ Selección VFQ (keep)", data=_csv_bytes(v_keep), file_name="vfq_keep.csv", mime="text/csv", use_container_width=True)
+
+    st.download_button("⬇️ Rechazados VFQ/técnico", data=_csv_bytes(v_rej), file_name="vfq_rejected.csv", mime="text/csv", use_container_width=True)
 
 
 # ====== TAB 7: BACKTESTING ======
 with tab7:
     st.subheader("Backtesting")
 
-    # -------------------------------
-    # 0. Recuperar candidatos y rango temporal
-    # -------------------------------
-    # usamos lo que dejó tab3/tab4:
     vfq_keep = st.session_state.get("vfq_keep", pd.DataFrame())
     if vfq_keep is None or vfq_keep.empty or "symbol" not in vfq_keep.columns:
-        st.warning(
-            "No hay símbolos aprobados en VFQ + técnico. "
-            "Corre las pestañas anteriores primero."
-        )
+        st.warning("No hay símbolos aprobados en VFQ + técnico. Corre las pestañas anteriores primero.")
         st.stop()
 
-    # universo base para testear
-    all_syms_bt = (
-        vfq_keep["symbol"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-    )
-
+    all_syms_bt = vfq_keep["symbol"].dropna().astype(str).unique().tolist()
     if not all_syms_bt:
         st.warning("No hay símbolos válidos para backtest.")
         st.stop()
 
-    # -------------------------------
-    # 1. Controles del backtest
-    # -------------------------------
+    # ---------- Controles ----------
     st.markdown("#### Parámetros de simulación")
-
     c_bt1, c_bt2, c_bt3 = st.columns(3)
-
     with c_bt1:
-        top_n_bt = st.slider(
-            "N° máx. de símbolos a probar",
-            min_value=5,
-            max_value=min(50, len(all_syms_bt)),
-            value=min(20, len(all_syms_bt)),
-            step=1,
-            help="Para no pedir miles de series si el universo está grande."
-        )
-
+        top_n_bt = st.slider("N° máx. de símbolos a probar", min_value=5, max_value=min(50, len(all_syms_bt)),
+                             value=min(20, len(all_syms_bt)), step=1)
     with c_bt2:
-        cost_bps = st.number_input(
-            "Costo de trading (bps por cambio de postura)",
-            min_value=0,
-            max_value=100,
-            value=10,
-            step=1,
-            help="10 bps = 0.10% cada vez que giras in/out."
-        )
-        lag_days = st.number_input(
-            "Lag ejecución (días)",
-            min_value=0,
-            max_value=5,
-            value=0,
-            step=1,
-            help="Retraso en la ejecución después de la señal."
-        )
-
+        cost_bps = st.number_input("Costo de trading (bps por cambio de postura)", min_value=0, max_value=100,
+                                   value=10, step=1)
+        lag_days = st.number_input("Lag ejecución (días)", min_value=0, max_value=5, value=0, step=1)
     with c_bt3:
-        use_and_condition = st.toggle(
-            "Exigir MA200 Y Mom12-1 > 0 (no OR)",
-            value=False,
-            help="Si está apagado: entrar si MA200 o Mom12-1 está OK. "
-                 "Si está prendido: exigir ambas."
-        )
-        rebalance_freq = st.selectbox(
-            "Frecuencia rebalance",
-            options=["M", "W"],
-            index=0,
-            help="M = mensual, W = semanal. El modelo asume long-only binario."
-        )
+        use_and_condition = st.toggle("Exigir MA200 Y Mom12-1 > 0", value=False)
+        rebalance_freq = st.selectbox("Frecuencia rebalance", options=["M", "W"], index=0)
 
-    # acotamos el set final a testear
-    syms_bt = all_syms_bt[:top_n_bt]
-
+    syms_bt = all_syms_bt[: int(top_n_bt)]
     st.caption(
-        f"Testeando {len(syms_bt)} símbolos: {', '.join(syms_bt[:10])}"
-        + ("…" if len(syms_bt) > 10 else "")
+        f"Testeando {len(syms_bt)} símbolos: {', '.join(syms_bt[:10])}" + ("…" if len(syms_bt) > 10 else "")
     )
 
-    # -------------------------------
-    # 2. Traer precios históricos
-    # -------------------------------
-    # usamos las fechas que ya definiste en sidebar ("Régimen & Fechas")
-    # si por algún motivo acá no existen start/end en este scope, hacemos fallback
+    # ---------- Fechas ----------
     try:
         start_dt = pd.to_datetime(start).date()
         end_dt   = pd.to_datetime(end).date()
@@ -1261,26 +848,19 @@ with tab7:
         start_dt = pd.to_datetime(DEFAULT_START).date()
         end_dt   = pd.to_datetime(DEFAULT_END).date()
 
-    # cargamos panel OHLC para todos los tickers
-    # _cached_load_prices_panel debe devolver dict-like:
-    #   { "AAPL": df_price, ... }
-    # donde df_price.index es datetime y df_price["close"] existe.
+    # ---------- Precios ----------
     price_panel = _cached_load_prices_panel(
         symbols=syms_bt,
         start=start_dt,
         end=end_dt,
         cache_key=f"bt_{start_dt}_{end_dt}_{len(syms_bt)}"
     )
-
-    if price_panel is None or price_panel == {}:
+    if not isinstance(price_panel, dict) or not price_panel:
         st.error("No pude cargar precios históricos para backtest.")
         st.stop()
 
-    # -------------------------------
-    # 3. Ejecutar backtest
-    # -------------------------------
-    # backtest_many viene de tu archivo backtests.py
-    bt_metrics, bt_curves = backtest_many(
+    # ---------- Backtest ----------
+    bt_metrics, bt_curves = backtest_many(  # usa el módulo ya importado arriba
         panel=price_panel,
         symbols=syms_bt,
         cost_bps=int(cost_bps),
@@ -1289,89 +869,49 @@ with tab7:
         rebalance_freq=str(rebalance_freq)
     )
 
-    # -------------------------------
-    # 4. Mostrar métricas agregadas
-    # -------------------------------
+    # ---------- Métricas ----------
     st.markdown("#### Resultados por símbolo")
-
     if bt_metrics is None or bt_metrics.empty:
         st.warning("No hubo data suficiente para calcular métricas.")
     else:
-        # formateo bonito
-        show_cols = ["symbol", "CAGR", "Sharpe", "Sortino", "MaxDD", "Turnover", "Trades"]
-        show_cols = [c for c in show_cols if c in bt_metrics.columns]
-
+        show_cols = [c for c in ["symbol","CAGR","Sharpe","Sortino","MaxDD","Turnover","Trades"] if c in bt_metrics.columns]
         fmt_df = bt_metrics.copy()
+        if "CAGR" in fmt_df:  fmt_df["CAGR"]   = (fmt_df["CAGR"] * 100).round(2)
+        if "MaxDD" in fmt_df: fmt_df["MaxDD"]  = (fmt_df["MaxDD"] * 100).round(2)
+        if "Turnover" in fmt_df: fmt_df["Turnover"] = (fmt_df["Turnover"] * 100).round(2)
 
-        # porcentajes legibles
-        if "CAGR" in fmt_df.columns:
-            fmt_df["CAGR"] = (fmt_df["CAGR"] * 100).round(2)
-        if "MaxDD" in fmt_df.columns:
-            fmt_df["MaxDD"] = (fmt_df["MaxDD"] * 100).round(2)
-        if "Turnover" in fmt_df.columns:
-            # turnover viene ~0..1. lo pasamos a % promedio por rebalance
-            fmt_df["Turnover"] = (fmt_df["Turnover"] * 100).round(2)
-
-        st.dataframe(
-            fmt_df[show_cols],
-            hide_index=True,
-            use_container_width=True
-        )
-
+        st.dataframe(fmt_df[show_cols], hide_index=True, use_container_width=True)
         st.caption(
-            "- CAGR: rendimiento anualizado del sistema long-only binario.\n"
-            "- Sharpe / Sortino: calidad de retornos.\n"
-            "- MaxDD: peor drawdown desde pico.\n"
-            "- Turnover (%): cuánto cambias postura en promedio cada rebalance.\n"
-            "- Trades: cuántas veces el sistema pasó de fuera→dentro o dentro→fuera."
+            "- CAGR anualizada; MaxDD y Turnover en %.  \n"
+            "- Señal simple long-only binaria por ticker."
         )
 
     st.markdown("---")
 
-    # -------------------------------
-    # 5. Curvas de equity normalizadas
-    # -------------------------------
+    # ---------- Curvas (Altair) ----------
     st.markdown("#### Curvas de equity normalizadas (1.0 = inicio)")
-
     if not bt_curves:
         st.info("No hay curvas de equity para graficar.")
     else:
-        # bt_curves: dict {sym: Series equity}
-        # Las unimos en un DataFrame ancho y luego derretimos para Altair
-        eq_df = []
+        eq_df_list = []
         for sym, curve in bt_curves.items():
             if curve is None or curve.empty:
                 continue
-            tmp = (
-                curve
-                .rename("equity")
-                .to_frame()
-                .reset_index()
-                .rename(columns={"index": "date"})
-            )
+            tmp = curve.rename("equity").to_frame().reset_index().rename(columns={"index": "date"})
             tmp["symbol"] = sym
-            eq_df.append(tmp)
+            eq_df_list.append(tmp)
 
-        if len(eq_df) == 0:
+        if not eq_df_list:
             st.info("No se pudo armar data suficiente para el gráfico.")
         else:
-            long_eq = pd.concat(eq_df, ignore_index=True)
+            long_eq = pd.concat(eq_df_list, ignore_index=True).sort_values(["symbol","date"])
 
-            # normalizar cada equity a 1.0 en su primer punto
             def _norm_grp(g):
                 first_val = g["equity"].iloc[0] if len(g) else np.nan
-                if first_val and first_val != 0:
-                    g["equity_norm"] = g["equity"] / first_val
-                else:
-                    g["equity_norm"] = np.nan
+                g["equity_norm"] = g["equity"] / first_val if (pd.notna(first_val) and first_val != 0) else np.nan
                 return g
 
-            long_eq = (
-                long_eq
-                .sort_values(["symbol", "date"])
-                .groupby("symbol", group_keys=False)
-                .apply(_norm_grp)
-            )
+            long_eq = long_eq.groupby("symbol", group_keys=False).apply(_norm_grp)
 
             chart = (
                 alt.Chart(long_eq)
@@ -1380,128 +920,33 @@ with tab7:
                     x=alt.X("date:T", title="Fecha"),
                     y=alt.Y("equity_norm:Q", title="Equidad normalizada"),
                     color=alt.Color("symbol:N", title="Símbolo"),
-                    tooltip=[
-                        alt.Tooltip("date:T", title="Fecha"),
-                        alt.Tooltip("symbol:N", title="Ticker"),
-                        alt.Tooltip("equity_norm:Q", title="Equidad norm.", format=".2f")
-                    ]
+                    tooltip=[alt.Tooltip("date:T", title="Fecha"),
+                             alt.Tooltip("symbol:N", title="Ticker"),
+                             alt.Tooltip("equity_norm:Q", title="Equidad norm.", format=".2f")]
                 )
                 .properties(height=320)
                 .interactive()
             )
-
             st.altair_chart(chart, use_container_width=True)
+            st.caption("Cada línea: dentro cuando señal ON, cash cuando OFF; reinvertido.")
 
-            st.caption(
-                "Cada línea = 'estar dentro cuando la señal está ON, en cash cuando está OFF', "
-                "reinvertido. Sirve para ver estabilidad comparada de cada ticker."
-            )
-
-    st.markdown("---")
-
-    # -------------------------------
-    # 6. Nota operativa
-    # -------------------------------
-    st.info(
-        "Cómo leer esto:\n"
-        "- Este backtest es súper simple: long-only binario por ticker, sin portfolio construction.\n"
-        "- La señal es tendencia/momentum (MA200 y/o Mom 12–1 > 0).\n"
-        "- El costo en bps castiga girar la posición.\n"
-        "- Lo importante aquí es el orden relativo: ¿qué tickers aguantan bien el swing? "
-        "Esos son los candidatos que vale la pena sobreponderar cuando estés en RISK ON."
-    )
-
+# ====== TAB 8: TUNING (Random Search) ======
 with tab8:
     import numpy as np
     import pandas as pd
-    import streamlit as st
 
-    # --- Defaults por si no existen en tu app ---
-    DEFAULT_START = "2020-01-01"
-    DEFAULT_END   = pd.Timestamp.today().strftime("%Y-%m-%d")
-
-    # --- Helpers métricas (para no depender de otros módulos) ---
-    def _cagr(returns: pd.Series, freq_per_year=12) -> float:
-        if returns is None or returns.empty:
-            return 0.0
-        eq = (1 + returns.fillna(0)).cumprod()
-        years = len(returns) / float(freq_per_year)
-        if years <= 0 or eq.iloc[-1] <= 0:
-            return 0.0
-        return eq.iloc[-1] ** (1.0 / years) - 1.0
-
-    def _sharpe(returns: pd.Series, freq_per_year=12) -> float:
-        mu = returns.mean() * freq_per_year
-        sd = returns.std(ddof=0) * np.sqrt(freq_per_year)
-        return 0.0 if sd == 0 or np.isnan(sd) else float(mu / sd)
-
-    def _sortino(returns: pd.Series, freq_per_year=12) -> float:
-        dn = returns[returns < 0]
-        sd = dn.std(ddof=0) * np.sqrt(freq_per_year)
-        mu = returns.mean() * freq_per_year
-        return 0.0 if sd == 0 or np.isnan(sd) else float(mu / sd)
-
-    def _maxdd(equity: pd.Series) -> float:
-        if equity is None or equity.empty:
-            return 0.0
-        dd = equity / equity.cummax() - 1.0
-        return float(dd.min())
-
-    def _perf_from_rets(rets: pd.Series, periods_per_year: int) -> dict:
-        if rets is None or rets.empty:
-            return {"CAGR":0.0,"Sharpe":0.0,"Sortino":0.0,"MaxDD":0.0,"Turnover":0.0}
-        equity = (1 + rets.fillna(0)).cumprod()
-        return {
-            "CAGR":   _cagr(rets, periods_per_year),
-            "Sharpe": _sharpe(rets, periods_per_year),
-            "Sortino":_sortino(rets, periods_per_year),
-            "MaxDD":  _maxdd(equity),
-        }
-
-    # -------- Loader/Caché de precios (ajusta a tu código de datos) --------
-    @st.cache_data(show_spinner=False)
-    def _cached_load_prices_panel(symbols: list[str], start: pd.Timestamp, end: pd.Timestamp) -> dict[str, pd.DataFrame]:
-        """
-        Intenta usar un loader existente de tu app. Si no está, muestra error claro.
-        Debe devolver: {symbol: DataFrame con index fecha y columna 'close'}.
-        """
-        # 1) Si ya traes un panel en session_state (por ejemplo desde otra tab)
-        panel = st.session_state.get("price_panel")
-        if isinstance(panel, dict) and panel:
-            # filtra al set pedido
-            return {s: df.loc[str(start):str(end)] for s, df in panel.items() if s in symbols and not df.empty}
-
-        # 2) Busca loaders comunes en session_state (inyectados en tu app)
-        loader = st.session_state.get("fetch_price_history") or st.session_state.get("load_price_history")
-        if callable(loader):
-            out = {}
-            for s in symbols:
-                df = loader(s, start=start, end=end)  # tu función debe existir
-                if isinstance(df, pd.DataFrame) and "close" in df.columns and not df.empty:
-                    out[s] = df.sort_index()
-            return out
-
-        # 3) Si nada existe, forzamos un error explicativo
-        raise RuntimeError(
-            "No encuentro un loader de precios. Define en st.session_state['fetch_price_history'] "
-            "una función (symbol, start, end) -> DataFrame con columna 'close', o provee 'price_panel'."
-        )
-
-    # ==================== UI ====================
     st.subheader("🔧 Tuning de umbrales (random search)")
 
     kept       = st.session_state.get("kept", pd.DataFrame())
-    uni_cur    = st.session_state.get("uni", pd.DataFrame())
     df_vfq_all = st.session_state.get("vfq_all", pd.DataFrame())
 
-    if kept.empty or df_vfq_all.empty:
+    if kept is None or kept.empty or df_vfq_all is None or df_vfq_all.empty:
         st.warning("Necesitas correr Guardrails y VFQ antes de tunear.")
         st.stop()
 
     # Asegura 'acc_pct' si falta (a partir de 'accruals_ta')
     if "acc_pct" not in df_vfq_all.columns and "accruals_ta" in df_vfq_all.columns:
-        s = df_vfq_all["accruals_ta"].astype(float)
-        # más cerca de 0 es mejor → usar percentil del |accrual| e invertir
+        s = pd.to_numeric(df_vfq_all["accruals_ta"], errors="coerce").astype(float)
         pct = (s.abs().rank(pct=True, method="average"))
         df_vfq_all["acc_pct"] = (1.0 - pct) * 100.0
 
@@ -1512,15 +957,18 @@ with tab8:
         cost_bps  = st.number_input("Costos (bps por rebalance)", 0, 100, 10, 1)
         use_and   = st.toggle("Tendencia: MA200 Y Mom12-1>0", value=False)
     with c2:
-        start_tune = st.date_input("Inicio tuning", value=pd.to_datetime(DEFAULT_START).date())
-        end_tune   = st.date_input("Fin tuning", value=pd.to_datetime(DEFAULT_END).date())
+        try:
+            start_tune = st.date_input("Inicio tuning", value=pd.to_datetime(start).date())
+            end_tune   = st.date_input("Fin tuning", value=pd.to_datetime(end).date())
+        except NameError:
+            start_tune = st.date_input("Inicio tuning", value=pd.to_datetime(DEFAULT_START).date())
+            end_tune   = st.date_input("Fin tuning", value=pd.to_datetime(DEFAULT_END).date())
         min_names  = st.number_input("Mín. símbolos por cartera", 5, 200, 15, 1)
     with c3:
         seed = st.number_input("Semilla aleatoria", 0, 10_000, 1234, 1)
         reb_freq = st.selectbox("Frecuencia rebalanceo", ["M","W","Q"], index=0)
         go_btn = st.button("Ejecutar Tuning", use_container_width=True, type="primary")
 
-    # Rangos razonables (puedes ajustarlos)
     ranges = dict(
         min_quality=(0.30, 0.70),
         min_value=(0.30, 0.70),
@@ -1547,39 +995,49 @@ with tab8:
         return p
 
     def _rank_and_pick(df: pd.DataFrame, p: dict) -> list[str]:
-        """Aplica filtros y rankea por prob_up (o BreakoutScore) devolviendo topN_prob."""
-        m = pd.Series(True, index=df.index)
-        m &= (df["quality_adj_neut"].fillna(0) >= p["min_quality"])
-        m &= (df["value_adj_neut"].fillna(0)   >= p["min_value"])
-        m &= (df["hits"].fillna(0)             >= p["min_hits_req"])
-        m &= (df["BreakoutScore"].fillna(0)    >= p["min_breakout"])
-        m &= (df["RVOL20"].fillna(0)           >= p["min_rvol20"])
-        m &= (df["acc_pct"].isna() | (df["acc_pct"] >= p["min_acc_pct"]))
-        m &= (df["netdebt_ebitda"].isna() | (df["netdebt_ebitda"] <= p["max_ndebt"]))
+        m = pd.Series(True, index=df.index, dtype=bool)
+        m &= df.get("quality_adj_neut", pd.Series(0, index=df.index)).fillna(0) >= p["min_quality"]
+        m &= df.get("value_adj_neut",   pd.Series(0, index=df.index)).fillna(0) >= p["min_value"]
+        m &= df.get("hits", pd.Series(0, index=df.index)).fillna(0)             >= p["min_hits_req"]
+        m &= df.get("BreakoutScore", pd.Series(0, index=df.index)).fillna(0)    >= p["min_breakout"]
+        m &= df.get("RVOL20", pd.Series(0, index=df.index)).fillna(0)           >= p["min_rvol20"]
+        m &= (df.get("acc_pct", pd.Series(np.nan, index=df.index)).isna()
+              | (df.get("acc_pct", pd.Series(0, index=df.index)).fillna(0) >= p["min_acc_pct"]))
+        m &= (df.get("netdebt_ebitda", pd.Series(np.nan, index=df.index)).isna()
+              | (df.get("netdebt_ebitda", pd.Series(0, index=df.index)).fillna(0) <= p["max_ndebt"]))
 
         df_f = df.loc[m].copy()
         if df_f.empty:
             return []
-        if "prob_up" in df_f.columns and df_f["prob_up"].notna().any():
-            df_f = df_f.sort_values("prob_up", ascending=False)
-        else:
-            df_f = df_f.sort_values("BreakoutScore", ascending=False)
+        rank_col = "prob_up" if ("prob_up" in df_f.columns and df_f["prob_up"].notna().any()) else "BreakoutScore"
+        df_f = df_f.sort_values(rank_col, ascending=False)
+        return df_f["symbol"].dropna().astype(str).unique().tolist()[: int(p["topN_prob"])]
 
-        return (
-            df_f["symbol"].dropna().astype(str).unique().tolist()[: int(p["topN_prob"])]
-        )
-
-    def _portfolio_metrics_from_curves(curves: dict[str, pd.Series]) -> dict:
-        """Cesta igual-ponderada a partir de curvas por símbolo."""
+    def _portfolio_metrics_from_curves(curves: dict[str, pd.Series], freq_code: str) -> dict:
         if not curves:
             return {"CAGR":0,"Sharpe":0,"Sortino":0,"MaxDD":0,"N":0,"Turnover":0}
         eq = pd.DataFrame(curves).dropna(how="all")
         if eq.empty:
             return {"CAGR":0,"Sharpe":0,"Sortino":0,"MaxDD":0,"N":0,"Turnover":0}
         rets = eq.pct_change().mean(axis=1).fillna(0.0)
-        perf = _perf_from_rets(rets, {"M":12,"W":52,"Q":4}[reb_freq])
-        perf["N"] = int(eq.shape[1])
-        return perf
+        periods = {"M":12,"W":52,"Q":4}[freq_code]
+
+        # métricas rápidas:
+        mu = rets.mean() * periods
+        sd = rets.std(ddof=0) * np.sqrt(periods)
+        sharpe = float(mu / sd) if sd else 0.0
+
+        dn = rets[rets < 0]
+        sdd = dn.std(ddof=0) * np.sqrt(periods)
+        sortino = float(mu / sdd) if sdd else 0.0
+
+        eq_curve = (1 + rets).cumprod()
+        years = len(rets) / float(periods) if periods else 0
+        cagr = float(eq_curve.iloc[-1] ** (1.0/years) - 1.0) if (years > 0 and eq_curve.iloc[-1] > 0) else 0.0
+        dd = (eq_curve / eq_curve.cummax() - 1.0).min()
+        maxdd = float(dd) if pd.notna(dd) else 0.0
+
+        return {"CAGR":cagr,"Sharpe":sharpe,"Sortino":sortino,"MaxDD":maxdd,"N":int(eq.shape[1])}
 
     results, details = [], []
 
@@ -1587,8 +1045,6 @@ with tab8:
         try:
             rng = np.random.RandomState(int(seed))
             pbar = st.progress(0.0, text="Buscando combinaciones…")
-
-            from backtests import backtest_many  # tu módulo agregado
 
             for i in range(int(n_samples)):
                 p = _sample_params(rng)
@@ -1598,26 +1054,27 @@ with tab8:
                 if len(picks) < int(min_names):
                     continue
 
-                # Precios y backtest
                 panel = _cached_load_prices_panel(
-                    picks,
-                    start=pd.to_datetime(start_tune),
-                    end=pd.to_datetime(end_tune),
+                    symbols=picks,
+                    start=pd.to_datetime(start_tune).date(),
+                    end=pd.to_datetime(end_tune).date(),
+                    cache_key=f"tune_{len(picks)}_{start_tune}_{end_tune}"
                 )
                 if not isinstance(panel, dict) or not panel:
                     continue
 
+                # Backtest (usa tu función estándar)
                 metrics_df, curves = backtest_many(
                     panel=panel,
                     symbols=list(panel.keys()),
                     cost_bps=int(cost_bps),
                     lag_days=0,
                     use_and_condition=bool(use_and),
-                    rebalance_freq=reb_freq,
+                    rebalance_freq=str(reb_freq),
                 )
                 avg_turn = float(metrics_df["Turnover"].mean()) if isinstance(metrics_df, pd.DataFrame) and not metrics_df.empty else 0.0
 
-                port_perf = _portfolio_metrics_from_curves(curves)
+                port_perf = _portfolio_metrics_from_curves(curves, str(reb_freq))
                 row = dict(
                     Sharpe=float(port_perf.get("Sharpe",0.0)),
                     Sortino=float(port_perf.get("Sortino",0.0)),
@@ -1656,7 +1113,7 @@ with tab8:
         if st.button("👉 Adoptar este preset", use_container_width=True):
             st.session_state["vfq_best_preset"] = {
                 "from_tuning": True,
-                "rebalance": reb_freq,
+                "rebalance": str(reb_freq),
                 "use_and": bool(use_and),
                 "cost_bps": int(cost_bps),
                 "date_range": (str(start_tune), str(end_tune)),
@@ -1668,9 +1125,3 @@ with tab8:
                 "picks": picks,
             }
             st.success("Preset guardado en st.session_state['vfq_best_preset']. Copia estos valores a los sliders de VFQ.")
-
-    st.markdown("---")
-    st.caption(
-        "Este tuning usa **las métricas VFQ actuales** para filtrar y luego backtestea la cesta en el intervalo elegido. "
-        "Es un _proxy_ rápido y puede tener **look-ahead**. Para rigor total, migra a walk-forward con fundamentales históricos."
-    )
