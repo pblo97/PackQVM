@@ -16,12 +16,7 @@ import pandas as pd
 import streamlit as st
 
 # ============== IMPORTS DE TU PIPELINE ==============
-from pipeline_factors import (
-    build_factor_frame,
-    _build_guardrails_base_from_snapshot,
-    apply_guardrails_logic,
-)
-
+from pipeline_factors import build_factor_frame
 from fundamentals import (
     download_fundamentals,
     build_vfq_scores_dynamic,          # (importado si luego lo usas)
@@ -45,9 +40,7 @@ from pipeline import (
     enrich_with_breakout,              # (importado si luego lo usas)
     market_regime_on,                  # (importado si luego lo usas)
 )
-
-
-from backtests import backtest_many
+from backtests import backtest_many     # (importado si luego lo usas)
 
 # Opcional (growth-aware). No se usan aún en la UI, pero los dejamos importables.
 from factors_growth_aware import (
@@ -194,8 +187,6 @@ def _cached_load_benchmark(bench, start, end):
     return load_benchmark(bench, start, end)
 
 # ------------------ HELPERS FORMATO ------------------
-
-
 def _fmt_mcap(x):
     try:
         x = float(x)
@@ -205,17 +196,6 @@ def _fmt_mcap(x):
         return f"${x:,.0f}"
     except Exception:
         return ""
-    
-import numpy as np
-import pandas as pd
-
-def _coalesce(*series):
-    for s in series:
-        if s is not None:
-            return pd.to_numeric(s, errors="coerce")
-    return pd.Series(np.nan, index=series[0].index if series and series[0] is not None else None)
-
-
 
 # ==================== CONFIG BÁSICO ====================
 st.set_page_config(
@@ -279,16 +259,6 @@ with st.sidebar:
         max_assets    = st.slider("Asset growth |y/y| máx.", 0.00, 0.50, 0.20, 0.01)
         max_accr      = st.slider("Accruals/TA | | máx.", 0.00, 0.25, 0.10, 0.01)
         max_ndeb      = st.slider("NetDebt/EBITDA máx.", 0.0, 6.0, 3.0, 0.5)
-
-    # GUARDA en session_state para que otros módulos/tab puedan leerlos
-    st.session_state.update(dict(
-        min_cov_guard = int(min_cov_guard),
-        profit_hits   = int(profit_hits),
-        max_issuance  = float(max_issuance),
-        max_assets    = float(max_assets),
-        max_accr      = float(max_accr),
-        max_ndeb      = float(max_ndeb),
-    ))
 
     # ---- Técnico ----
     with st.expander("Técnico — Tendencia & Breakout", expanded=True):
@@ -422,70 +392,44 @@ with tab1:
     }
 
 # ====== TAB 2: GUARDRAILS ======
-# ====== TAB 2: GUARDRAILS ======
-# ====== TAB 2: GUARDRAILS ======
 with tab2:
     st.subheader("Guardrails")
 
-    # --- 0) Universo estable ---
     uni = st.session_state.get("uni", pd.DataFrame())
     if uni is None or uni.empty or "symbol" not in uni.columns:
         st.info("Primero genera el universo en la pestaña Universo.")
         st.stop()
 
-    # --- 1) BASE cacheada por firma del universo ---
-    uni_sig = st.session_state.get("uni_sig", "")
-    need_rebuild = (
-        ("qvm_guard_uni_sig" not in st.session_state)
-        or ("qvm_guardrails_base" not in st.session_state)
-        or (st.session_state["qvm_guard_uni_sig"] != uni_sig)
-        or run_btn
-    )
-    if need_rebuild:
-        # Snapshot VFQ del universo actual (cacheado fuera)
-        snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)
+    syms = uni["symbol"].dropna().astype(str).unique().tolist()
+    if not syms:
+        st.info("No hay símbolos en el universo.")
+        st.stop()
 
-        # Builder canónico que ya tienes en pipeline_factors:
-        #   - injerta sector/market_cap
-        #   - calcula profit_hits desde márgenes (>0)
-        #   - calcula coverage_count por BLOQUES (rentabilidad disponible + 4 métricas)
-        base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni)
+    # construimos frame con factores/guardrails para TODO el universo actual
+    df_all = build_factor_frame(syms)
 
-        st.session_state["qvm_guardrails_base"] = base
-        st.session_state["qvm_guard_uni_sig"]   = uni_sig
-
-    base = st.session_state["qvm_guardrails_base"].copy()
-
-    # --- 2) Parámetros desde la sidebar (ya los guardaste en session_state) ---
-    min_cov_guard = int(st.session_state.get("min_cov_guard", 2))
-    profit_hits   = int(st.session_state.get("profit_hits", 2))
-    max_issuance  = float(st.session_state.get("max_issuance", 0.03))
-    max_assets    = float(st.session_state.get("max_assets", 0.20))
-    max_accr      = float(st.session_state.get("max_accr", 0.10))
-    max_ndeb      = float(st.session_state.get("max_ndeb", 3.0))
-
-    # --- 3) Aplicar lógica centralizada (NO recalcula factores) ---
-    df_all = apply_guardrails_logic(
-        base,
-        PROFIT_MIN_HITS    = profit_hits,
-        MAX_ISSUANCE       = max_issuance,
-        MAX_ASSET_GROWTH   = max_assets,
-        MAX_ACCRUALS_ABS   = max_accr,
-        MAX_NETDEBT_EBITDA = max_ndeb,
-        MIN_COVERAGE       = min_cov_guard,
+    # injertar sector / market_cap desde universo actual
+    base_cols = ["symbol", "sector", "market_cap"]
+    df_all = (
+        df_all.drop(columns=["sector", "market_cap"], errors="ignore")
+        .merge(uni[[c for c in base_cols if c in uni.columns]], on="symbol", how="left")
     )
 
-    # --- 4) Estado compartido & KPIs (nombres igual que antes para no romper Tab 3) ---
+    # máscara 'estricta': pass_all True
+    strict_mask = df_all.get("pass_all", False) == True
+
     kept_raw = (
-        df_all.loc[df_all["pass_all"], ["symbol"]]
-              .drop_duplicates()
-              .reset_index(drop=True)
+        df_all.loc[strict_mask, ["symbol"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
     )
-    st.session_state["kept"]       = kept_raw
+
+    # guardamos para siguientes tabs
+    st.session_state["kept"] = kept_raw
     st.session_state["guard_diag"] = df_all.copy()
 
-    total  = len(df_all)
-    pasan  = int(df_all["pass_all"].sum())
+    total = len(df_all)
+    pasan = int(strict_mask.sum())
     rechaz = total - pasan
 
     c1g, c2g, c3g = st.columns(3)
@@ -494,10 +438,10 @@ with tab2:
     c3g.metric("Rechazados totales", f"{rechaz}")
 
     cols_show = [
-        "symbol","sector","pass_all",
-        "profit_hits","coverage_count",
-        "asset_growth","accruals_ta","netdebt_ebitda","share_issuance",
-        "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage",
+        "symbol", "sector", "pass_all", "profit_hits", "coverage_count",
+        "asset_growth", "accruals_ta", "netdebt_ebitda",
+        "pass_profit", "pass_issuance", "pass_assets",
+        "pass_accruals", "pass_ndebt", "pass_coverage",
     ]
     cols_show = [c for c in cols_show if c in df_all.columns]
 
@@ -509,10 +453,9 @@ with tab2:
         )
 
     st.caption(
-        "• `profit_hits` se calcula desde márgenes (EBIT/CFO/FCF > 0). "
-        "• `coverage_count` cuenta disponibilidad por BLOQUES: {márgenes}, netdebt/EBITDA, accruals/TA, asset growth, share issuance."
+        "pass_all = pasó TODAS las barreras simultáneamente. "
+        "coverage_count = cuánta info fundamental tenemos disponible."
     )
-
 
 # ====== TAB 3: VFQ ======
 with tab3:
@@ -716,8 +659,7 @@ with tab3:
                 st.write({k: ("✅" if v else "❌") for k, v in checks.items()})
                 st.dataframe(row.T, use_container_width=True)
 
-
-# ====== TAB 4: SEÑALES (placeholder por ahora) ======
+# ====== TAB 4: SEÑALES ======
 # ====== TAB 4: SEÑALES ======
 with tab4:
     st.subheader("Señales técnicas / Breakout")
