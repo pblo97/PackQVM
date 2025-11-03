@@ -309,25 +309,32 @@ def apply_guardrails_ui(
     """Aplica los thresholds de la UI y genera/actualiza columnas pass_* y pass_all."""
     out = df.copy()
 
-    # -------- coverage_count (por si no viene) --------
+    # -------- coverage_count (independiente de profit_hits) --------
     if "coverage_count" not in out.columns:
-        coverage_cols = ["profit_hits","netdebt_ebitda","accruals_ta","asset_growth","share_issuance"]
-        coverage_cols = [c for c in coverage_cols if c in out.columns]
-        out["coverage_count"] = (
-            out[coverage_cols]
-            .apply(pd.to_numeric, errors="coerce")
-            .notna()
-            .sum(axis=1)
-            .astype(int)
-        )
+        # 1 punto por el BLOQUE de rentabilidad si hay al menos una métrica disponible
+        ebit_av = pd.to_numeric(out.get("ebit_margin"), errors="coerce").notna()
+        cfo_av  = pd.to_numeric(out.get("cfo_margin"),  errors="coerce").notna()
+        fcf_av  = pd.to_numeric(out.get("fcf_margin"),  errors="coerce").notna()
+        has_profit_any = pd.concat([ebit_av, cfo_av, fcf_av], axis=1).any(axis=1)
+
+        # +1 por cada una de las otras cuatro si está disponible
+        ndebt_av = pd.to_numeric(out.get("netdebt_ebitda"), errors="coerce").notna()
+        accr_av  = pd.to_numeric(out.get("accruals_ta"),    errors="coerce").notna()
+        ag_av    = pd.to_numeric(out.get("asset_growth"),   errors="coerce").notna()
+        iss_av   = pd.to_numeric(out.get("share_issuance"), errors="coerce").notna()
+
+        blocks = pd.concat([has_profit_any, ndebt_av, accr_av, ag_av, iss_av], axis=1)
+        out["coverage_count"] = blocks.sum(axis=1).astype(int)
 
     # -------- columnas numéricas coalescidas --------
     profit_hits_s = pd.to_numeric(out.get("profit_hits"), errors="coerce").fillna(0).astype(int)
 
     # distintas posibles etiquetas para issuance
-    issuance = _coalesce(out.get("share_issuance"),
-                         out.get("net_issuance"),
-                         out.get("issuance_net"))
+    issuance = _coalesce(
+        out.get("share_issuance"),
+        out.get("net_issuance"),
+        out.get("issuance_net"),
+    )
 
     asset_growth = pd.to_numeric(out.get("asset_growth"), errors="coerce")
     accruals_ta  = pd.to_numeric(out.get("accruals_ta"), errors="coerce")
@@ -335,10 +342,8 @@ def apply_guardrails_ui(
 
     # -------- reglas --------
     out["pass_coverage"] = (out["coverage_count"] >= int(min_cov))
-
     out["pass_profit"]   = (profit_hits_s >= int(profit_hits))
     out["pass_issuance"] = (issuance.abs() <= float(max_issuance))
-
     out["pass_assets"]   = (asset_growth.abs() <= float(max_assets))
     out["pass_accruals"] = (accruals_ta.abs()  <= float(max_accr))
     out["pass_ndebt"]    = (ndebt <= float(max_ndebt))
@@ -357,6 +362,7 @@ def apply_guardrails_ui(
     )
 
     return out
+
 
 
 # ==================== CONFIG BÁSICO ====================
@@ -499,6 +505,15 @@ with st.sidebar:
     st.session_state["min_cov"] = int(min_cov)
     st.session_state["min_pct"] = float(min_pct)
 
+    with st.sidebar:
+        if st.button("🔄 Reset cache & estado", use_container_width=True):
+            st.cache_data.clear()
+            for k in list(st.session_state.keys()):
+                if k not in ("_is_running_with_streamlit",):
+                    del st.session_state[k]
+            st.rerun()
+
+
 vfq_cfg = dict(
     value_metrics=sel_value,
     quality_metrics=sel_quality,
@@ -509,6 +524,8 @@ vfq_cfg = dict(
     size_buckets=int(size_buckets),
     group_mode=group_mode,
 )
+
+
 
 # ====== TAB 1: UNIVERSO ======
 with tab1:
