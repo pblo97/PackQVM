@@ -1,5 +1,5 @@
 from __future__ import annotations
-from altair import alt
+
 # --- watcher de archivos (evita recargas agresivas en dev) ---
 import os
 os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"  # o "none" si prefieres desactivar
@@ -10,7 +10,7 @@ import json
 import time
 from datetime import datetime
 from typing import Tuple
-
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
