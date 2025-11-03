@@ -44,49 +44,63 @@ def fetch_raw_fundamentals(tickers: Iterable[str]) -> pd.DataFrame:
 # ===========================================================
 # 2. Guardrails (pasa / no pasa "empresa sana")
 # ===========================================================
-def apply_guardrails_logic(df: pd.DataFrame) -> pd.DataFrame:
+def apply_guardrails_logic(
+    df: pd.DataFrame,
+    *,
+    PROFIT_MIN_HITS: int      = 2,
+    MAX_ISSUANCE: float       = 0.03,
+    MAX_ASSET_GROWTH: float   = 0.20,
+    MAX_ACCRUALS_ABS: float   = 0.10,
+    MAX_NETDEBT_EBITDA: float = 3.0,
+    MIN_COVERAGE: int         = 2,
+) -> pd.DataFrame:
     """
-    Marca pass_* y pass_all en base a umbrales fijos.
-    Si quieres sliders para estos umbrales después, genial,
-    pero la lógica queda centralizada acá.
+    Usa columnas ya presentes en 'df' (provenientes del snapshot/base).
+    No recalcula factores; solo aplica umbrales y marca pass_* / pass_all.
+    coverage_count = bloques disponibles:
+      [márgenes disponibles] + netdebt_ebitda + accruals_ta + asset_growth + share_issuance
     """
     out = df.copy()
 
-    PROFIT_MIN_HITS    = 2       # p.ej. al menos 2 Q buenos
-    MAX_ISSUANCE       = 0.03    # dilución aceptable (3%)
-    MAX_ASSET_GROWTH   = 0.20    # crecimiento de activos razonable
-    MAX_ACCRUALS_ABS   = 0.10    # accruals no locos
-    MAX_NETDEBT_EBITDA = 3.0     # deuda controlada
-    MIN_COVERAGE       = 2       # cuántas métricas no-NaN mínimas
+    # Si falta coverage_count, lo reconstruimos por BLOQUES (sin contar profit_hits)
+    if "coverage_count" not in out.columns:
+        has_profit_any = pd.concat([
+            pd.to_numeric(out.get("ebit_margin"), errors="coerce").notna(),
+            pd.to_numeric(out.get("cfo_margin"),  errors="coerce").notna(),
+            pd.to_numeric(out.get("fcf_margin"),  errors="coerce").notna(),
+        ], axis=1).any(axis=1)
 
-    # coverage_count = cuántas métricas clave tenemos realmente
-    coverage_cols = [
-        "profit_hits","netdebt_ebitda","accruals_ta",
-        "asset_growth","share_issuance",
-    ]
-    out["coverage_count"] = (
-        out[coverage_cols]
-        .apply(pd.to_numeric, errors="coerce")
-        .notna()
-        .sum(axis=1)
-        .astype(int)
-    )
+        blocks = pd.concat([
+            has_profit_any,
+            pd.to_numeric(out.get("netdebt_ebitda"), errors="coerce").notna(),
+            pd.to_numeric(out.get("accruals_ta"),    errors="coerce").notna(),
+            pd.to_numeric(out.get("asset_growth"),   errors="coerce").notna(),
+            pd.to_numeric(out.get("share_issuance"), errors="coerce").notna(),
+        ], axis=1)
+        out["coverage_count"] = blocks.sum(axis=1).astype(int)
 
-    out["pass_profit"]    = out["profit_hits"]    >= PROFIT_MIN_HITS
-    out["pass_issuance"]  = out["share_issuance"].abs() <= MAX_ISSUANCE
-    out["pass_assets"]    = out["asset_growth"].fillna(0).abs() <= MAX_ASSET_GROWTH
-    out["pass_accruals"]  = out["accruals_ta"].abs() <= MAX_ACCRUALS_ABS
-    out["pass_ndebt"]     = out["netdebt_ebitda"] <= MAX_NETDEBT_EBITDA
-    out["pass_coverage"]  = out["coverage_count"] >= MIN_COVERAGE
+    # Columnas numéricas seguras
+    profit_hits  = pd.to_numeric(out.get("profit_hits"), errors="coerce").fillna(0).astype(int)
+    issuance     = pd.to_numeric(out.get("share_issuance"), errors="coerce")
+    asset_growth = pd.to_numeric(out.get("asset_growth"),   errors="coerce")
+    accruals_ta  = pd.to_numeric(out.get("accruals_ta"),    errors="coerce")
+    ndebt        = pd.to_numeric(out.get("netdebt_ebitda"), errors="coerce")
 
-    hard_checks = [
-        "pass_profit","pass_issuance","pass_assets",
-        "pass_accruals","pass_ndebt","pass_coverage",
-    ]
-    out["pass_all"] = out[hard_checks].all(axis=1)
+    # Reglas
+    out["pass_profit"]   = profit_hits >= int(PROFIT_MIN_HITS)
+    out["pass_issuance"] = issuance.abs()     <= float(MAX_ISSUANCE)
+    out["pass_assets"]   = asset_growth.abs() <= float(MAX_ASSET_GROWTH)
+    out["pass_accruals"] = accruals_ta.abs()  <= float(MAX_ACCRUALS_ABS)
+    out["pass_ndebt"]    = ndebt              <= float(MAX_NETDEBT_EBITDA)
+    out["pass_coverage"] = out["coverage_count"] >= int(MIN_COVERAGE)
+
+    for c in ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]:
+        out[c] = out[c].fillna(False)
+
+    checks = ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]
+    out["pass_all"] = out[checks].all(axis=1)
 
     return out
-
 
 # ===========================================================
 # 3. VFQ scores (Quality / Value / Flow)
