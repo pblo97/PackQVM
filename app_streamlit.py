@@ -417,17 +417,30 @@ with tab2:
     base["fcf_hit"]  = (pd.to_numeric(base.get("fcf_margin"),  errors="coerce") > 0)
 
     # ---------- 3) Umbrales desde la barra lateral ----------
+        # ---------- 3) Umbrales desde la barra lateral ----------
     min_cov_guard = int(st.session_state.get("min_cov_guard", 2))
-    profit_hits   = int(st.session_state.get("profit_hits",   2))
-    max_issuance  = float(st.session_state.get("max_issuance", 0.03))
-    max_assets    = float(st.session_state.get("max_assets",   0.20))
-    max_accr      = float(st.session_state.get("max_accr",     0.10))
-    max_ndeb      = float(st.session_state.get("max_ndeb",     3.0))
+    profit_hits_ui = int(st.session_state.get("profit_hits",   2))
+    max_issuance   = float(st.session_state.get("max_issuance", 0.03))
+    max_assets     = float(st.session_state.get("max_assets",   0.20))
+    max_accr       = float(st.session_state.get("max_accr",     0.10))
+    max_ndeb       = float(st.session_state.get("max_ndeb",     3.0))
+
+    # ---------- 3.1) Detectar si hay señales de rentabilidad disponibles ----------
+    _margins = pd.concat([
+        pd.to_numeric(base.get("ebit_margin"), errors="coerce"),
+        pd.to_numeric(base.get("cfo_margin"),  errors="coerce"),
+        pd.to_numeric(base.get("fcf_margin"),  errors="coerce"),
+    ], axis=1)
+    has_any_margin_values = _margins.notna().any(axis=None)  # ¿existe al menos un margen no-NaN en TODO el df?
+    has_profit_hits_col   = pd.to_numeric(base.get("profit_hits"), errors="coerce").notna().any()
+
+    # Si NO hay márgenes ni profit_hits válidos, desactivamos la regla de profit_hits
+    profit_rule = profit_hits_ui if (has_any_margin_values or has_profit_hits_col) else 0
 
     # ---------- 4) Aplicar guardrails sobre la BASE (sin rearmar DF) ----------
     df_all = apply_guardrails_logic(
         base,
-        PROFIT_MIN_HITS    = profit_hits,
+        PROFIT_MIN_HITS    = int(profit_rule),
         MAX_ISSUANCE       = max_issuance,
         MAX_ASSET_GROWTH   = max_assets,
         MAX_ACCRUALS_ABS   = max_accr,
@@ -435,23 +448,36 @@ with tab2:
         MIN_COVERAGE       = min_cov_guard,
     ).copy()
 
-    # ---------- 5) KPIs de hits contables y de reglas ----------
-    total = len(df_all)
-    pasan = int(df_all["pass_all"].sum())
+    # ---------- 5) (opcional) flags de hits individuales SOLO si existen márgenes ----------
+    if has_any_margin_values:
+        df_all["ebit_hit"] = (pd.to_numeric(df_all.get("ebit_margin"), errors="coerce") > 0)
+        df_all["cfo_hit"]  = (pd.to_numeric(df_all.get("cfo_margin"),  errors="coerce") > 0)
+        df_all["fcf_hit"]  = (pd.to_numeric(df_all.get("fcf_margin"),  errors="coerce") > 0)
+    else:
+        # no contaminar: si no existen, no los mostramos ni contamos
+        for _c in ("ebit_hit","cfo_hit","fcf_hit"):
+            if _c in df_all.columns: df_all.drop(columns=[_c], inplace=True, errors="ignore")
+
+    # ---------- 6) KPIs ----------
+    total  = len(df_all)
+    pasan  = int(df_all["pass_all"].sum())
     rechaz = total - pasan
 
-    # Conteo por cada hit
-    ebit_ok = int(df_all["ebit_hit"].fillna(False).sum())
-    cfo_ok  = int(df_all["cfo_hit"].fillna(False).sum())
-    fcf_ok  = int(df_all["fcf_hit"].fillna(False).sum())
+    if has_any_margin_values:
+        ebit_ok = int(df_all.get("ebit_hit", pd.Series(False, index=df_all.index)).fillna(False).sum())
+        cfo_ok  = int(df_all.get("cfo_hit",  pd.Series(False, index=df_all.index)).fillna(False).sum())
+        fcf_ok  = int(df_all.get("fcf_hit",  pd.Series(False, index=df_all.index)).fillna(False).sum())
+        hits_caption = f"{ebit_ok}/{cfo_ok}/{fcf_ok}"
+    else:
+        hits_caption = "—/—/—"  # no había data de márgenes
 
     c1g, c2g, c3g, c4g = st.columns(4)
     c1g.metric("Pasan guardrails (estricto)", f"{pasan}")
     c2g.metric("Rechazados", f"{rechaz}")
-    c3g.metric("Hits contables (EBIT/CFO/FCF>0)", f"{ebit_ok}/{cfo_ok}/{fcf_ok}")
+    c3g.metric("Hits contables (EBIT/CFO/FCF>0)", hits_caption)
     c4g.metric("Cobertura ≥ mín.", f"{int((df_all['coverage_count']>=min_cov_guard).sum())} / {total}")
 
-    # ---------- 6) Persistir selección para otras pestañas ----------
+    # ---------- 7) Persistir y mostrar ----------
     kept_raw = (
         df_all.loc[df_all["pass_all"], ["symbol"]]
               .drop_duplicates()
@@ -460,13 +486,15 @@ with tab2:
     st.session_state["kept"]       = kept_raw
     st.session_state["guard_diag"] = df_all.copy()
 
-    # ---------- 7) Vista de detalle ----------
     cols_show = [
         "symbol","sector","pass_all",
-        "profit_hits","ebit_hit","cfo_hit","fcf_hit","coverage_count",
+        "profit_hits","coverage_count",
         "asset_growth","accruals_ta","netdebt_ebitda","share_issuance",
         "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage",
     ]
+    # solo añadir ebit/cfo/fcf hit si existen
+    if has_any_margin_values:
+        cols_show[cols_show.index("profit_hits")+1:1] = ["ebit_hit","cfo_hit","fcf_hit"]
     cols_show = [c for c in cols_show if c in df_all.columns]
 
     with st.expander(f"Detalle guardrails (estricto): {pasan} / {total}", expanded=True):
@@ -476,10 +504,12 @@ with tab2:
         )
 
     st.caption(
-        "• `profit_hits` = nº de márgenes > 0 entre EBIT/CFO/FCF (derivado del snapshot). "
-        "• `coverage_count` cuenta BLOQUES disponibles: {algún margen}, netdebt/EBITDA, accruals/TA, asset growth, share issuance. "
-        "• Los sliders filtran sobre este snapshot cacheado (no se rearma el DF)."
+        ("• `profit_hits` se usa si hay datos (márgenes o columna cargada). De lo contrario, "
+         "la regla de hits queda desactivada (=0) para no bloquear todo hasta que lleguen márgenes reales. "
+         "• `coverage_count` cuenta bloques: {algún margen}, netdebt/EBITDA, accruals/TA, asset growth, share issuance. "
+         "• Los sliders filtran sobre el snapshot cacheado; no se rearma el DataFrame.")
     )
+
 
 
 # ====== TAB 3: VFQ ======
