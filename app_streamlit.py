@@ -187,6 +187,26 @@ def _cached_load_benchmark(bench, start, end):
     return load_benchmark(bench, start, end)
 
 # ------------------ HELPERS FORMATO ------------------
+
+# ---- Guardrails helpers (QVM) ----
+COVERAGE_COLS = ["profit_hits","netdebt_ebitda","accruals_ta","asset_growth","share_issuance"]
+
+def _build_guardrails_base_from_snapshot(snapshot: pd.DataFrame, uni: pd.DataFrame) -> pd.DataFrame:
+    """Toma el snapshot VFQ y le injerta sector/mcap + coverage_count; sin filtros."""
+    df = (
+        snapshot.drop(columns=["sector", "market_cap"], errors="ignore")
+        .merge(uni[["symbol","sector","market_cap"]], on="symbol", how="left")
+    )
+    # coverage_count = cuántas métricas clave existen (no NaN)
+    df["coverage_count"] = (
+        df[COVERAGE_COLS]
+        .apply(pd.to_numeric, errors="coerce")
+        .notna()
+        .sum(axis=1)
+        .astype(int)
+    )
+    return df
+
 def _fmt_mcap(x):
     try:
         x = float(x)
@@ -392,6 +412,7 @@ with tab1:
     }
 
 # ====== TAB 2: GUARDRAILS ======
+# ====== TAB 2: GUARDRAILS ======
 with tab2:
     st.subheader("Guardrails")
 
@@ -400,36 +421,54 @@ with tab2:
         st.info("Primero genera el universo en la pestaña Universo.")
         st.stop()
 
-    syms = uni["symbol"].dropna().astype(str).unique().tolist()
-    if not syms:
-        st.info("No hay símbolos en el universo.")
-        st.stop()
+    # 1) Construimos / recuperamos la BASE (snapshot + coverage) una sola vez por universo
+    uni_sig = st.session_state.get("uni_sig", "")
+    need_rebuild = (
+        ("qvm_guard_uni_sig" not in st.session_state) or
+        ("qvm_guardrails_base" not in st.session_state) or
+        (st.session_state["qvm_guard_uni_sig"] != uni_sig) or
+        run_btn  # si apretaste Ejecutar, refrescamos
+    )
+    if need_rebuild:
+        snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)  # <— usa tu caché ya definido
+        base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni)
+        st.session_state["qvm_guardrails_base"] = base
+        st.session_state["qvm_guard_uni_sig"] = uni_sig
 
-    # construimos frame con factores/guardrails para TODO el universo actual
-    df_all = build_factor_frame(syms)
+    base = st.session_state["qvm_guardrails_base"].copy()
 
-    # injertar sector / market_cap desde universo actual
-    base_cols = ["symbol", "sector", "market_cap"]
-    df_all = (
-        df_all.drop(columns=["sector", "market_cap"], errors="ignore")
-        .merge(uni[[c for c in base_cols if c in uni.columns]], on="symbol", how="left")
+    # 2) Aplicamos SOLO filtros según sliders (sin recalcular factores)
+    # sliders ya definidos en sidebar: min_cov_guard, profit_hits, max_issuance, max_assets, max_accr, max_ndeb
+    # (aseguramos tipos y NaNs)
+    def _num(s, absval=False):
+        s = pd.to_numeric(base[s], errors="coerce")
+        return s.abs() if absval else s
+
+    pass_profit   = (_num("profit_hits") >= int(profit_hits))
+    pass_issuance = (_num("share_issuance", absval=True) <= float(max_issuance))
+    pass_assets   = (_num("asset_growth", absval=True)   <= float(max_assets))
+    pass_accruals = (_num("accruals_ta", absval=True)    <= float(max_accr))
+    pass_ndebt    = (_num("netdebt_ebitda")              <= float(max_ndeb))
+    pass_cover    = (pd.to_numeric(base["coverage_count"], errors="coerce") >= int(min_cov_guard))
+
+    pass_all = pass_profit & pass_issuance & pass_assets & pass_accruals & pass_ndebt & pass_cover
+
+    df_all = base.assign(
+        pass_profit=pass_profit.fillna(False),
+        pass_issuance=pass_issuance.fillna(False),
+        pass_assets=pass_assets.fillna(False),
+        pass_accruals=pass_accruals.fillna(False),
+        pass_ndebt=pass_ndebt.fillna(False),
+        pass_coverage=pass_cover.fillna(False),
+        pass_all=pass_all.fillna(False),
     )
 
-    # máscara 'estricta': pass_all True
-    strict_mask = df_all.get("pass_all", False) == True
-
-    kept_raw = (
-        df_all.loc[strict_mask, ["symbol"]]
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
-
-    # guardamos para siguientes tabs
+    kept_raw = df_all.loc[df_all["pass_all"], ["symbol"]].drop_duplicates().reset_index(drop=True)
     st.session_state["kept"] = kept_raw
     st.session_state["guard_diag"] = df_all.copy()
 
     total = len(df_all)
-    pasan = int(strict_mask.sum())
+    pasan = int(df_all["pass_all"].sum())
     rechaz = total - pasan
 
     c1g, c2g, c3g = st.columns(3)
@@ -438,10 +477,9 @@ with tab2:
     c3g.metric("Rechazados totales", f"{rechaz}")
 
     cols_show = [
-        "symbol", "sector", "pass_all", "profit_hits", "coverage_count",
-        "asset_growth", "accruals_ta", "netdebt_ebitda",
-        "pass_profit", "pass_issuance", "pass_assets",
-        "pass_accruals", "pass_ndebt", "pass_coverage",
+        "symbol","sector","pass_all","profit_hits","coverage_count",
+        "asset_growth","accruals_ta","netdebt_ebitda",
+        "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage",
     ]
     cols_show = [c for c in cols_show if c in df_all.columns]
 
@@ -452,10 +490,7 @@ with tab2:
             hide_index=True,
         )
 
-    st.caption(
-        "pass_all = pasó TODAS las barreras simultáneamente. "
-        "coverage_count = cuánta info fundamental tenemos disponible."
-    )
+    st.caption("pass_all = pasó TODAS las barreras. coverage_count = cuánta info fundamental tenemos disponible.")
 
 # ====== TAB 3: VFQ ======
 with tab3:
