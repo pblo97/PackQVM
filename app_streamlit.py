@@ -16,7 +16,7 @@ import pandas as pd
 import streamlit as st
 
 # ============== IMPORTS DE TU PIPELINE ==============
-from pipeline_factors import build_factor_frame
+from pipeline_factors import _build_guardrails_base_from_snapshot, apply_guardrails_logic, build_factor_frame
 from fundamentals import (
     download_fundamentals,
     build_vfq_scores_dynamic,          # (importado si luego lo usas)
@@ -392,70 +392,97 @@ with tab1:
     }
 
 # ====== TAB 2: GUARDRAILS ======
+# ====== TAB 2: GUARDRAILS ======
 with tab2:
     st.subheader("Guardrails")
 
+    # 0) Universo estable
     uni = st.session_state.get("uni", pd.DataFrame())
     if uni is None or uni.empty or "symbol" not in uni.columns:
         st.info("Primero genera el universo en la pestaña Universo.")
         st.stop()
 
-    syms = uni["symbol"].dropna().astype(str).unique().tolist()
-    if not syms:
-        st.info("No hay símbolos en el universo.")
-        st.stop()
+    # 1) ¿Debemos (re)construir la BASE de guardrails?
+    #    Solo si cambió el universo (firma) o si el usuario lo pide explícitamente.
+    recalc_base = st.button("♻️ Recalcular base (solo si cambió universo)", use_container_width=False)
+    uni_sig = st.session_state.get("uni_sig", "")
 
-    # construimos frame con factores/guardrails para TODO el universo actual
-    df_all = build_factor_frame(syms)
+    need_rebuild = (
+        recalc_base
+        or ("qvm_guard_uni_sig" not in st.session_state)
+        or ("qvm_guardrails_base" not in st.session_state)
+        or (st.session_state["qvm_guard_uni_sig"] != uni_sig)
+    )
+    if need_rebuild:
+        # snapshot VFQ cacheado por firma de universo
+        snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)
+        # construir base, SIN umbrales, con profit_hits y coverage_count
+        base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni)
+        st.session_state["qvm_guardrails_base"] = base
+        st.session_state["qvm_guard_uni_sig"]   = uni_sig
 
-    # injertar sector / market_cap desde universo actual
-    base_cols = ["symbol", "sector", "market_cap"]
-    df_all = (
-        df_all.drop(columns=["sector", "market_cap"], errors="ignore")
-        .merge(uni[[c for c in base_cols if c in uni.columns]], on="symbol", how="left")
+    # 2) Tomamos SIEMPRE la base fija ya construida y solo aplicamos UMBRALES (no recalculamos nada)
+    base = st.session_state["qvm_guardrails_base"].copy()
+
+    # Sliders (traer de session_state; moverlos NO dispara rebuild de la base)
+    min_cov_guard = int(st.session_state.get("min_cov_guard", 2))
+    profit_hits   = int(st.session_state.get("profit_hits", 2))       # ← hits contables (EBIT/CFO/FCF)
+    max_issuance  = float(st.session_state.get("max_issuance", 0.03))
+    max_assets    = float(st.session_state.get("max_assets", 0.20))
+    max_accr      = float(st.session_state.get("max_accr", 0.10))
+    max_ndeb      = float(st.session_state.get("max_ndeb", 3.0))
+
+    # Aplica SOLO lógica de umbrales sobre la base fija
+    df_all = apply_guardrails_logic(
+        base,
+        PROFIT_MIN_HITS    = profit_hits,     # ← filtra por cantidad de hits contables
+        MAX_ISSUANCE       = max_issuance,
+        MAX_ASSET_GROWTH   = max_assets,
+        MAX_ACCRUALS_ABS   = max_accr,
+        MAX_NETDEBT_EBITDA = max_ndeb,
+        MIN_COVERAGE       = min_cov_guard,
     )
 
-    # máscara 'estricta': pass_all True
-    strict_mask = df_all.get("pass_all", False) == True
-
+    # 3) Estado compartido para otras pestañas
     kept_raw = (
-        df_all.loc[strict_mask, ["symbol"]]
-        .drop_duplicates()
-        .reset_index(drop=True)
+        df_all.loc[df_all["pass_all"], ["symbol"]]
+              .drop_duplicates()
+              .reset_index(drop=True)
     )
-
-    # guardamos para siguientes tabs
-    st.session_state["kept"] = kept_raw
+    st.session_state["kept"]       = kept_raw
     st.session_state["guard_diag"] = df_all.copy()
 
-    total = len(df_all)
-    pasan = int(strict_mask.sum())
+    # 4) KPIs + tabla
+    total  = len(df_all)
+    pasan  = int(df_all["pass_all"].sum())
     rechaz = total - pasan
 
     c1g, c2g, c3g = st.columns(3)
     c1g.metric("Pasan guardrails estrictos", f"{pasan}")
-    c2g.metric("Candidatos saludables (relajado)", f"{pasan}")  # placeholder
+    c2g.metric("Candidatos saludables (relajado)", f"{pasan}")  # placeholder si luego haces un modo relax
     c3g.metric("Rechazados totales", f"{rechaz}")
 
     cols_show = [
-        "symbol", "sector", "pass_all", "profit_hits", "coverage_count",
-        "asset_growth", "accruals_ta", "netdebt_ebitda",
-        "pass_profit", "pass_issuance", "pass_assets",
-        "pass_accruals", "pass_ndebt", "pass_coverage",
+        "symbol","sector","pass_all",
+        "profit_hits","coverage_count",
+        "asset_growth","accruals_ta","netdebt_ebitda","share_issuance",
+        "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage",
     ]
     cols_show = [c for c in cols_show if c in df_all.columns]
 
     with st.expander(f"Detalle guardrails (estricto): {pasan} / {total}", expanded=True):
         st.dataframe(
-            df_all[cols_show].sort_values("symbol"),
+            df_all[cols_show].sort_values(["pass_all","symbol"], ascending=[False, True]),
             use_container_width=True,
             hide_index=True,
         )
 
     st.caption(
-        "pass_all = pasó TODAS las barreras simultáneamente. "
-        "coverage_count = cuánta info fundamental tenemos disponible."
+        "• `profit_hits` cuenta cuántas métricas de rentabilidad > 0 entre EBIT/CFO/FCF. "
+        "• `coverage_count` **no** incluye `profit_hits`: suma disponibilidad por BLOQUES — {márgenes}, netdebt/EBITDA, accruals/TA, asset growth, share issuance. "
+        "Mover sliders re-filtra sobre la base fija; no se recalculan factores."
     )
+
 
 # ====== TAB 3: VFQ ======
 with tab3:
