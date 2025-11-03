@@ -187,6 +187,92 @@ def _cached_load_benchmark(bench, start, end):
     return load_benchmark(bench, start, end)
 
 # ------------------ HELPERS FORMATO ------------------
+def _build_guardrails_base_from_snapshot(snapshot_vfq: pd.DataFrame, uni_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construye el frame base para Guardrails SIN recalcular factores cada vez.
+    - Calcula profit_hits a partir de ebit/cfo/fcf (no desde coverage).
+    - Calcula coverage_count SIN incluir profit_hits.
+    - No aplica umbrales; los umbrales se aplican en la UI (Tab 2).
+    """
+    if snapshot_vfq is None or snapshot_vfq.empty:
+        return pd.DataFrame(columns=[
+            "symbol","sector","market_cap",
+            "ebit_margin","cfo_margin","fcf_margin",
+            "netdebt_ebitda","accruals_ta","asset_growth","share_issuance",
+            "profit_hits","coverage_count"
+        ])
+
+    df = snapshot_vfq.copy()
+
+    # ------- columnas esperadas y alias de respaldo -------
+    # Intenta mapear nombres alternativos si tu pipeline usa otros
+    alias = {
+        "ebit_margin": ["ebit_margin","ebitMargin","EBIT_margin"],
+        "cfo_margin":  ["cfo_margin","cfoMargin","CFO_margin","oper_cf_margin"],
+        "fcf_margin":  ["fcf_margin","fcfMargin","FCF_margin"],
+        "netdebt_ebitda": ["netdebt_ebitda","netDebtToEbitda","netDebt_EBITDA","NetDebtEBITDA"],
+        "accruals_ta": ["accruals_ta","accrualsTA","accruals_total_assets"],
+        "asset_growth": ["asset_growth","assetGrowth","assets_growth_yoy"],
+        "share_issuance": ["share_issuance","net_issuance","shares_net_issuance"],
+    }
+
+    def _ensure_col(name, candidates):
+        for c in candidates:
+            if c in df.columns:
+                df[name] = pd.to_numeric(df[c], errors="coerce")
+                return
+        df[name] = np.nan
+
+    for k, cand in alias.items():
+        _ensure_col(k, cand)
+
+    # sector / market cap desde universo actual
+    base_cols = ["symbol", "sector", "market_cap"]
+    merge_cols = [c for c in base_cols if c in uni_df.columns]
+    df = (
+        df.drop(columns=["sector","market_cap"], errors="ignore")
+          .merge(uni_df[merge_cols], on="symbol", how="left")
+    )
+
+    # ------- PROFIT HITS (independiente de coverage) -------
+    # criterio simple: margen > 0 → 1; si todas NaN → NaN
+    ebit_hit = (pd.to_numeric(df["ebit_margin"], errors="coerce") > 0)
+    cfo_hit  = (pd.to_numeric(df["cfo_margin"],  errors="coerce") > 0)
+    fcf_hit  = (pd.to_numeric(df["fcf_margin"],  errors="coerce") > 0)
+
+    profit_hits = (
+        pd.concat([ebit_hit, cfo_hit, fcf_hit], axis=1)
+          .sum(axis=1, min_count=1)   # si las 3 son NaN → NaN
+          .astype("Float64")
+    )
+    # lo dejamos como entero nullable
+    df["profit_hits"] = profit_hits.astype("Int64")
+
+    # ------- COVERAGE COUNT (sin incluir profit_hits) -------
+    # 1 punto si hay AL MENOS una de {ebit,cfo,fcf} disponible (no NaN)
+    has_profit_any = pd.concat([
+        pd.to_numeric(df["ebit_margin"], errors="coerce").notna(),
+        pd.to_numeric(df["cfo_margin"],  errors="coerce").notna(),
+        pd.to_numeric(df["fcf_margin"],  errors="coerce").notna(),
+    ], axis=1).any(axis=1)
+
+    coverage_cols = [
+        has_profit_any,                                  # bloque rentabilidad disponible
+        pd.to_numeric(df["netdebt_ebitda"], errors="coerce").notna(),
+        pd.to_numeric(df["accruals_ta"],   errors="coerce").notna(),
+        pd.to_numeric(df["asset_growth"],  errors="coerce").notna(),
+        pd.to_numeric(df["share_issuance"],errors="coerce").notna(),
+    ]
+    df["coverage_count"] = pd.concat(coverage_cols, axis=1).sum(axis=1).astype(int)
+
+    # Orden “amigable”
+    order = [
+        "symbol","sector","market_cap",
+        "ebit_margin","cfo_margin","fcf_margin",
+        "profit_hits","coverage_count",
+        "netdebt_ebitda","accruals_ta","asset_growth","share_issuance",
+    ]
+    return df[[c for c in order if c in df.columns]].copy()
 
 # ---- Guardrails helpers (QVM) ----
 COVERAGE_COLS = ["profit_hits","netdebt_ebitda","accruals_ta","asset_growth","share_issuance"]
@@ -488,20 +574,12 @@ with tab1:
 with tab2:
     st.subheader("Guardrails")
 
-    # ------------------ 0) Universo estable ------------------
     uni = st.session_state.get("uni", pd.DataFrame())
     if uni is None or uni.empty or "symbol" not in uni.columns:
         st.info("Primero genera el universo en la pestaña Universo.")
         st.stop()
 
-    syms = (
-        uni["symbol"].dropna().astype(str).unique().tolist()
-    )
-    if not syms:
-        st.info("No hay símbolos en el universo.")
-        st.stop()
-
-    # ------------------ 1) BASE (snapshot + coverage) cacheada por universo ------------------
+    # 1) snapshot VFQ y base para guardrails, cacheada por firma de universo
     uni_sig = st.session_state.get("uni_sig", "")
     need_rebuild = (
         ("qvm_guard_uni_sig" not in st.session_state) or
@@ -509,71 +587,62 @@ with tab2:
         (st.session_state["qvm_guard_uni_sig"] != uni_sig) or
         run_btn
     )
-
     if need_rebuild:
-        # snapshot VFQ completo del universo actual (cacheado)
-        snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)
-        # función helper que ya tienes: produce columnas:
-        # symbol, sector, market_cap, profit_hits, share_issuance, asset_growth,
-        # accruals_ta, netdebt_ebitda, coverage_count  (y cualesquiera otras diagnósticas)
+        snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)      # <- tu cache existente
         base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni)
         st.session_state["qvm_guardrails_base"] = base
-        st.session_state["qvm_guard_uni_sig"]   = uni_sig
+        st.session_state["qvm_guard_uni_sig"] = uni_sig
 
     base = st.session_state["qvm_guardrails_base"].copy()
 
-    # ------------------ 2) Solo filtros según sliders (SIN recalcular factores) ------------------
-    def _num(col, *, absval=False):
-        s = pd.to_numeric(base.get(col), errors="coerce")
+    # 2) Aplicar UMBRALES de la UI (sin recalcular factores)
+    # sliders ya definidos en el sidebar:
+    #   min_cov_guard, profit_hits, max_issuance, max_assets, max_accr, max_ndeb
+
+    def _num(series_name, absval=False):
+        s = pd.to_numeric(base[series_name], errors="coerce")
         return s.abs() if absval else s
 
-    pass_profit   = (_num("profit_hits")                    >= int(profit_hits))
-    pass_issuance = (_num("share_issuance", absval=True)    <= float(max_issuance))
-    pass_assets   = (_num("asset_growth",   absval=True)    <= float(max_assets))
-    pass_accruals = (_num("accruals_ta",    absval=True)    <= float(max_accr))
-    pass_ndebt    = (_num("netdebt_ebitda")                 <= float(max_ndeb))
-    pass_cover    = (pd.to_numeric(base.get("coverage_count"), errors="coerce")
-                     >= int(min_cov_guard))
+    # profit_hits: trata NaN como 0 para el filtro
+    profit_hits_series = pd.to_numeric(base["profit_hits"], errors="coerce").fillna(0)
+    pass_profit   = (profit_hits_series >= int(profit_hits))
 
-    pass_all = (
-        pass_profit & pass_issuance & pass_assets &
-        pass_accruals & pass_ndebt & pass_cover
-    )
+    pass_issuance = (_num("share_issuance", absval=True) <= float(max_issuance))
+    pass_assets   = (_num("asset_growth",  absval=True)  <= float(max_assets))
+    pass_accruals = (_num("accruals_ta",   absval=True)  <= float(max_accr))
+    pass_ndebt    = (_num("netdebt_ebitda")              <= float(max_ndeb))
+    pass_cover    = (pd.to_numeric(base["coverage_count"], errors="coerce") >= int(min_cov_guard))
 
-    # Frame final DIAGNÓSTICO (lo que se muestra)
+    pass_all = pass_profit & pass_issuance & pass_assets & pass_accruals & pass_ndebt & pass_cover
+
     df_all = base.assign(
-        pass_profit   = pass_profit.fillna(False),
-        pass_issuance = pass_issuance.fillna(False),
-        pass_assets   = pass_assets.fillna(False),
-        pass_accruals = pass_accruals.fillna(False),
-        pass_ndebt    = pass_ndebt.fillna(False),
-        pass_coverage = pass_cover.fillna(False),
-        pass_all      = pass_all.fillna(False),
+        pass_profit=pass_profit.fillna(False),
+        pass_issuance=pass_issuance.fillna(False),
+        pass_assets=pass_assets.fillna(False),
+        pass_accruals=pass_accruals.fillna(False),
+        pass_ndebt=pass_ndebt.fillna(False),
+        pass_coverage=pass_cover.fillna(False),
+        pass_all=pass_all.fillna(False),
     )
 
-    # ------------------ 3) Estado compartido + KPIs ------------------
-    kept_raw = (
-        df_all.loc[df_all["pass_all"], ["symbol"]]
-              .drop_duplicates()
-              .reset_index(drop=True)
-    )
-    st.session_state["kept"]       = kept_raw
+    kept_raw = df_all.loc[df_all["pass_all"], ["symbol"]].drop_duplicates().reset_index(drop=True)
+    st.session_state["kept"] = kept_raw
     st.session_state["guard_diag"] = df_all.copy()
 
-    total  = len(df_all)
-    pasan  = int(df_all["pass_all"].sum())
+    total = len(df_all)
+    pasan = int(df_all["pass_all"].sum())
     rechaz = total - pasan
 
     c1g, c2g, c3g = st.columns(3)
     c1g.metric("Pasan guardrails estrictos", f"{pasan}")
-    c2g.metric("Candidatos saludables (relajado)", f"{pasan}")  # placeholder
+    c2g.metric("Candidatos saludables (relajado)", f"{pasan}")  # (si luego agregas modo relajado, cámbialo)
     c3g.metric("Rechazados totales", f"{rechaz}")
 
     cols_show = [
-        "symbol","sector","pass_all","profit_hits","coverage_count",
-        "asset_growth","accruals_ta","netdebt_ebitda",
-        "pass_profit","pass_issuance","pass_assets",
-        "pass_accruals","pass_ndebt","pass_coverage",
+        "symbol","sector","pass_all",
+        "profit_hits","coverage_count",
+        "asset_growth","accruals_ta","netdebt_ebitda","share_issuance",
+        "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage",
     ]
     cols_show = [c for c in cols_show if c in df_all.columns]
 
@@ -585,8 +654,8 @@ with tab2:
         )
 
     st.caption(
-        "pass_all = pasó TODAS las barreras simultáneamente. "
-        "coverage_count = cuánta info fundamental tenemos disponible."
+        "• `profit_hits` se calcula solo desde EBIT/CFO/FCF (>0). "
+        "• `coverage_count` suma disponibilidad de bloques (rentabilidad disponible cuenta como 1) + netdebt/EBITDA + accruals/TA + asset growth + share issuance."
     )
 
 

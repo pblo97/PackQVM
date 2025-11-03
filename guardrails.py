@@ -38,3 +38,4 @@ def apply_guardrails(base: pd.DataFrame, cfg: GuardrailsCfg) -> pd.DataFrame:
         pass_assets=pass_assets, pass_accruals=pass_accruals,
         pass_leverage=pass_leverage, pass_all=strict
     )
+
