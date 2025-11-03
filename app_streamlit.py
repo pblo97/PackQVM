@@ -393,48 +393,38 @@ with tab1:
 
 # ====== TAB 2: GUARDRAILS ======
 # ====== TAB 2: GUARDRAILS ======
+# ====== TAB 2: GUARDRAILS ======
 with tab2:
     st.subheader("Guardrails")
 
-    # 0) Universo estable
+    # Universo estable del Tab1
     uni = st.session_state.get("uni", pd.DataFrame())
     if uni is None or uni.empty or "symbol" not in uni.columns:
         st.info("Primero genera el universo en la pestaña Universo.")
         st.stop()
 
-    # 1) ¿Debemos (re)construir la BASE de guardrails?
-    #    Solo si cambió el universo (firma) o si el usuario lo pide explícitamente.
-    recalc_base = st.button("♻️ Recalcular base (solo si cambió universo)", use_container_width=False)
+    # ---------- 1) Snapshot VFQ cacheado por firma del universo ----------
     uni_sig = st.session_state.get("uni_sig", "")
+    snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)  # <- NO recalcula si no cambia la firma
 
-    need_rebuild = (
-        recalc_base
-        or ("qvm_guard_uni_sig" not in st.session_state)
-        or ("qvm_guardrails_base" not in st.session_state)
-        or (st.session_state["qvm_guard_uni_sig"] != uni_sig)
-    )
-    if need_rebuild:
-        # snapshot VFQ cacheado por firma de universo
-        snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)
-        # construir base, SIN umbrales, con profit_hits y coverage_count
-        base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni)
-        st.session_state["qvm_guardrails_base"] = base
-        st.session_state["qvm_guard_uni_sig"]   = uni_sig
+    # ---------- 2) Base para guardrails (deriva hits desde márgenes y coverage por bloques) ----------
+    #   *no descarga ni normaliza nada nuevo; solo trabaja con snapshot + uni*
+    base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni).copy()
 
-    # 2) Tomamos SIEMPRE la base fija ya construida y solo aplicamos UMBRALES (no recalculamos nada)
-    base = st.session_state["qvm_guardrails_base"].copy()
+    # Añadimos flags de hit individuales (útiles para conteo/diagnóstico)
+    base["ebit_hit"] = (pd.to_numeric(base.get("ebit_margin"), errors="coerce") > 0)
+    base["cfo_hit"]  = (pd.to_numeric(base.get("cfo_margin"),  errors="coerce") > 0)
+    base["fcf_hit"]  = (pd.to_numeric(base.get("fcf_margin"),  errors="coerce") > 0)
 
-    # Sliders (traer de session_state; moverlos NO dispara rebuild de la base)
+    # ---------- 3) Umbrales desde la barra lateral ----------
     min_cov_guard = int(st.session_state.get("min_cov_guard", 2))
-    profit_hits   = int(st.session_state.get("profit_hits", 2))       # ← hits contables (EBIT/CFO/FCF)
+    profit_hits   = int(st.session_state.get("profit_hits",   2))
     max_issuance  = float(st.session_state.get("max_issuance", 0.03))
-    max_assets    = float(st.session_state.get("max_assets", 0.20))
-    max_accr      = float(st.session_state.get("max_accr", 0.10))
-    max_ndeb      = float(st.session_state.get("max_ndeb", 3.0))
+    max_assets    = float(st.session_state.get("max_assets",   0.20))
+    max_accr      = float(st.session_state.get("max_accr",     0.10))
+    max_ndeb      = float(st.session_state.get("max_ndeb",     3.0))
 
-    # Aplica SOLO lógica de umbrales sobre la base fija
-    snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)
-    base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni)
+    # ---------- 4) Aplicar guardrails sobre la BASE (sin rearmar DF) ----------
     df_all = apply_guardrails_logic(
         base,
         PROFIT_MIN_HITS    = profit_hits,
@@ -443,8 +433,25 @@ with tab2:
         MAX_ACCRUALS_ABS   = max_accr,
         MAX_NETDEBT_EBITDA = max_ndeb,
         MIN_COVERAGE       = min_cov_guard,
-    )
-    # 3) Estado compartido para otras pestañas
+    ).copy()
+
+    # ---------- 5) KPIs de hits contables y de reglas ----------
+    total = len(df_all)
+    pasan = int(df_all["pass_all"].sum())
+    rechaz = total - pasan
+
+    # Conteo por cada hit
+    ebit_ok = int(df_all["ebit_hit"].fillna(False).sum())
+    cfo_ok  = int(df_all["cfo_hit"].fillna(False).sum())
+    fcf_ok  = int(df_all["fcf_hit"].fillna(False).sum())
+
+    c1g, c2g, c3g, c4g = st.columns(4)
+    c1g.metric("Pasan guardrails (estricto)", f"{pasan}")
+    c2g.metric("Rechazados", f"{rechaz}")
+    c3g.metric("Hits contables (EBIT/CFO/FCF>0)", f"{ebit_ok}/{cfo_ok}/{fcf_ok}")
+    c4g.metric("Cobertura ≥ mín.", f"{int((df_all['coverage_count']>=min_cov_guard).sum())} / {total}")
+
+    # ---------- 6) Persistir selección para otras pestañas ----------
     kept_raw = (
         df_all.loc[df_all["pass_all"], ["symbol"]]
               .drop_duplicates()
@@ -453,19 +460,10 @@ with tab2:
     st.session_state["kept"]       = kept_raw
     st.session_state["guard_diag"] = df_all.copy()
 
-    # 4) KPIs + tabla
-    total  = len(df_all)
-    pasan  = int(df_all["pass_all"].sum())
-    rechaz = total - pasan
-
-    c1g, c2g, c3g = st.columns(3)
-    c1g.metric("Pasan guardrails estrictos", f"{pasan}")
-    c2g.metric("Candidatos saludables (relajado)", f"{pasan}")  # placeholder si luego haces un modo relax
-    c3g.metric("Rechazados totales", f"{rechaz}")
-
+    # ---------- 7) Vista de detalle ----------
     cols_show = [
         "symbol","sector","pass_all",
-        "profit_hits","coverage_count",
+        "profit_hits","ebit_hit","cfo_hit","fcf_hit","coverage_count",
         "asset_growth","accruals_ta","netdebt_ebitda","share_issuance",
         "pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage",
     ]
@@ -474,14 +472,13 @@ with tab2:
     with st.expander(f"Detalle guardrails (estricto): {pasan} / {total}", expanded=True):
         st.dataframe(
             df_all[cols_show].sort_values(["pass_all","symbol"], ascending=[False, True]),
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True
         )
 
     st.caption(
-        "• `profit_hits` cuenta cuántas métricas de rentabilidad > 0 entre EBIT/CFO/FCF. "
-        "• `coverage_count` **no** incluye `profit_hits`: suma disponibilidad por BLOQUES — {márgenes}, netdebt/EBITDA, accruals/TA, asset growth, share issuance. "
-        "Mover sliders re-filtra sobre la base fija; no se recalculan factores."
+        "• `profit_hits` = nº de márgenes > 0 entre EBIT/CFO/FCF (derivado del snapshot). "
+        "• `coverage_count` cuenta BLOQUES disponibles: {algún margen}, netdebt/EBITDA, accruals/TA, asset growth, share issuance. "
+        "• Los sliders filtran sobre este snapshot cacheado (no se rearma el DF)."
     )
 
 
