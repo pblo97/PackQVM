@@ -328,8 +328,18 @@ def calculate_portfolio_metrics(
     if costs is None:
         costs = TradingCosts()
     
-    # Combine equity curves (equal weight)
-    df = pd.DataFrame(equity_curves)
+    # Remove duplicate indices from each series
+    clean_curves = {}
+    for symbol, curve in equity_curves.items():
+        # Keep last value for duplicate indices
+        curve_clean = curve[~curve.index.duplicated(keep='last')]
+        clean_curves[symbol] = curve_clean
+    
+    # Combine equity curves (equal weight) - align to common dates
+    df = pd.DataFrame(clean_curves)
+    
+    # Forward fill to handle missing dates, then take mean
+    df = df.ffill().bfill()
     portfolio_equity = df.mean(axis=1)
     
     # Returns
