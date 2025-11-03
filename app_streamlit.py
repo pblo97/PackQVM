@@ -433,16 +433,17 @@ with tab2:
     max_ndeb      = float(st.session_state.get("max_ndeb", 3.0))
 
     # Aplica SOLO lógica de umbrales sobre la base fija
+    snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)
+    base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni)
     df_all = apply_guardrails_logic(
         base,
-        PROFIT_MIN_HITS    = profit_hits,     # ← filtra por cantidad de hits contables
+        PROFIT_MIN_HITS    = profit_hits,
         MAX_ISSUANCE       = max_issuance,
         MAX_ASSET_GROWTH   = max_assets,
         MAX_ACCRUALS_ABS   = max_accr,
         MAX_NETDEBT_EBITDA = max_ndeb,
         MIN_COVERAGE       = min_cov_guard,
     )
-
     # 3) Estado compartido para otras pestañas
     kept_raw = (
         df_all.loc[df_all["pass_all"], ["symbol"]]

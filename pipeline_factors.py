@@ -238,14 +238,15 @@ def build_factor_frame(tickers: Iterable[str]) -> pd.DataFrame:
     out["symbol"] = out["symbol"].astype(str)
     return out
 # ---------- BUILDER BASE: snapshot → frame para Guardrails ----------
+# --- BUILDER: base para Guardrails desde el snapshot VFQ (sin recalcular factores) ---
 def _build_guardrails_base_from_snapshot(snapshot_vfq: pd.DataFrame, uni_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Toma el snapshot VFQ (ya calculado) y construye el frame base para Guardrails:
-      - reinyecta sector/market_cap desde el universo actual
-      - calcula profit_hits a partir de márgenes (EBIT/CFO/FCF > 0)
-      - calcula coverage_count por BLOQUES:
-          [márgenes disponibles] + netdebt_ebitda + accruals_ta + asset_growth + share_issuance
-    No aplica umbrales; eso lo hace apply_guardrails_logic / la UI.
+    Toma el snapshot VFQ existente y construye un frame "base" para Guardrails:
+      - Reinyecta sector/market_cap desde el universo actual (no se recalculan)
+      - Deriva profit_hits = # de {EBIT, CFO, FCF} con margen > 0
+      - Deriva coverage_count por BLOQUES de disponibilidad:
+          [algún margen disponible] + netdebt_ebitda + accruals_ta + asset_growth + share_issuance
+    No descarga ni normaliza nada nuevo.
     """
     if snapshot_vfq is None or snapshot_vfq.empty:
         return pd.DataFrame(columns=[
@@ -257,7 +258,7 @@ def _build_guardrails_base_from_snapshot(snapshot_vfq: pd.DataFrame, uni_df: pd.
 
     df = snapshot_vfq.copy()
 
-    # Alias por si las columnas llegan con otros nombres
+    # Mapeos de alias (por si en tu snapshot vienen con otros nombres)
     alias = {
         "ebit_margin":    ["ebit_margin","ebitMargin","EBIT_margin"],
         "cfo_margin":     ["cfo_margin","cfoMargin","CFO_margin","oper_cf_margin"],
@@ -267,7 +268,6 @@ def _build_guardrails_base_from_snapshot(snapshot_vfq: pd.DataFrame, uni_df: pd.
         "asset_growth":   ["asset_growth","assetGrowth","assets_growth_yoy"],
         "share_issuance": ["share_issuance","net_issuance","shares_net_issuance"],
     }
-
     def _ensure_col(name, candidates):
         for c in candidates:
             if c in df.columns:
@@ -278,40 +278,41 @@ def _build_guardrails_base_from_snapshot(snapshot_vfq: pd.DataFrame, uni_df: pd.
     for k, cand in alias.items():
         _ensure_col(k, cand)
 
-    # Reinyecta sector / market_cap desde el universo vivo
+    # Reinyectamos sector / market_cap del universo actual
     merge_cols = [c for c in ["symbol","sector","market_cap"] if c in uni_df.columns]
     df = (
         df.drop(columns=["sector","market_cap"], errors="ignore")
           .merge(uni_df[merge_cols], on="symbol", how="left")
     )
 
-    # profit_hits = # de márgenes > 0 (independiente de coverage)
-    ebit_hit = pd.to_numeric(df["ebit_margin"], errors="coerce") > 0
-    cfo_hit  = pd.to_numeric(df["cfo_margin"],  errors="coerce") > 0
-    fcf_hit  = pd.to_numeric(df["fcf_margin"],  errors="coerce") > 0
+    # ---- profit_hits = nº de márgenes > 0 (si los 3 son NaN → <NA>) ----
+    ebit_hit = (pd.to_numeric(df["ebit_margin"], errors="coerce") > 0)
+    cfo_hit  = (pd.to_numeric(df["cfo_margin"],  errors="coerce") > 0)
+    fcf_hit  = (pd.to_numeric(df["fcf_margin"],  errors="coerce") > 0)
 
-    profit_hits = (
+    hits = (
         pd.concat([ebit_hit, cfo_hit, fcf_hit], axis=1)
-          .sum(axis=1, min_count=1)    # si las 3 son NaN → NaN
+          .sum(axis=1, min_count=1)   # si los 3 son NaN → NaN
           .astype("Float64")
     )
-    df["profit_hits"] = profit_hits.astype("Int64")
+    df["profit_hits"] = hits.astype("Int64")     # entero anulable
 
-    # coverage_count por BLOQUES (márgenes disponibles = 1 bloque, no suma 3)
+    # ---- coverage_count por BLOQUES (NO cuenta profit_hits, sí la disponibilidad de márgenes) ----
     has_profit_any = pd.concat([
         pd.to_numeric(df["ebit_margin"], errors="coerce").notna(),
         pd.to_numeric(df["cfo_margin"],  errors="coerce").notna(),
         pd.to_numeric(df["fcf_margin"],  errors="coerce").notna(),
     ], axis=1).any(axis=1)
 
-    coverage_cols = [
+    blocks = pd.concat([
         has_profit_any,
         pd.to_numeric(df["netdebt_ebitda"], errors="coerce").notna(),
         pd.to_numeric(df["accruals_ta"],    errors="coerce").notna(),
         pd.to_numeric(df["asset_growth"],   errors="coerce").notna(),
         pd.to_numeric(df["share_issuance"], errors="coerce").notna(),
-    ]
-    df["coverage_count"] = pd.concat(coverage_cols, axis=1).sum(axis=1).astype(int)
+    ], axis=1)
+
+    df["coverage_count"] = blocks.sum(axis=1).astype(int)
 
     order = [
         "symbol","sector","market_cap",
