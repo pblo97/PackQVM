@@ -423,33 +423,40 @@ with tab1:
 
 # ====== TAB 2: GUARDRAILS ======
 # ====== TAB 2: GUARDRAILS ======
+# ====== TAB 2: GUARDRAILS ======
 with tab2:
     st.subheader("Guardrails")
 
-    # 0) Universo estable
+    # --- 0) Universo estable ---
     uni = st.session_state.get("uni", pd.DataFrame())
     if uni is None or uni.empty or "symbol" not in uni.columns:
         st.info("Primero genera el universo en la pestaña Universo.")
         st.stop()
 
-    # 1) BASE cacheada por firma del universo
+    # --- 1) BASE cacheada por firma del universo ---
     uni_sig = st.session_state.get("uni_sig", "")
     need_rebuild = (
-        ("qvm_guard_uni_sig" not in st.session_state) or
-        ("qvm_guardrails_base" not in st.session_state) or
-        (st.session_state["qvm_guard_uni_sig"] != uni_sig) or
-        run_btn
+        ("qvm_guard_uni_sig" not in st.session_state)
+        or ("qvm_guardrails_base" not in st.session_state)
+        or (st.session_state["qvm_guard_uni_sig"] != uni_sig)
+        or run_btn
     )
     if need_rebuild:
+        # Snapshot VFQ del universo actual (cacheado fuera)
         snapshot_vfq = _cached_vfq_snapshot(uni, uni_sig)
-        # OJO: usa la versión canónica (en pipeline_factors si ya la moviste allí)
+
+        # Builder canónico que ya tienes en pipeline_factors:
+        #   - injerta sector/market_cap
+        #   - calcula profit_hits desde márgenes (>0)
+        #   - calcula coverage_count por BLOQUES (rentabilidad disponible + 4 métricas)
         base = _build_guardrails_base_from_snapshot(snapshot_vfq, uni)
+
         st.session_state["qvm_guardrails_base"] = base
         st.session_state["qvm_guard_uni_sig"]   = uni_sig
 
     base = st.session_state["qvm_guardrails_base"].copy()
 
-    # 2) Aplicar lógica centralizada (con sliders como parámetros)
+    # --- 2) Parámetros desde la sidebar (ya los guardaste en session_state) ---
     min_cov_guard = int(st.session_state.get("min_cov_guard", 2))
     profit_hits   = int(st.session_state.get("profit_hits", 2))
     max_issuance  = float(st.session_state.get("max_issuance", 0.03))
@@ -457,6 +464,7 @@ with tab2:
     max_accr      = float(st.session_state.get("max_accr", 0.10))
     max_ndeb      = float(st.session_state.get("max_ndeb", 3.0))
 
+    # --- 3) Aplicar lógica centralizada (NO recalcula factores) ---
     df_all = apply_guardrails_logic(
         base,
         PROFIT_MIN_HITS    = profit_hits,
@@ -466,7 +474,8 @@ with tab2:
         MAX_NETDEBT_EBITDA = max_ndeb,
         MIN_COVERAGE       = min_cov_guard,
     )
-    # 3) Estado compartido + KPIs
+
+    # --- 4) Estado compartido & KPIs (nombres igual que antes para no romper Tab 3) ---
     kept_raw = (
         df_all.loc[df_all["pass_all"], ["symbol"]]
               .drop_duplicates()
@@ -500,9 +509,10 @@ with tab2:
         )
 
     st.caption(
-        "• `profit_hits` usa márgenes (EBIT/CFO/FCF > 0). "
+        "• `profit_hits` se calcula desde márgenes (EBIT/CFO/FCF > 0). "
         "• `coverage_count` cuenta disponibilidad por BLOQUES: {márgenes}, netdebt/EBITDA, accruals/TA, asset growth, share issuance."
     )
+
 
 # ====== TAB 3: VFQ ======
 with tab3:
