@@ -16,7 +16,12 @@ import pandas as pd
 import streamlit as st
 
 # ============== IMPORTS DE TU PIPELINE ==============
-from pipeline_factors import build_factor_frame
+from pipeline_factors import (
+    build_factor_frame,
+    _build_guardrails_base_from_snapshot,
+    apply_guardrails_logic,
+)
+
 from fundamentals import (
     download_fundamentals,
     build_vfq_scores_dynamic,          # (importado si luego lo usas)
@@ -41,11 +46,7 @@ from pipeline import (
     market_regime_on,                  # (importado si luego lo usas)
 )
 
-from pipeline_factors import (
-    build_factor_frame,
-    _build_guardrails_base_from_snapshot,  # si la moviste allí
-    apply_guardrails_logic,                # lógica centralizada
-)
+
 from backtests import backtest_many
 
 # Opcional (growth-aware). No se usan aún en la UI, pero los dejamos importables.

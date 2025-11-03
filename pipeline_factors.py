@@ -193,73 +193,155 @@ def compute_quality_value_flow(df_raw: pd.DataFrame) -> pd.DataFrame:
 # ===========================================================
 # 4. FUNCIÓN ÚNICA que usa TODO el resto de la app
 # ===========================================================
-def build_factor_frame(tickers: Iterable[str]) -> pd.DataFrame:
-    """
-    Entrada: lista de tickers.
-    Salida: dataframe maestro con TODAS las columnas que van a usar Tab2 y Tab3.
+__all__ = [
+    "build_factor_frame",
+    "_build_guardrails_base_from_snapshot",
+    "apply_guardrails_logic",
+]
 
-    Columnas clave que devolvemos SIEMPRE:
-      symbol, sector, market_cap,
-      profit_hits, coverage_count, asset_growth, accruals_ta,
-      netdebt_ebitda, pass_profit, pass_issuance, pass_assets,
-      pass_accruals, pass_ndebt, pass_coverage, pass_all,
-      quality_adj_neut, value_adj_neut, acc_pct, hits,
-      BreakoutScore, RVOL20, prob_up
+# ---------- 1) FACTORES (stub o tu implementación real) ----------
+def build_factor_frame(symbols: list[str]) -> pd.DataFrame:
     """
+    Devuelve un DataFrame con los factores VFQ por 'symbol'.
+    Debe incluir, al menos, las columnas usadas en guardrails:
+    - ebit_margin, cfo_margin, fcf_margin
+    - netdebt_ebitda, accruals_ta, asset_growth, share_issuance
+    - y 'symbol' como clave. Si ya tienes tu versión, deja la tuya.
+    """
+    # TODO: sustituir por tu pipeline real
+    return pd.DataFrame({"symbol": pd.Series(symbols, dtype=str)})
 
-    tickers = list(dict.fromkeys(tickers))  # unique
-    if not tickers:
+# ---------- 2) BUILDER BASE (injerta sector/mcap + profit_hits + coverage_count) ----------
+def _build_guardrails_base_from_snapshot(snapshot_vfq: pd.DataFrame, uni_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    - Reinyecta sector/market_cap desde 'uni_df'
+    - Calcula profit_hits desde márgenes (>0) independiente de coverage
+    - Calcula coverage_count por BLOQUES (rentabilidad disponible cuenta como 1) + 4 métricas
+    """
+    if snapshot_vfq is None or snapshot_vfq.empty:
         return pd.DataFrame(columns=[
             "symbol","sector","market_cap",
-            "profit_hits","coverage_count","asset_growth","accruals_ta",
-            "netdebt_ebitda","pass_profit","pass_issuance","pass_assets",
-            "pass_accruals","pass_ndebt","pass_coverage","pass_all",
-            "quality_adj_neut","value_adj_neut","acc_pct",
-            "hits","BreakoutScore","RVOL20","prob_up",
+            "ebit_margin","cfo_margin","fcf_margin",
+            "netdebt_ebitda","accruals_ta","asset_growth","share_issuance",
+            "profit_hits","coverage_count",
         ])
 
-    # 1. Data cruda
-    raw = fetch_raw_fundamentals(tickers)
+    df = snapshot_vfq.copy()
 
-    # 2. Guardrails
-    guarded = apply_guardrails_logic(raw)
-
-    # 3. VFQ scores
-    qvf = compute_quality_value_flow(raw)
-
-    # 4. Merge final
-    out = guarded.merge(qvf, on="symbol", how="left", suffixes=("",""))
-
-    # 5. Fill columnas que podrían faltar
-    needed_cols_defaults = {
-        "sector": "Unknown",
-        "market_cap": np.nan,
-
-        "profit_hits": np.nan,
-        "coverage_count": 0,
-        "asset_growth": np.nan,
-        "accruals_ta": np.nan,
-        "netdebt_ebitda": np.nan,
-
-        "pass_profit": False,
-        "pass_issuance": False,
-        "pass_assets": False,
-        "pass_accruals": False,
-        "pass_ndebt": False,
-        "pass_coverage": False,
-        "pass_all": False,
-
-        "quality_adj_neut": 0.0,
-        "value_adj_neut": 0.0,
-        "acc_pct": 0.0,
-        "hits": 0.0,
-        "BreakoutScore": 0.0,
-        "RVOL20": 0.0,
-        "prob_up": 0.0,
+    # Map de alias por si vienen con otros nombres
+    alias = {
+        "ebit_margin":    ["ebit_margin","ebitMargin","EBIT_margin"],
+        "cfo_margin":     ["cfo_margin","cfoMargin","CFO_margin","oper_cf_margin"],
+        "fcf_margin":     ["fcf_margin","fcfMargin","FCF_margin"],
+        "netdebt_ebitda": ["netdebt_ebitda","netDebtToEbitda","netDebt_EBITDA","NetDebtEBITDA"],
+        "accruals_ta":    ["accruals_ta","accrualsTA","accruals_total_assets"],
+        "asset_growth":   ["asset_growth","assetGrowth","assets_growth_yoy"],
+        "share_issuance": ["share_issuance","net_issuance","shares_net_issuance"],
     }
-    for col, default_val in needed_cols_defaults.items():
-        if col not in out.columns:
-            out[col] = default_val
 
-    out["symbol"] = out["symbol"].astype(str)
+    def _ensure_col(name, candidates):
+        for c in candidates:
+            if c in df.columns:
+                df[name] = pd.to_numeric(df[c], errors="coerce")
+                return
+        df[name] = np.nan
+
+    for k, cand in alias.items():
+        _ensure_col(k, cand)
+
+    # sector / market cap desde universo actual
+    merge_cols = [c for c in ["symbol","sector","market_cap"] if c in uni_df.columns]
+    df = (
+        df.drop(columns=["sector","market_cap"], errors="ignore")
+          .merge(uni_df[merge_cols], on="symbol", how="left")
+    )
+
+    # PROFIT HITS (márgenes > 0)
+    ebit_hit = pd.to_numeric(df["ebit_margin"], errors="coerce") > 0
+    cfo_hit  = pd.to_numeric(df["cfo_margin"],  errors="coerce") > 0
+    fcf_hit  = pd.to_numeric(df["fcf_margin"],  errors="coerce") > 0
+
+    profit_hits = (
+        pd.concat([ebit_hit, cfo_hit, fcf_hit], axis=1)
+          .sum(axis=1, min_count=1)
+          .astype("Float64")
+    )
+    df["profit_hits"] = profit_hits.astype("Int64")
+
+    # COVERAGE COUNT (por bloques; sin incluir los 'hits', solo disponibilidad)
+    has_profit_any = pd.concat([
+        pd.to_numeric(df["ebit_margin"], errors="coerce").notna(),
+        pd.to_numeric(df["cfo_margin"],  errors="coerce").notna(),
+        pd.to_numeric(df["fcf_margin"],  errors="coerce").notna(),
+    ], axis=1).any(axis=1)
+
+    coverage_cols = [
+        has_profit_any,
+        pd.to_numeric(df["netdebt_ebitda"], errors="coerce").notna(),
+        pd.to_numeric(df["accruals_ta"],    errors="coerce").notna(),
+        pd.to_numeric(df["asset_growth"],   errors="coerce").notna(),
+        pd.to_numeric(df["share_issuance"], errors="coerce").notna(),
+    ]
+    df["coverage_count"] = pd.concat(coverage_cols, axis=1).sum(axis=1).astype(int)
+
+    order = [
+        "symbol","sector","market_cap",
+        "ebit_margin","cfo_margin","fcf_margin",
+        "profit_hits","coverage_count",
+        "netdebt_ebitda","accruals_ta","asset_growth","share_issuance",
+    ]
+    return df[[c for c in order if c in df.columns]].copy()
+
+# ---------- 3) LÓGICA DE GUARDRAILS (sin recalcular factores) ----------
+def apply_guardrails_logic(
+    df: pd.DataFrame,
+    *,
+    PROFIT_MIN_HITS: int    = 2,
+    MAX_ISSUANCE: float     = 0.03,
+    MAX_ASSET_GROWTH: float = 0.20,
+    MAX_ACCRUALS_ABS: float = 0.10,
+    MAX_NETDEBT_EBITDA: float = 3.0,
+    MIN_COVERAGE: int       = 2,
+) -> pd.DataFrame:
+    """
+    Usa columnas ya presentes en 'df' (producidas por el builder).
+    No recalcula factores; solo aplica umbrales y marca pass_* / pass_all.
+    """
+    out = df.copy()
+
+    # Si falta coverage_count por alguna razón, reconstruimos mínimo…
+    if "coverage_count" not in out.columns:
+        has_profit_any = pd.concat([
+            pd.to_numeric(out.get("ebit_margin"), errors="coerce").notna(),
+            pd.to_numeric(out.get("cfo_margin"),  errors="coerce").notna(),
+            pd.to_numeric(out.get("fcf_margin"),  errors="coerce").notna(),
+        ], axis=1).any(axis=1)
+
+        blocks = pd.concat([
+            has_profit_any,
+            pd.to_numeric(out.get("netdebt_ebitda"), errors="coerce").notna(),
+            pd.to_numeric(out.get("accruals_ta"),    errors="coerce").notna(),
+            pd.to_numeric(out.get("asset_growth"),   errors="coerce").notna(),
+            pd.to_numeric(out.get("share_issuance"), errors="coerce").notna(),
+        ], axis=1)
+        out["coverage_count"] = blocks.sum(axis=1).astype(int)
+
+    profit_hits  = pd.to_numeric(out.get("profit_hits"), errors="coerce").fillna(0).astype(int)
+    issuance     = pd.to_numeric(out.get("share_issuance"), errors="coerce")
+    asset_growth = pd.to_numeric(out.get("asset_growth"),   errors="coerce")
+    accruals_ta  = pd.to_numeric(out.get("accruals_ta"),    errors="coerce")
+    ndebt        = pd.to_numeric(out.get("netdebt_ebitda"), errors="coerce")
+
+    out["pass_profit"]   = profit_hits >= int(PROFIT_MIN_HITS)
+    out["pass_issuance"] = issuance.abs()     <= float(MAX_ISSUANCE)
+    out["pass_assets"]   = asset_growth.abs() <= float(MAX_ASSET_GROWTH)
+    out["pass_accruals"] = accruals_ta.abs()  <= float(MAX_ACCRUALS_ABS)
+    out["pass_ndebt"]    = ndebt              <= float(MAX_NETDEBT_EBITDA)
+    out["pass_coverage"] = out["coverage_count"] >= int(MIN_COVERAGE)
+
+    for c in ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]:
+        out[c] = out[c].fillna(False)
+
+    checks = ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]
+    out["pass_all"] = out[checks].all(axis=1)
     return out
