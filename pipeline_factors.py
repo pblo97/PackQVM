@@ -44,48 +44,88 @@ def fetch_raw_fundamentals(tickers: Iterable[str]) -> pd.DataFrame:
 # ===========================================================
 # 2. Guardrails (pasa / no pasa "empresa sana")
 # ===========================================================
-def apply_guardrails_logic(df: pd.DataFrame) -> pd.DataFrame:
+def apply_guardrails_logic(
+    df: pd.DataFrame,
+    *,
+    PROFIT_MIN_HITS: int    = 2,     # al menos 2 de {EBIT, CFO, FCF} > 0
+    MAX_ISSUANCE: float     = 0.03,  # dilución neta máx (3%)
+    MAX_ASSET_GROWTH: float = 0.20,  # |asset growth| máx
+    MAX_ACCRUALS_ABS: float = 0.10,  # |accruals/TA| máx
+    MAX_NETDEBT_EBITDA: float = 3.0, # net debt / EBITDA máx
+    MIN_COVERAGE: int       = 2      # # de bloques disponibles mín
+) -> pd.DataFrame:
     """
-    Marca pass_* y pass_all en base a umbrales fijos.
-    Si quieres sliders para estos umbrales después, genial,
-    pero la lógica queda centralizada acá.
+    Marca pass_* y pass_all en base a umbrales centrales.
+    - coverage_count cuenta BLOQUES disponibles: 
+      1) bloque rentabilidad si hay al menos UNO de {ebit_margin, cfo_margin, fcf_margin} no-NaN
+      2) netdebt_ebitda
+      3) accruals_ta
+      4) asset_growth
+      5) share_issuance
+    - pass_profit usa 'profit_hits' (>= PROFIT_MIN_HITS) pero OJO: coverage NO se basa en profit_hits,
+      se basa en la DISPONIBILIDAD de márgenes (para evitar el bug de coverage=5 para todos).
     """
     out = df.copy()
 
-    PROFIT_MIN_HITS    = 2       # p.ej. al menos 2 Q buenos
-    MAX_ISSUANCE       = 0.03    # dilución aceptable (3%)
-    MAX_ASSET_GROWTH   = 0.20    # crecimiento de activos razonable
-    MAX_ACCRUALS_ABS   = 0.10    # accruals no locos
-    MAX_NETDEBT_EBITDA = 3.0     # deuda controlada
-    MIN_COVERAGE       = 2       # cuántas métricas no-NaN mínimas
+    # -------- columnas numéricas seguras --------
+    # (no rellenamos NaN aquí salvo donde es necesario para la lógica)
+    ebit_m = pd.to_numeric(out.get("ebit_margin"), errors="coerce")
+    cfo_m  = pd.to_numeric(out.get("cfo_margin"),  errors="coerce")
+    fcf_m  = pd.to_numeric(out.get("fcf_margin"),  errors="coerce")
 
-    # coverage_count = cuántas métricas clave tenemos realmente
-    coverage_cols = [
-        "profit_hits","netdebt_ebitda","accruals_ta",
-        "asset_growth","share_issuance",
-    ]
-    out["coverage_count"] = (
-        out[coverage_cols]
-        .apply(pd.to_numeric, errors="coerce")
-        .notna()
-        .sum(axis=1)
-        .astype(int)
+    ndebt  = pd.to_numeric(out.get("netdebt_ebitda"), errors="coerce")
+    accr   = pd.to_numeric(out.get("accruals_ta"),    errors="coerce")
+    ag     = pd.to_numeric(out.get("asset_growth"),   errors="coerce")
+    iss    = pd.to_numeric(out.get("share_issuance"), errors="coerce")
+
+    profit_hits = pd.to_numeric(out.get("profit_hits"), errors="coerce")  # puede ser Int64 con <NA>
+
+    # -------- coverage_count: disponibilidad de BLOQUES --------
+    # 1) bloque rentabilidad: hay al menos un margen disponible?
+    if (ebit_m is not None) or (cfo_m is not None) or (fcf_m is not None):
+        has_profit_any = pd.concat(
+            [ebit_m.notna(), cfo_m.notna(), fcf_m.notna()],
+            axis=1
+        ).any(axis=1)
+    else:
+        # fallback si por alguna razón no tenemos márgenes pero sí profit_hits:
+        # cuenta el bloque si profit_hits no es NaN
+        has_profit_any = profit_hits.notna()
+
+    blocks = pd.concat([
+        has_profit_any,
+        ndebt.notna(),
+        accr.notna(),
+        ag.notna(),
+        iss.notna(),
+    ], axis=1)
+
+    out["coverage_count"] = blocks.sum(axis=1).astype(int)
+
+    # -------- reglas pass_* --------
+    # Para pass_profit, tratamos NaN en profit_hits como 0 (no pasa)
+    out["pass_profit"]   = profit_hits.fillna(0).astype(int) >= int(PROFIT_MIN_HITS)
+    out["pass_issuance"] = iss.abs()   <= float(MAX_ISSUANCE)
+    out["pass_assets"]   = ag.abs()    <= float(MAX_ASSET_GROWTH)
+    out["pass_accruals"] = accr.abs()  <= float(MAX_ACCRUALS_ABS)
+    out["pass_ndebt"]    = ndebt       <= float(MAX_NETDEBT_EBITDA)
+    out["pass_coverage"] = out["coverage_count"] >= int(MIN_COVERAGE)
+
+    # NaN → False
+    for c in ["pass_profit","pass_issuance","pass_assets","pass_accruals","pass_ndebt","pass_coverage"]:
+        out[c] = out[c].fillna(False)
+
+    out["pass_all"] = (
+        out["pass_profit"]
+        & out["pass_issuance"]
+        & out["pass_assets"]
+        & out["pass_accruals"]
+        & out["pass_ndebt"]
+        & out["pass_coverage"]
     )
 
-    out["pass_profit"]    = out["profit_hits"]    >= PROFIT_MIN_HITS
-    out["pass_issuance"]  = out["share_issuance"].abs() <= MAX_ISSUANCE
-    out["pass_assets"]    = out["asset_growth"].fillna(0).abs() <= MAX_ASSET_GROWTH
-    out["pass_accruals"]  = out["accruals_ta"].abs() <= MAX_ACCRUALS_ABS
-    out["pass_ndebt"]     = out["netdebt_ebitda"] <= MAX_NETDEBT_EBITDA
-    out["pass_coverage"]  = out["coverage_count"] >= MIN_COVERAGE
-
-    hard_checks = [
-        "pass_profit","pass_issuance","pass_assets",
-        "pass_accruals","pass_ndebt","pass_coverage",
-    ]
-    out["pass_all"] = out[hard_checks].all(axis=1)
-
     return out
+
 
 
 # ===========================================================
