@@ -415,7 +415,7 @@ with st.sidebar:
 
     # ---- Fundamentales & Guardrails ----
     with st.expander("Fundamentales & Guardrails", expanded=False):
-        min_cov_guard = st.slider("Cobertura VFQ mínima (# métricas)", 1, 4, 2)
+        min_cov_guard = st.slider("Cobertura VFQ mínima (# métricas)", 0, 5, 2)
         profit_hits   = st.slider("Pisos de rentabilidad (hits EBIT/CFO/FCF)", 0, 3, 2)
         max_issuance  = st.slider("Net issuance máx.", 0.00, 0.10, 0.03, 0.01)
         max_assets    = st.slider("Asset growth |y/y| máx.", 0.00, 0.50, 0.20, 0.01)
