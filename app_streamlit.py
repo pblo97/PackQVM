@@ -639,6 +639,7 @@ with tab1:
     st.caption(
         "Esta tabla vive en st.session_state['uni'] y alimenta las demás pestañas."
     )
+    
 
 
 # ====== TAB 2: GUARDRAILS ======
@@ -731,7 +732,10 @@ with tab2:
         "coverage_count = cuánta info fundamental tenemos disponible."
     )
 
+    
 
+
+# ====== TAB 3: VFQ ======
 # ====== TAB 3: VFQ ======
 # ====== TAB 3: VFQ ======
 with tab3:
@@ -755,41 +759,80 @@ with tab3:
     # A) 🔒 SNAPSHOT VFQ FIJO (se recalcula solo cuando lo pides)
     #     Reemplaza CUALQUIER creación previa de df_vfq_all por esto
     # ------------------------------------------------------------
-    snap_key = "vfq_snapshot"
+    # --- A) SNAPSHOT VFQ FIJO con auto-invalidate cuando cambia el universo ---
+    import hashlib, json, time
 
-    # Botón para forzar un nuevo snapshot del universo (percentiles + métricas neutras)
+    def _kept_signature(kept_syms: list[str], extra: dict | None = None) -> str:
+        """
+        Firma determinista del universo kept. Si quieres, puedes incluir parámetros extra
+        (ej. winsor/buckets del tab Universo) para que también invaliden el snapshot.
+        """
+        payload = {"kept": sorted(map(str, kept_syms))}
+        if extra:
+            payload["extra"] = extra
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.md5(raw).hexdigest()
+
+    snap_key  = "vfq_snapshot"
+    meta_key  = "vfq_snapshot_meta"
+
+    # Botón manual por si quieres forzar el recálculo
     recalc = st.button("♻️ Recalcular snapshot VFQ (universo)", use_container_width=False)
 
-    if st.session_state.get(snap_key) is None or recalc:
-        # 1) Construimos una sola vez las columnas *_adj_neut, acc_pct, hits, RVOL20, BreakoutScore, etc.
+    # 1) Calcula firma del universo actual (después de Guardrails)
+    kept_syms = (
+        kept.get("symbol", pd.Series(dtype=str))
+            .dropna().astype(str).unique().tolist()
+    )
+    # Si tienes parámetros del tab Universo que afectan a build_factor_frame (winsor, buckets, group_by, etc)
+    # ponlos aquí para que su cambio también fuerce la invalidación:
+    universe_norm_params = st.session_state.get("universe_norm_params", {})  # opcional
+    cur_sig = _kept_signature(kept_syms, extra=universe_norm_params)
+
+    # 2) ¿Debemos reconstruir? (botón, no existe snapshot, o firma distinta)
+    need_rebuild = recalc or (snap_key not in st.session_state)
+    if not need_rebuild:
+        prev_meta = st.session_state.get(meta_key, {})
+        need_rebuild = (prev_meta.get("kept_sig") != cur_sig)
+
+    if need_rebuild:
+        # --- Construye snapshot nuevo con el universo ACTUAL ---
         df_vfq_all = build_factor_frame(kept_syms)
 
-        # 2) Agregamos sector y market_cap (sin volver a normalizar nada)
         df_vfq_all = (
             df_vfq_all.drop(columns=["sector", "market_cap"], errors="ignore")
             .merge(uni_cur[["symbol", "sector", "market_cap"]], on="symbol", how="left")
         )
 
-        # 3) Orden base determinista para que TopN sea estable (no "salte" al mover sliders)
+        # Orden base determinista
         df_vfq_all = df_vfq_all.assign(
-            _p = df_vfq_all["prob_up"].fillna(-9e9),
-            _b = df_vfq_all["BreakoutScore"].fillna(-9e9),
-            _q = df_vfq_all["quality_adj_neut"].fillna(-9e9),
-            _v = df_vfq_all["value_adj_neut"].fillna(-9e9),
+            _p=df_vfq_all["prob_up"].fillna(-9e9),
+            _b=df_vfq_all["BreakoutScore"].fillna(-9e9),
+            _q=df_vfq_all["quality_adj_neut"].fillna(-9e9),
+            _v=df_vfq_all["value_adj_neut"].fillna(-9e9),
         ).sort_values(
-            ["_p","_b","_q","_v","symbol"],
-            ascending=[False,False,False,False,True],
-            kind="mergesort"   # IMPORTANTE: sort estable
+            ["_p", "_b", "_q", "_v", "symbol"],
+            ascending=[False, False, False, False, True],
+            kind="mergesort",
         )
 
-        # 4) Guardamos percentil por tamaño para reglas "size-aware"
+        # Percentil por tamaño (para carril mega-cap)
         df_vfq_all["cap_pct"] = df_vfq_all["market_cap"].rank(pct=True)
 
         st.session_state[snap_key] = df_vfq_all.copy()
+        st.session_state[meta_key] = {
+            "kept_sig": cur_sig,
+            "n_kept": len(kept_syms),
+            "ts": time.time(),
+        }
 
-    # recuperar snapshot fijo para esta corrida del tab
+    # 3) Usa SIEMPRE el snapshot fijo
     df_vfq_all = st.session_state[snap_key].copy()
-    st.caption(f"Snapshot fijo: {len(df_vfq_all)} filas en kept. (Solo cambia si presionas el botón de recalcular)")
+    meta = st.session_state.get(meta_key, {})
+    st.caption(
+        f"Snapshot fijo: {meta.get('n_kept','?')} filas en kept. "
+        f"(ts={meta.get('ts','—')}). Solo se actualiza si cambia el universo o presionas el botón."
+    )
 
     # -------------------------------------
     # B) 🎛️ SLIDERS (+ toggle carril mega-cap)
