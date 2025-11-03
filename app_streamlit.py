@@ -275,23 +275,7 @@ def _build_guardrails_base_from_snapshot(snapshot_vfq: pd.DataFrame, uni_df: pd.
     return df[[c for c in order if c in df.columns]].copy()
 
 # ---- Guardrails helpers (QVM) ----
-COVERAGE_COLS = ["profit_hits","netdebt_ebitda","accruals_ta","asset_growth","share_issuance"]
 
-def _build_guardrails_base_from_snapshot(snapshot: pd.DataFrame, uni: pd.DataFrame) -> pd.DataFrame:
-    """Toma el snapshot VFQ y le injerta sector/mcap + coverage_count; sin filtros."""
-    df = (
-        snapshot.drop(columns=["sector", "market_cap"], errors="ignore")
-        .merge(uni[["symbol","sector","market_cap"]], on="symbol", how="left")
-    )
-    # coverage_count = cuántas métricas clave existen (no NaN)
-    df["coverage_count"] = (
-        df[COVERAGE_COLS]
-        .apply(pd.to_numeric, errors="coerce")
-        .notna()
-        .sum(axis=1)
-        .astype(int)
-    )
-    return df
 
 def _fmt_mcap(x):
     try:
