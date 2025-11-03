@@ -21,7 +21,6 @@ from pipeline_factors import (
     _build_guardrails_base_from_snapshot,
     apply_guardrails_logic,
 )
-
 from fundamentals import (
     download_fundamentals,
     build_vfq_scores_dynamic,          # (importado si luego lo usas)
