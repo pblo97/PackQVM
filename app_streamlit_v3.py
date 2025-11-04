@@ -697,20 +697,42 @@ if run_button or st.session_state.get('results') is not None:
             # Scatter plot: Quality vs Value
             st.subheader("Quality vs Value")
 
-            fig_scatter = px.scatter(
-                portfolio,
-                x='value_score_component',
-                y='quality_score_component',
-                size='market_cap',
-                color='sector',
-                hover_data=['symbol', 'piotroski_score', 'qv_score'],
-                title="Quality Score vs Value Score",
-                labels={
-                    'value_score_component': 'Value Score',
-                    'quality_score_component': 'Quality Score (Piotroski Normalizado)'
-                }
-            )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            # Verificar si las columnas existen
+            if 'value_score_component' in portfolio.columns and 'quality_score_component' in portfolio.columns:
+                fig_scatter = px.scatter(
+                    portfolio,
+                    x='value_score_component',
+                    y='quality_score_component',
+                    size='market_cap',
+                    color='sector',
+                    hover_data=['symbol', 'piotroski_score', 'qv_score'],
+                    title="Quality Score vs Value Score",
+                    labels={
+                        'value_score_component': 'Value Score',
+                        'quality_score_component': 'Quality Score (Piotroski Normalizado)'
+                    }
+                )
+                st.plotly_chart(fig_scatter, use_container_width=True)
+            else:
+                # Usar Piotroski como proxy de Quality
+                if 'piotroski_score' in portfolio.columns:
+                    fig_scatter = px.scatter(
+                        portfolio,
+                        x='ev_ebitda' if 'ev_ebitda' in portfolio.columns else 'pe',
+                        y='piotroski_score',
+                        size='market_cap',
+                        color='sector',
+                        hover_data=['symbol', 'qv_score'],
+                        title="Piotroski Score vs Valuation",
+                        labels={
+                            'piotroski_score': 'Piotroski Score (Quality)',
+                            'ev_ebitda': 'EV/EBITDA (Value)',
+                            'pe': 'P/E (Value)'
+                        }
+                    )
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+                else:
+                    st.info("Componentes de score no disponibles para visualización.")
 
         with tab2:
             st.subheader("Distribución por Sector")
@@ -779,55 +801,72 @@ if run_button or st.session_state.get('results') is not None:
 
                 for i, col in enumerate(valuation_cols):
                     with col1 if i % 2 == 0 else col2:
-                        fig = px.histogram(
-                            portfolio,
-                            x=col,
-                            title=f"Distribución de {col.upper()}",
-                            labels={col: col.upper(), 'count': 'Frecuencia'}
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
+                        # Filtrar valores válidos para evitar errores
+                        valid_data = portfolio[portfolio[col].notna()]
+                        if not valid_data.empty:
+                            fig = px.histogram(
+                                valid_data,
+                                x=col,
+                                title=f"Distribución de {col.upper()}",
+                                labels={col: col.upper(), 'count': 'Frecuencia'}
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info(f"No hay datos válidos para {col.upper()}")
+            else:
+                st.info("No hay métricas de valoración disponibles para visualizar.")
 
         with tab5:
             st.subheader("Momentum & MA200 Analysis")
 
-            if 'momentum_12m' in portfolio.columns:
-                # Histograma de momentum
-                fig_momentum = px.histogram(
-                    portfolio,
-                    x='momentum_12m',
-                    nbins=20,
-                    title="Distribución de Momentum 12M",
-                    labels={'momentum_12m': 'Momentum 12M', 'count': 'Frecuencia'}
-                )
-                st.plotly_chart(fig_momentum, use_container_width=True)
+            has_momentum = 'momentum_12m' in portfolio.columns
+            has_ma200 = 'above_ma200' in portfolio.columns
 
-            # MA200 status
-            if 'above_ma200' in portfolio.columns:
-                ma200_counts = portfolio['above_ma200'].value_counts()
+            if not has_momentum and not has_ma200:
+                st.info("⚠️ Los datos de Momentum y MA200 no están disponibles. Asegúrate de que el pipeline descargue precios históricos correctamente.")
+            else:
+                if has_momentum:
+                    # Histograma de momentum
+                    valid_momentum = portfolio[portfolio['momentum_12m'].notna()]
+                    if not valid_momentum.empty:
+                        fig_momentum = px.histogram(
+                            valid_momentum,
+                            x='momentum_12m',
+                            nbins=20,
+                            title="Distribución de Momentum 12M",
+                            labels={'momentum_12m': 'Momentum 12M', 'count': 'Frecuencia'}
+                        )
+                        st.plotly_chart(fig_momentum, use_container_width=True)
 
-                fig_ma200 = px.pie(
-                    values=ma200_counts.values,
-                    names=['Por encima MA200' if x else 'Por debajo MA200' for x in ma200_counts.index],
-                    title="Distribución MA200",
-                )
-                st.plotly_chart(fig_ma200, use_container_width=True)
+                # MA200 status
+                if has_ma200:
+                    ma200_counts = portfolio['above_ma200'].value_counts()
 
-            # Scatter: Momentum vs QV Score
-            if 'momentum_12m' in portfolio.columns:
-                fig_momentum_qv = px.scatter(
-                    portfolio,
-                    x='momentum_12m',
-                    y='qv_score',
-                    size='market_cap',
-                    color='above_ma200' if 'above_ma200' in portfolio.columns else 'sector',
-                    hover_data=['symbol', 'piotroski_score'],
-                    title="Momentum vs QV Score",
-                    labels={
-                        'momentum_12m': 'Momentum 12M',
-                        'qv_score': 'QV Score'
-                    }
-                )
-                st.plotly_chart(fig_momentum_qv, use_container_width=True)
+                    fig_ma200 = px.pie(
+                        values=ma200_counts.values,
+                        names=['Por encima MA200' if x else 'Por debajo MA200' for x in ma200_counts.index],
+                        title="Distribución MA200",
+                    )
+                    st.plotly_chart(fig_ma200, use_container_width=True)
+
+                # Scatter: Momentum vs QV Score
+                if has_momentum and 'qv_score' in portfolio.columns:
+                    valid_data = portfolio[portfolio['momentum_12m'].notna() & portfolio['qv_score'].notna()]
+                    if not valid_data.empty:
+                        fig_momentum_qv = px.scatter(
+                            valid_data,
+                            x='momentum_12m',
+                            y='qv_score',
+                            size='market_cap' if 'market_cap' in portfolio.columns else None,
+                            color='above_ma200' if has_ma200 else 'sector',
+                            hover_data=['symbol', 'piotroski_score'] if 'piotroski_score' in portfolio.columns else ['symbol'],
+                            title="Momentum vs QV Score",
+                            labels={
+                                'momentum_12m': 'Momentum 12M',
+                                'qv_score': 'QV Score'
+                            }
+                        )
+                        st.plotly_chart(fig_momentum_qv, use_container_width=True)
 
     else:
         st.warning("No hay stocks en el portfolio final.")
