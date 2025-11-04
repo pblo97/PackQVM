@@ -128,6 +128,9 @@ def _safe_float(x) -> float:
     except Exception:
         return float("nan")
 
+# Alias para compatibilidad con código que usa _to_float
+_to_float = _safe_float
+
 def _sanitize_symbol(sym: str) -> List[str]:
     """
     Devuelve posibles variantes que FMP acepta mejor para TTM.
@@ -263,9 +266,7 @@ def _fetch_income_statement(symbol: str, limit: int = 2) -> List[dict]:
     data = _http_get(
         f"income-statement/{symbol}",
         params={"limit": limit},
-        cache_ns="income_stmt",
-        cache_key=f"{symbol}_{limit}",
-        max_age_sec=24 * 3600,
+        ttl=24 * 3600,
     )
     if isinstance(data, list):
         return data
@@ -280,9 +281,7 @@ def _fetch_balance_sheet(symbol: str, limit: int = 2) -> List[dict]:
     data = _http_get(
         f"balance-sheet-statement/{symbol}",
         params={"limit": limit},
-        cache_ns="balance_sheet",
-        cache_key=f"{symbol}_{limit}",
-        max_age_sec=24 * 3600,
+        ttl=24 * 3600,
     )
     if isinstance(data, list):
         return data
@@ -297,9 +296,7 @@ def _fetch_cash_flow_statement(symbol: str, limit: int = 2) -> List[dict]:
     data = _http_get(
         f"cash-flow-statement/{symbol}",
         params={"limit": limit},
-        cache_ns="cashflow_stmt",
-        cache_key=f"{symbol}_{limit}",
-        max_age_sec=24 * 3600,
+        ttl=24 * 3600,
     )
     if isinstance(data, list):
         return data
@@ -596,7 +593,7 @@ def fetch_financial_statements_batch(symbols: List[str]) -> pd.DataFrame:
     return df
 
 
-def fetch_fundamentals_batch(symbols: List[str], use_full_statements: bool = False) -> pd.DataFrame:
+def fetch_fundamentals_batch(symbols: List[str], use_full_statements: bool = False, use_cache: bool = True, debug: bool = False) -> pd.DataFrame:
     """
     Devuelve DataFrame con columnas:
     symbol, ev_ebitda, pb, pe, roe, roic, gross_margin, fcf, operating_cf
@@ -616,14 +613,6 @@ def fetch_fundamentals_batch(symbols: List[str], use_full_statements: bool = Fal
     for s in symbols:
         row = {"symbol": s}
         try:
-            row.update(_fetch_ratios(s))
-        except Exception:
-            pass
-        try:
-            row.update(_fetch_key_metrics(s))
-        except Exception:
-            pass
-        try:
             km = _get_key_metrics_ttm(s, use_cache)
             rt = _get_ratios_ttm(s, use_cache)
             cf = _get_cashflow_ttm(s, use_cache)
@@ -642,15 +631,15 @@ def fetch_fundamentals_batch(symbols: List[str], use_full_statements: bool = Fal
                 "operating_cf": _safe_float(cf.get("operatingCashFlowTTM") or cf.get("netCashProvidedByOperatingActivities")),
                 "fcf": _safe_float(cf.get("freeCashFlowTTM")),
             }
-            rows.append(row)
+            out_rows.append(row)
         except Exception:
-            rows.append({
+            out_rows.append({
                 "symbol": s, "ev_ebitda": float("nan"), "pb": float("nan"), "pe": float("nan"),
                 "roe": float("nan"), "roic": float("nan"), "gross_margin": float("nan"),
                 "operating_cf": float("nan"), "fcf": float("nan"),
             })
 
-    df = pd.DataFrame(rows).drop_duplicates("symbol")
+    df = pd.DataFrame(out_rows).drop_duplicates("symbol")
 
     if debug and not df.empty:
         numeric_cols = ["ev_ebitda","pb","pe","roe","roic","gross_margin","operating_cf","fcf"]
