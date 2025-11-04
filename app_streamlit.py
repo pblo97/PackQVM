@@ -416,58 +416,63 @@ if run_btn:
         # ---------------------------------------------------------------------
         # PASO 7: CALCULAR FACTORES QVM
         # ---------------------------------------------------------------------
+       # PASO 7: CALCULAR FACTORES QVM
+# ---------------------------------------------------------------------
         status_text.text("💎 Paso 7/8: Calculando factores QVM...")
         progress_bar.progress(90)
 
-        # Blindaje: recuperar sector/market_cap desde el universo original si faltan
-        needed = ['sector', 'market_cap']
-        missing = [c for c in needed if c not in df_final.columns]
-        if missing and 'universe' in st.session_state:
-            uni = st.session_state['universe'][['symbol'] + [c for c in needed if c in st.session_state['universe'].columns]].drop_duplicates('symbol')
-            df_final = df_final.merge(uni, on='symbol', how='left')
-        for c in needed:
-            if c not in df_final.columns:
-                df_final[c] = np.nan
+        # --- Reinyectar SIEMPRE universo y fundamentales aquí ---
+        symbols_in_scope = df_final["symbol"].dropna().astype(str).unique().tolist()
 
-        # Si no hubo F-Score (use_fscore False), asegura columna para el merge posterior
-        if 'fscore' not in df_final.columns:
-            df_final['fscore'] = np.nan
-        
-        df_universe_clean = df_final[['symbol', 'sector', 'market_cap']].copy()
-        df_fundamentals_clean = df_final[['symbol', 'ev_ebitda', 'pb', 'pe', 
-                                          'roe', 'roic', 'gross_margin', 
-                                          'fcf', 'operating_cf']].copy()
-        
+        # Universo limpio (aseguramos sector y market_cap desde el universo original)
+        df_universe_clean = (
+            universe.loc[:, ["symbol", "sector", "market_cap"]]
+            .drop_duplicates("symbol")
+            .merge(pd.DataFrame({"symbol": symbols_in_scope}), on="symbol", how="inner")
+        )
+
+        # Fundamentales limpios SOLO para los símbolos vigentes
+        needed_fund_cols = ["symbol","ev_ebitda","pb","pe","roe","roic","gross_margin","fcf","operating_cf"]
+        df_fundamentals_clean = (
+            fundamentals.loc[:, [c for c in needed_fund_cols if c in fundamentals.columns]]
+            .drop_duplicates("symbol")
+            .merge(pd.DataFrame({"symbol": symbols_in_scope}), on="symbol", how="inner")
+        )
+
+        # Asegurar que existan todas las columnas esperadas (si falta alguna, crearla en NaN)
+        for col in needed_fund_cols:
+            if col not in df_fundamentals_clean.columns:
+                df_fundamentals_clean[col] = np.nan
+
+        # Calcular QVM con neutralización por sector
         df_with_factors = compute_all_factors(
             df_universe_clean,
-            df_fundamentals_clean,
+            df_fundamentals_clean[needed_fund_cols],
             sector_neutral=True,
-            w_quality=w_quality * (1 - w_fscore),  # Ajustar por peso de F-Score
+            w_quality=w_quality * (1 - w_fscore),  # Ajuste por peso F-Score
             w_value=w_value * (1 - w_fscore),
             w_momentum=w_momentum * (1 - w_fscore),
         )
-        
-        # Merge con momentum y F-Score
+
+        # Merge con momentum y F-Score reales
+        cols_keep_from_final = ["symbol","momentum_12m1m","above_ma200","composite_momentum","fscore","roe","sector","market_cap"]
+        cols_keep_from_final = [c for c in cols_keep_from_final if c in df_final.columns]
         df_with_factors = df_with_factors.merge(
-            df_final[['symbol', 'momentum_12m1m', 'above_ma200', 'composite_momentum', 'fscore']],
-            on='symbol',
-            how='left'
+            df_final[cols_keep_from_final],
+            on="symbol",
+            how="left"
         )
-        
-        # ⭐ Recalcular composite score con momentum REAL y F-Score
-        df_with_factors['qvm_score_corrected'] = (
-            w_quality * df_with_factors['quality_extended'] +
-            w_value * df_with_factors['value_score'] +
-            w_momentum * df_with_factors['composite_momentum'] +
-            w_fscore * (df_with_factors['fscore'] / 9.0)
+
+        # Recalcular composite score final con MOM real y F-Score
+        df_with_factors["qvm_score_corrected"] = (
+            w_quality * df_with_factors["quality_extended"] +
+            w_value   * df_with_factors["value_score"] +
+            w_momentum* df_with_factors["composite_momentum"] +
+            w_fscore  * (df_with_factors["fscore"] / 9.0)
         )
-        
-        df_with_factors['final_rank'] = df_with_factors['qvm_score_corrected'].rank(
-            pct=True, method='average'
-        )
-        
-        st.session_state['df_with_factors'] = df_with_factors
-        
+
+        df_with_factors["final_rank"] = df_with_factors["qvm_score_corrected"].rank(pct=True, method="average")
+        st.session_state["df_with_factors"] = df_with_factors
         # ---------------------------------------------------------------------
         # PASO 8: SELECCIÓN FINAL
         # ---------------------------------------------------------------------
