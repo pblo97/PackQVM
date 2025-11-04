@@ -1,6 +1,6 @@
 # 🎯 PackQVM - Quality-Value-Momentum Strategy
 
-Sistema de screening de acciones usando **Piotroski Score Real** + **Quality-Value Score** sin multicolinealidad.
+Sistema de screening de acciones usando **Piotroski Score Real** + **Quality-Value Score** sin multicolinealidad + **MA200 Filter** + **Backtest**.
 
 ---
 
@@ -13,11 +13,16 @@ export FMP_API_KEY="tu_api_key_aqui"
 # 2. Instalar dependencias
 pip install pandas numpy requests streamlit plotly
 
-# 3. Ejecutar la aplicación
-streamlit run app_streamlit.py
+# 3. Ejecutar la aplicación V3 (RECOMENDADO)
+streamlit run app_streamlit_v3.py
 ```
 
 **La aplicación se abrirá en tu navegador en http://localhost:8501**
+
+### Versiones Disponibles:
+- **`app_streamlit_v3.py`** ⭐ **RECOMENDADO** - Versión completa con MA200, Backtest, Momentum, ROIC>WACC
+- `app_streamlit_v2.py` - Versión con Piotroski real y sliders ajustables
+- `app_streamlit.py` - Versión básica original
 
 ---
 
@@ -36,33 +41,70 @@ QV Score = 40% Piotroski + 35% Value + 15% FCF Yield + 10% Momentum
 - **Piotroski**: Captura calidad operacional completa
 - **Value**: EV/EBITDA, P/B, P/E (independiente de Piotroski)
 - **FCF Yield**: Free Cash Flow / Market Cap
-- **Momentum**: Retornos históricos
+- **Momentum**: Retornos históricos 12M-1M
+
+### 🚀 NUEVAS CARACTERÍSTICAS V3
+
+#### 📈 MA200 Filter (Faber 2007)
+- Filtro de tendencia: solo stocks por encima de MA de 200 días
+- Implementa "A Quantitative Approach to Tactical Asset Allocation"
+
+#### 🎯 Momentum 12M-1M (Jegadeesh & Titman 1993)
+- Momentum real calculado desde precios históricos
+- Excluye último mes para evitar reversión de corto plazo
+
+#### 💎 Métricas Avanzadas de Valoración
+- **EBIT/EV**: Earnings Yield (mejor indicador que P/E)
+- **FCF/EV**: Free Cash Flow Yield normalizado
+- **ROIC > WACC**: Filtro de creación de valor
+
+#### 📊 Backtest Integrado
+- Performance histórica del portfolio
+- Métricas: CAGR, Sharpe Ratio, Sortino Ratio, Max Drawdown
+- Rebalanceo configurable (Mensual/Trimestral/Anual)
+- Costos de trading incluidos (comisión, slippage, market impact)
+- Visualización de equity curve
+
+#### 🔍 Filtros Heurísticos
+- 52-Week High filter: precio cerca del máximo anual
+- ROIC > WACC: solo empresas que crean valor
 
 ### 🎛️ Parámetros Ajustables (Sliders)
 - Pesos de Quality/Value/FCF Yield/Momentum
 - Filtros de Piotroski mínimo (0-9)
 - QV Score mínimo (0-1)
-- Límites de valoración (P/E, EV/EBITDA)
+- Límites de valoración (P/E, EV/EBITDA, EBIT/EV, FCF/EV)
+- Momentum mínimo 12M
 - Tamaño de universo y portfolio
+- Configuración de backtest y costos
 
 ### 📊 Visualizaciones Interactivas
-- Funnel de selección por pasos
+- Funnel de selección por pasos (10 pasos en V3)
 - Distribución de scores
 - Análisis por sector
 - Componentes de Piotroski
-- Métricas de valoración
+- Métricas de valoración avanzadas
+- **NUEVO**: Análisis de Momentum y MA200
+- **NUEVO**: Equity curve del backtest
+- **NUEVO**: Performance metrics dashboard
 - Exportación a CSV
 
 ---
 
 ## 📁 Estructura del Proyecto
 
-### Archivos Principales:
+### Archivos Principales V3 (RECOMENDADO):
 ```
-app_streamlit.py              # ⭐ Interfaz principal (Streamlit)
-qvm_pipeline_v2.py           # Pipeline optimizado con análisis por pasos
+app_streamlit_v3.py          # ⭐ Interfaz V3 completa (MA200, Backtest, Momentum)
+qvm_pipeline_v3.py           # ⭐ Pipeline V3 con 10 pasos y backtest integrado
 quality_value_score.py       # Score sin multicolinealidad
-data_fetcher.py              # Descarga de datos + Piotroski Score
+data_fetcher.py              # Descarga de datos + Piotroski Score real
+```
+
+### Archivos V2 (Funcionales):
+```
+app_streamlit_v2.py          # Interfaz V2 con sliders ajustables
+qvm_pipeline_v2.py           # Pipeline V2 optimizado (6 pasos)
 ```
 
 ### Archivos de Soporte:
@@ -70,13 +112,14 @@ data_fetcher.py              # Descarga de datos + Piotroski Score
 factor_calculator.py         # Cálculo de factores QVM
 piotroski_fscore.py         # F-Score simplificado
 screener_filters.py         # Filtros de calidad
-backtest_engine.py          # Motor de backtesting
-momentum_calculator.py      # Cálculo de momentum
+backtest_engine.py          # Motor de backtesting con métricas
+momentum_calculator.py      # Cálculo de momentum y MA200
 ```
 
 ### Documentación:
 ```
-USAGE_V2.md                 # Guía detallada de uso
+PIPELINE_V3_FEATURES.md     # ⭐ Documentación completa de V3
+USAGE_V2.md                 # Guía detallada de V2
 README.md                   # Este archivo
 ```
 
@@ -118,11 +161,13 @@ QV Score Promedio: 0.74 (Muy Atractivo)
 
 ## 🔧 Uso Programático
 
-```python
-from qvm_pipeline_v2 import run_qvm_pipeline_v2, QVMConfig
+### Pipeline V3 (RECOMENDADO):
 
-# Configurar parámetros
-config = QVMConfig(
+```python
+from qvm_pipeline_v3 import run_qvm_pipeline_v3, QVMConfigV3
+
+# Configurar parámetros V3
+config = QVMConfigV3(
     universe_size=200,
     portfolio_size=30,
     min_piotroski_score=6,
@@ -131,14 +176,42 @@ config = QVMConfig(
     w_value=0.35,
     w_fcf_yield=0.15,
     w_momentum=0.10,
+    # Nuevos parámetros V3
+    require_above_ma200=True,          # MA200 filter
+    min_momentum_12m=0.10,             # 10% momentum mínimo
+    require_roic_above_wacc=True,      # ROIC > WACC
+    backtest_enabled=True,             # Ejecutar backtest
 )
 
-# Ejecutar pipeline
-results = run_qvm_pipeline_v2(config=config, verbose=True)
+# Ejecutar pipeline V3
+results = run_qvm_pipeline_v3(config=config, verbose=True)
 
 if results.get('success'):
     portfolio = results['portfolio']
-    print(portfolio[['symbol', 'piotroski_score', 'qv_score', 'sector']])
+    print(portfolio[['symbol', 'piotroski_score', 'qv_score', 'momentum_12m', 'above_ma200']])
+
+    # Resultados del backtest
+    if results.get('backtest'):
+        metrics = results['backtest']['portfolio_metrics']
+        print(f"\nBacktest Results:")
+        print(f"CAGR: {metrics['CAGR']:.2%}")
+        print(f"Sharpe: {metrics['Sharpe']:.2f}")
+        print(f"Max DD: {metrics['MaxDD']:.2%}")
+```
+
+### Pipeline V2 (Alternativa):
+
+```python
+from qvm_pipeline_v2 import run_qvm_pipeline_v2, QVMConfig
+
+config = QVMConfig(
+    universe_size=200,
+    portfolio_size=30,
+    min_piotroski_score=6,
+    min_qv_score=0.50,
+)
+
+results = run_qvm_pipeline_v2(config=config, verbose=True)
 ```
 
 ---
@@ -150,6 +223,10 @@ if results.get('success'):
 2. **Asness, C. S., Frazzini, A., & Pedersen, L. H. (2019)**. "Quality Minus Junk." *Review of Accounting Studies*, 24(1), 34-112.
 
 3. **Fama, E. F., & French, K. R. (1992)**. "The Cross-Section of Expected Stock Returns." *Journal of Finance*, 47(2), 427-465.
+
+4. **Faber, M. T. (2007)**. "A Quantitative Approach to Tactical Asset Allocation." *The Journal of Wealth Management*, 9(4), 69-79. (MA200 Filter)
+
+5. **Jegadeesh, N., & Titman, S. (1993)**. "Returns to Buying Winners and Selling Losers: Implications for Stock Market Efficiency." *Journal of Finance*, 48(1), 65-91. (Momentum Strategy)
 
 ---
 
