@@ -24,37 +24,28 @@ from typing import Tuple, Optional
 
 @dataclass
 class FilterConfig:
-    """
-    Configuración de filtros - VERSIÓN OPTIMIZADA
-
-    Mantiene compatibilidad con código anterior pero con
-    valores más estrictos por default.
-    """
-    # Profitabilidad (MÁS ESTRICTO)
-    min_roe: float = 0.15              # 15% (vs 10% anterior) ⭐
-    min_roic: float = 0.12             # 12% ROIC (nuevo)
-    min_gross_margin: float = 0.30     # 30% (vs 20% anterior) ⭐
-
-    # Cash generation
+    # --- existentes ---
+    min_roe: float = 0.15
+    min_roic: float = 0.12
+    min_gross_margin: float = 0.30
     require_positive_fcf: bool = True
     require_positive_ocf: bool = True
-    min_fcf_margin: float = 0.05       # Nuevo: FCF/Revenue >= 5%
-
-    # Valuación (MÁS ESTRICTO)
-    max_pe: float = 40.0               # 40 (vs 100 anterior) ⭐
-    max_ev_ebitda: float = 20.0        # 20 (vs 50 anterior) ⭐
-    max_pb: float = 10.0               # Nuevo
-
-    # Leverage (NUEVO) — placeholders para futura integración si traes deuda/capital
+    min_fcf_margin: float = 0.05
+    max_pe: float = 40.0
+    max_ev_ebitda: float = 20.0
+    max_pb: float = 10.0
     max_debt_to_equity: float = 2.0
     min_current_ratio: float = 1.0
+    min_volume: int = 1_000_000
+    min_market_cap: float = 2e9
+    require_positive_revenue_growth: bool = False
 
-    # Liquidez
-    min_volume: int = 1_000_000        # 1M (vs 500k anterior)
-    min_market_cap: float = 2e9        # $2B (vs $500M anterior)
-
-    # Growth (NUEVO)
-    require_positive_revenue_growth: bool = False  # Opcional por ahora
+    # --- nuevos, usados en el pipeline (PASO 4 y PASO 6), no en apply_all_filters ---
+    use_altman_guardrail: bool = True
+    min_altman_z: float = 2.0
+    min_fscore: int = 6
+    require_above_ma200: bool = True
+    min_momentum_12m: float = 0.05
 
 
 # ============================================================================
@@ -211,6 +202,24 @@ def apply_all_filters(
         config = FilterConfig()
 
     df = df.copy()
+    # al comienzo, tras df.copy():
+    if "piotroskiScore" in df.columns:
+        df["pass_piotroski_api"] = (pd.to_numeric(df["piotroskiScore"], errors="coerce") >= config.min_piotroski_api) | df["piotroskiScore"].isna()
+    else:
+        df["pass_piotroski_api"] = True
+
+    if "altmanZScore" in df.columns:
+        df["pass_altman"] = (pd.to_numeric(df["altmanZScore"], errors="coerce") >= config.min_altman_z) | df["altmanZScore"].isna()
+    else:
+        df["pass_altman"] = True
+
+    # añade a filter_cols:
+    filter_cols = [
+        'pass_profitability','pass_cash','pass_valuation','pass_liquidity',
+        'pass_piotroski_api','pass_altman'
+    ]
+
+    
 
     # Filtros
     df['pass_profitability'] = filter_profitability(df, config)

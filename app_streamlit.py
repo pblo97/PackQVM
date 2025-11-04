@@ -87,6 +87,10 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .5rem 0; }
 # =============================================================================
 # CACHÉ / WRAPPERS
 # =============================================================================
+@st.cache_data(ttl=900)
+def cached_scores(symbols: tuple):
+    from data_fetcher import fetch_financial_scores
+    return fetch_financial_scores(list(symbols), use_cache=True)
 
 @st.cache_data(ttl=3600)
 def cached_screener(limit: int, mcap_min: float, volume_min: int) -> pd.DataFrame:
@@ -468,24 +472,30 @@ with tab1:
 with tab2:
     st.markdown("### 💎 QVM Rankings")
 
+    # ---------- Helpers locales ----------
     def _ensure_sector(df: pd.DataFrame) -> pd.DataFrame:
-        """Garantiza columna 'sector' usando alias o el universo original como fallback."""
+        """
+        Garantiza columna 'sector' usando alias comunes o merge con 'universe' si falta.
+        Mantiene idempotencia (no rompe si ya existe).
+        """
         pf = df.copy()
 
         # 1) Alias frecuentes dentro del propio DF
         if "sector" not in pf.columns:
-            for cand in ("sectorName", "industry", "industryTitle", "subSector"):
+            for cand in ("sector", "sectorName", "industry", "industryTitle", "subSector"):
                 if cand in pf.columns:
                     pf["sector"] = (
-                        pf[cand].astype(str).str.strip().replace({"": "Unknown"}).fillna("Unknown")
+                        pf[cand].astype(str).str.strip()
+                        .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+                        .fillna("Unknown")
                     )
                     break
 
         # 2) Merge con universo original si aún falta
         if "sector" not in pf.columns:
             uni = st.session_state.get("universe", pd.DataFrame())
-            if not uni.empty:
-                # Normaliza 'sector' en el universo también
+            if isinstance(uni, pd.DataFrame) and not uni.empty and "symbol" in uni.columns:
+                # Detecta columna sector en universo
                 sector_src = None
                 for cand in ("sector", "sectorName", "industry", "industryTitle", "subSector"):
                     if cand in uni.columns:
@@ -493,47 +503,63 @@ with tab2:
                         break
                 if sector_src is not None:
                     look = (
-                        uni[["symbol", sector_src]].rename(columns={sector_src: "sector"})
+                        uni[["symbol", sector_src]]
+                        .rename(columns={sector_src: "sector"})
                         .dropna(subset=["symbol"])
                         .drop_duplicates("symbol")
                     )
                     look["sector"] = (
-                        look["sector"].astype(str).str.strip().replace({"": "Unknown"}).fillna("Unknown")
+                        look["sector"].astype(str).str.strip()
+                        .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+                        .fillna("Unknown")
                     )
-                    pf = pf.drop(columns=["sector"], errors="ignore").merge(look, on="symbol", how="left")
+                    pf = (
+                        pf.drop(columns=["sector"], errors="ignore")
+                          .merge(look, on="symbol", how="left")
+                    )
 
-        # 3) Último recurso
+        # 3) Último recurso: crea la columna
         if "sector" not in pf.columns:
             pf["sector"] = "Unknown"
 
         # Limpieza final
-        pf["sector"] = pf["sector"].astype(str).str.strip().replace({"": "Unknown"}).fillna("Unknown")
+        pf["sector"] = (
+            pf["sector"].astype(str).str.strip()
+              .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+              .fillna("Unknown")
+        )
         return pf
 
     def _safe_metric(label: str, value, fmt: str | None = None):
-        """Evita excepciones en métricas cuando faltan columnas."""
+        """Evita excepciones en métricas cuando faltan columnas o hay NaNs."""
         try:
-            if value is None:
+            if value is None or (isinstance(value, float) and (pd.isna(value) or np.isinf(value))):
                 st.metric(label, "—")
-                return
-            st.metric(label, (fmt % value) if fmt else value)
+            else:
+                st.metric(label, (fmt % value) if fmt else value)
         except Exception:
             st.metric(label, "—")
 
-    if "portfolio" not in st.session_state or st.session_state["portfolio"] is None or len(st.session_state["portfolio"]) == 0:
+    # ---------- Cuerpo Tab ----------
+    pf_raw = st.session_state.get("portfolio", None)
+
+    if pf_raw is None or not isinstance(pf_raw, pd.DataFrame) or pf_raw.empty:
         st.info("Ejecuta el pipeline primero.")
     else:
-        pf = st.session_state["portfolio"].copy()
+        pf = pf_raw.copy()
+        # Garantiza 'sector'
         pf = _ensure_sector(pf)
 
         # ===== MÉTRICAS DE CABECERA =====
         a, b, c, d = st.columns(4)
         with a:
-            _safe_metric("Portfolio Size", len(pf))
+            _safe_metric("Portfolio Size", int(len(pf)))
         with b:
-            _safe_metric("Avg QVM Score", (pf["qvm_score_corrected"].mean() if "qvm_score_corrected" in pf.columns and len(pf) else None), "%.3f")
+            avg_qvm = pf["qvm_score_corrected"].mean() if "qvm_score_corrected" in pf.columns and len(pf) else None
+            _safe_metric("Avg QVM Score", avg_qvm, "%.3f")
         with c:
-            _safe_metric("Avg F-Score", (pf["fscore"].mean() if "fscore" in pf.columns and len(pf) else None), "%.1f/9.0")
+            avg_f = pf["fscore"].mean() if "fscore" in pf.columns and len(pf) else None
+            _safe_metric("Avg F-Score", avg_f, "%.1f/9.0")
         with d:
             _safe_metric("Sectores", (pf["sector"].nunique() if "sector" in pf.columns else None))
 
@@ -541,14 +567,17 @@ with tab2:
 
         # ===== TABLA PRINCIPAL =====
         cols = [
-            "symbol","sector","qvm_score_corrected","final_rank",
-            "quality_extended","value_score","composite_momentum","fscore",
-            "momentum_12m1m","above_ma200","roe","market_cap",
+            "symbol", "companyName", "sector",
+            "qvm_score_corrected", "final_rank",
+            "quality_extended", "value_score", "composite_momentum", "fscore",
+            "momentum_12m1m", "above_ma200", "roe", "market_cap",
         ]
         cols = [c for c in cols if c in pf.columns]
         disp = pf[cols].copy()
 
+        # Renombres amigables
         rename = {
+            "companyName": "Company",
             "qvm_score_corrected": "QVM Score",
             "final_rank": "Rank %ile",
             "quality_extended": "Quality",
@@ -581,7 +610,16 @@ with tab2:
         if "MCap" in disp.columns:
             disp["MCap"] = (pd.to_numeric(disp["MCap"], errors="coerce") / 1e9).round(2)
 
-        # Mostrar tabla
+        # Orden sugerido (si existen)
+        preferred_order = [
+            "symbol", "Company", "sector",
+            "QVM Score", "Rank %ile",
+            "Quality", "Value", "Momentum", "F-Score",
+            "Mom 12M", "MA200✓", "roe", "MCap",
+        ]
+        ordered_cols = [c for c in preferred_order if c in disp.columns] + [c for c in disp.columns if c not in preferred_order]
+        disp = disp[ordered_cols]
+
         st.dataframe(
             disp,
             use_container_width=True,
@@ -597,32 +635,27 @@ with tab2:
 
         # ===== DISTRIBUCIÓN POR SECTOR =====
         st.markdown("#### 📊 Distribución por Sector")
-        needed = {"sector", "symbol"}
-        if needed.issubset(pf.columns):
-            # columnas opcionales para promedios (si no están, se omiten)
-            agg_dict = {"symbol": "count"}
-            if "qvm_score_corrected" in pf.columns:
-                agg_dict["qvm_score_corrected"] = "mean"
-            if "fscore" in pf.columns:
-                agg_dict["fscore"] = "mean"
-            if "momentum_12m1m" in pf.columns:
-                agg_dict["momentum_12m1m"] = "mean"
+        if {"sector", "symbol"}.issubset(pf.columns):
+            agg = {"symbol": "count"}
+            if "qvm_score_corrected" in pf.columns: agg["qvm_score_corrected"] = "mean"
+            if "fscore" in pf.columns:               agg["fscore"] = "mean"
+            if "momentum_12m1m" in pf.columns:      agg["momentum_12m1m"] = "mean"
 
-            sec = pf.groupby("sector").agg(agg_dict).reset_index()
-            # Renombrar amigable
-            rename_sec = {"symbol": "Count"}
-            if "qvm_score_corrected" in sec.columns:
-                rename_sec["qvm_score_corrected"] = "Avg QVM"
-            if "fscore" in sec.columns:
-                rename_sec["fscore"] = "Avg F-Score"
-            if "momentum_12m1m" in sec.columns:
-                rename_sec["momentum_12m1m"] = "Avg Mom"
-            sec.rename(columns=rename_sec, inplace=True)
+            sec = pf.groupby("sector").agg(agg).reset_index()
 
+            # Renombres y formateo
+            rn = {"symbol": "Count"}
+            if "qvm_score_corrected" in sec.columns: rn["qvm_score_corrected"] = "Avg QVM"
+            if "fscore" in sec.columns:               rn["fscore"] = "Avg F-Score"
+            if "momentum_12m1m" in sec.columns:      rn["momentum_12m1m"] = "Avg Mom"
+            sec.rename(columns=rn, inplace=True)
             if "Avg Mom" in sec.columns:
                 sec["Avg Mom"] = (pd.to_numeric(sec["Avg Mom"], errors="coerce") * 100).round(1)
 
-            st.dataframe(sec.sort_values("Count", ascending=False), use_container_width=True)
+            st.dataframe(
+                sec.sort_values("Count", ascending=False),
+                use_container_width=True
+            )
         else:
             st.info("No hay columnas suficientes para agrupar por sector.")
 
@@ -689,35 +722,97 @@ with tab3:
 
 with tab4:
     st.markdown("### 🏆 F-Score Analysis")
-    fscore_data = st.session_state.get("fscore_data")
-    if not isinstance(fscore_data, pd.DataFrame) or fscore_data.empty or "fscore" not in fscore_data.columns:
+
+    df_raw = st.session_state.get("fscore_data")
+    if not isinstance(df_raw, pd.DataFrame) or df_raw.empty:
         st.info("Ejecuta el pipeline con F-Score habilitado.")
     else:
-        avg_f = float(fscore_data["fscore"].mean())
-        hi = int((fscore_data["fscore"] >= 8).sum())
-        mid = int(((fscore_data["fscore"] >= 6) & (fscore_data["fscore"] < 8)).sum())
-        lo = int((fscore_data["fscore"] < 6).sum())
-        a, b, c, d = st.columns(4)
-        with a: st.metric("F-Score Promedio", f"{avg_f:.1f}/9.0")
-        with b: st.metric("High Quality (8-9)", hi)
-        with c: st.metric("Medium (6-7)", mid)
-        with d: st.metric("Low (0-5)", lo)
+        # Copia segura y coerción numérica
+        fdf = df_raw.copy()
+        if "fscore" not in fdf.columns:
+            st.info("No hay columna 'fscore' disponible; ejecuta el pipeline con F-Score.")
+            st.stop()
 
-        hist = fscore_data["fscore"].round(0).value_counts().sort_index().reset_index()
-        hist.columns = ["F-Score","Count"]
-        chart = alt.Chart(hist).mark_bar().encode(
-            x=alt.X("F-Score:O", title="F-Score"),
-            y=alt.Y("Count:Q", title="Número de acciones"),
-            color=alt.condition(alt.datum["F-Score"] >= 6, alt.value("steelblue"), alt.value("lightgray")),
-        ).properties(height=300)
-        st.altair_chart(chart, use_container_width=True)
+        # Asegura numéricos
+        fdf["fscore"] = pd.to_numeric(fdf["fscore"], errors="coerce")
+        for col in ("roe", "fcf", "operating_cf"):
+            if col in fdf.columns:
+                fdf[col] = pd.to_numeric(fdf[col], errors="coerce")
 
-        st.markdown("#### 📋 Stocks by F-Score Category")
-        show_cols = [c for c in ["symbol","fscore","roe","fcf","operating_cf"] if c in fscore_data.columns]
-        tbl = fscore_data[show_cols].copy()
-        tbl["category"] = pd.cut(tbl["fscore"], bins=[-0.1,5.5,7.5,9.1],
-                                 labels=["Low (0-5)","Medium (6-7)","High (8-9)"])
-        st.dataframe(tbl.sort_values("fscore", ascending=False), use_container_width=True, height=420)
+        # Filtra filas válidas para métricas/histograma
+        valid = fdf["fscore"].between(0, 9, inclusive="both")
+        fdf_valid = fdf.loc[valid].copy()
+
+        if fdf_valid.empty:
+            st.info("No hay F-Scores válidos (0–9) para analizar.")
+        else:
+            # ===== Métricas =====
+            avg_f = float(fdf_valid["fscore"].mean())
+            hi  = int((fdf_valid["fscore"] >= 8).sum())
+            mid = int(((fdf_valid["fscore"] >= 6) & (fdf_valid["fscore"] < 8)).sum())
+            lo  = int((fdf_valid["fscore"] < 6).sum())
+
+            a, b, c, d = st.columns(4)
+            with a: st.metric("F-Score Promedio", f"{avg_f:.1f}/9.0")
+            with b: st.metric("High Quality (8–9)", hi)
+            with c: st.metric("Medium (6–7)", mid)
+            with d: st.metric("Low (0–5)", lo)
+
+            # ===== Histograma =====
+            hist = (
+                fdf_valid["fscore"].round(0)
+                .value_counts()
+                .sort_index()
+                .reset_index()
+                .rename(columns={"index": "F-Score", "fscore": "Count"})
+            )
+            # Asegura ejes 0..9 incluso si faltan barras
+            all_bins = pd.DataFrame({"F-Score": list(range(0, 10))})
+            hist = all_bins.merge(hist, on="F-Score", how="left").fillna({"Count": 0})
+
+            chart = alt.Chart(hist).mark_bar().encode(
+                x=alt.X("F-Score:O", title="F-Score"),
+                y=alt.Y("Count:Q", title="Número de acciones"),
+                color=alt.condition(
+                    alt.datum["F-Score"] >= 6,
+                    alt.value("steelblue"),
+                    alt.value("lightgray"),
+                ),
+                tooltip=["F-Score:O", "Count:Q"]
+            ).properties(height=300)
+            st.altair_chart(chart, use_container_width=True)
+
+            # ===== Tabla categorizada =====
+            st.markdown("#### 📋 Stocks by F-Score Category")
+            show_cols = [c for c in ["symbol", "companyName", "fscore", "roe", "fcf", "operating_cf"] if c in fdf_valid.columns]
+            tbl = fdf_valid[show_cols].copy()
+
+            # Categorías (0–5, 6–7, 8–9)
+            tbl["category"] = pd.cut(
+                tbl["fscore"],
+                bins=[-0.1, 5.5, 7.5, 9.1],
+                labels=["Low (0–5)", "Medium (6–7)", "High (8–9)"]
+            )
+
+            # Formato amigable
+            if "roe" in tbl.columns:
+                tbl["roe"] = (pd.to_numeric(tbl["roe"], errors="coerce") * 100).round(1)
+            for col in ("fcf", "operating_cf"):
+                if col in tbl.columns:
+                    tbl[col] = pd.to_numeric(tbl[col], errors="coerce").round(0)
+
+            st.dataframe(
+                tbl.sort_values(["category", "fscore"], ascending=[True, False]),
+                use_container_width=True,
+                height=420,
+                column_config={
+                    "roe": st.column_config.NumberColumn(label="ROE", format="%.1f%%"),
+                    "fcf": st.column_config.NumberColumn(label="FCF", format="%.0f"),
+                    "operating_cf": st.column_config.NumberColumn(label="Operating CF", format="%.0f"),
+                    "fscore": st.column_config.NumberColumn(label="F-Score", format="%.1f"),
+                }
+            )
+
 
 # =============================================================================
 # TAB 5 — BACKTEST

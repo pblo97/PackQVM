@@ -20,6 +20,7 @@ from data_fetcher import (
     fetch_screener,
     fetch_fundamentals_batch,
     fetch_prices,
+    fetch_financial_scores,
 )
 from factor_calculator import compute_all_factors
 from momentum_calculator import (
@@ -180,15 +181,72 @@ def run_optimized_qvm_strategy(
 
     # ---------------- PASO 4: F-Score ----------------
     if verbose:
-        print(f"\n🏆 PASO 4/10: F-Score (>= {config.min_fscore})")
+        print(f"\n🏆 PASO 4/10: F-Score (>= {config.min_fscore}) usando API (fallback si falta)")
 
-    df_for_fscore = passed_filters.merge(fundamentals, on="symbol", how="left")
-    df_for_fscore["fscore"] = calculate_simplified_fscore(df_for_fscore)
-    df_fscore_passed = df_for_fscore[df_for_fscore["fscore"] >= config.min_fscore].copy()
-    _print_stage("F-Score >= umbral", len(df_fscore_passed), total_initial)
+    # Traer scores de FMP para los símbolos vigentes
+    syms_pf = (
+        passed_filters["symbol"]
+        .dropna()
+        .astype(str).str.strip().str.upper()
+        .unique().tolist()
+    )
+
+    scores_df = fetch_financial_scores(syms_pf, use_cache=True)  # cols: symbol, altmanZScore, piotroskiScore, date
+
+    # Para posible fallback necesitamos columnas mínimas de fundamentals
+    _need = ["symbol","roa","net_income","total_assets","operating_cf","fcf","capex"]
+    base_cols = [c for c in _need if c in fundamentals.columns] or ["symbol"]
+
+    df_for_fscore = (
+        passed_filters
+        .merge(fundamentals[base_cols].drop_duplicates("symbol"), on="symbol", how="left")
+        .merge(scores_df, on="symbol", how="left")
+    )
+
+    # Fallback: calcula F-Score simplificado (0..9) cuando no haya piotroskiScore de API
+    df_for_fscore["fscore_calc"] = calculate_simplified_fscore(df_for_fscore)
+
+    # Toma piotroskiScore de API si existe; si no, usa fscore_calc
+    df_for_fscore["fscore"] = np.where(
+        df_for_fscore["piotroskiScore"].notna(),
+        df_for_fscore["piotroskiScore"],
+        df_for_fscore["fscore_calc"]
+    )
+
+    # Guardrail Altman Z (opcional). Si tu config no trae min_altman_z, fija un default conservador.
+    min_altman_z = getattr(config, "min_altman_z", 2.0)
+    if "altmanZScore" in df_for_fscore.columns:
+        z = pd.to_numeric(df_for_fscore["altmanZScore"], errors="coerce")
+        df_for_fscore["pass_altman"] = (z >= min_altman_z) | z.isna()
+    else:
+        df_for_fscore["pass_altman"] = True
+
+    # Filtro final por F-Score y Altman Z
+    df_fscore_passed = df_for_fscore[
+        (pd.to_numeric(df_for_fscore["fscore"], errors="coerce") >= float(config.min_fscore)) &
+        (df_for_fscore["pass_altman"])
+    ].copy()
+
+    # Estadísticas/diagnóstico
+    _print_stage(f"F-Score >= {config.min_fscore}", len(df_fscore_passed), total_initial)
+    if verbose and len(df_fscore_passed) > 0:
+        try:
+            f_avg = pd.to_numeric(df_fscore_passed["fscore"], errors="coerce").mean()
+            f_med = pd.to_numeric(df_fscore_passed["fscore"], errors="coerce").median()
+            print(f"   · F-Score promedio: {f_avg:.1f}/9.0")
+            print(f"   · F-Score mediano : {f_med:.1f}/9.0")
+            if "altmanZScore" in df_for_fscore.columns:
+                acc = df_fscore_passed["altmanZScore"].notna().mean()
+                print(f"   · Altman Z coverage: {acc:.0%}")
+                if hasattr(config, 'min_altman_z'):
+                    print(f"   · Guardrail Altman Z ≥ {config.min_altman_z:.1f}")
+                else:
+                    print(f"   · Guardrail Altman Z ≥ {min_altman_z:.1f} (default)")
+        except Exception:
+            pass
 
     if df_fscore_passed.empty:
-        return {"error": f"No symbols with F-Score >= {config.min_fscore}"}
+        return {"error": f"No symbols with F-Score >= {config.min_fscore} (and Altman Z ≥ {min_altman_z:.1f})"}
 
     # ---------------- PASO 5: Precios ----------------
     if verbose:

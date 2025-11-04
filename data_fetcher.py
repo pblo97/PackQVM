@@ -320,6 +320,63 @@ def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True) -> p
     df = df.dropna(subset=["date","close"]).sort_values("date")
     return df[["date","close"]].reset_index(drop=True)
 
+def fetch_financial_scores(symbols: list[str], use_cache: bool = True) -> pd.DataFrame:
+    """
+    Llama a FMP /stable/financial-scores y retorna SIEMPRE columnas normalizadas:
+      ['symbol','altmanZScore','piotroskiScore','date']
+    - Si hay múltiples filas por símbolo, conserva la MÁS RECIENTE por 'date'
+    - 'symbol' upper/strip
+    """
+    if not symbols:
+        return pd.DataFrame(columns=["symbol","altmanZScore","piotroskiScore","date"])
+
+    # FMP acepta múltiples símbolos en una sola query (separa por coma).
+    # Para listas largas: chunkea (p.ej., 100 por request).
+    out = []
+    chunk_size = 100
+    ttl = 900 if use_cache else None
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i:i+chunk_size]
+        params = {"symbol": ",".join(chunk)}
+        data = _http_get("stable/financial-scores", params=params, ttl=ttl)
+        if isinstance(data, list) and data:
+            out.extend(data)
+
+    if not out:
+        return pd.DataFrame(columns=["symbol","altmanZScore","piotroskiScore","date"])
+
+    df = pd.DataFrame(out)
+
+    # Normalizar columnas esperadas
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    else:
+        df["symbol"] = pd.NA
+
+    # Coerce numéricas
+    for col in ["altmanZScore", "piotroskiScore"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = pd.NA
+
+    # Fecha (si existe)
+    if "date" not in df.columns:
+        df["date"] = pd.NaT
+    else:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    # Mantener SOLO la fila más reciente por símbolo
+    df = df.sort_values(["symbol","date"], ascending=[True, False])
+    df = df.drop_duplicates("symbol", keep="first").reset_index(drop=True)
+
+    # Solo columnas útiles (con default si faltan)
+    keep = ["symbol","altmanZScore","piotroskiScore","date"]
+    for k in keep:
+        if k not in df.columns:
+            df[k] = pd.NA
+
+    return df[keep]
 
 # -----------------------------------------------------------------------------
 # Prueba rápida
