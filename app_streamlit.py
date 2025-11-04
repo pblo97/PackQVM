@@ -327,24 +327,38 @@ if run_btn:
         # ---------------------------------------------------------------------
         # PASO 4: F-SCORE (Forma B ya alias)
         # ---------------------------------------------------------------------
-        if use_fscore:
-            status_text.text("🏆 Paso 4/8: Calculando F-Score...")
-            progress_bar.progress(40)
-            
-            df_for_fscore = passed_filters.merge(fundamentals, on='symbol', how='left')
-            df_for_fscore['fscore'] = calculate_simplified_fscore(df_for_fscore)
-            
-            df_fscore_passed = df_for_fscore[df_for_fscore['fscore'] >= min_fscore].copy()
-            
-            st.session_state['fscore_data'] = df_for_fscore
-            st.session_state['fscore_passed'] = df_fscore_passed
-            
-            if df_fscore_passed.empty:
-                st.error(f"❌ Ningún símbolo con F-Score >= {min_fscore}")
-                st.stop()
-        else:
-            df_fscore_passed = passed_filters.copy()
-            st.session_state['fscore_passed'] = df_fscore_passed
+        # PASO 4: F-SCORE
+        status_text.text("🏆 Paso 4/8: Calculando F-Score...")
+        progress_bar.progress(40)
+
+        # columnas que nos gustaría tener para mostrar y/o calcular
+        fcols = ["symbol","roe","fcf","operating_cf","capex","roa","net_income","total_assets"]
+
+        # merge con fundamentales pero solo columnas disponibles
+        base_cols = [c for c in fcols if c in fundamentals.columns] or ["symbol"]
+        df_for_fscore = passed_filters.merge(
+            fundamentals[base_cols].drop_duplicates("symbol"),
+            on="symbol", how="left"
+        )
+
+        # garantiza columnas esperadas para que no falle más adelante
+        for c in ["roe","fcf","operating_cf"]:
+            if c not in df_for_fscore.columns:
+                df_for_fscore[c] = np.nan
+
+        # calcula fscore simplificado
+        df_for_fscore["fscore"] = calculate_simplified_fscore(df_for_fscore)
+
+        # aplica umbral si está activo
+        df_fscore_passed = df_for_fscore[df_for_fscore["fscore"] >= min_fscore].copy()
+
+        st.session_state["fscore_data"] = df_for_fscore
+        st.session_state["fscore_passed"] = df_fscore_passed
+
+        if df_fscore_passed.empty:
+            st.error(f"❌ Ningún símbolo con F-Score >= {min_fscore}")
+            st.stop()
+
         
         # ---------------------------------------------------------------------
         # PASO 5: DESCARGAR PRECIOS
@@ -778,64 +792,55 @@ with tab3:
 # TAB 4: F-SCORE ANALYSIS
 # ============================================================================
 
-with tab4:
-    st.markdown("### 🏆 F-Score Analysis")
-    
-    if 'fscore_data' not in st.session_state:
-        st.info("Ejecuta el pipeline con F-Score habilitado")
+# TAB 4: F-Score Analysis
+st.markdown("### 🏆 F-Score Analysis")
+
+if 'fscore_data' not in st.session_state:
+    st.info("Ejecuta el pipeline con F-Score habilitado")
+else:
+    fscore_data = st.session_state['fscore_data'].copy()
+
+    # Métricas
+    if "fscore" in fscore_data.columns and not fscore_data["fscore"].empty:
+        avg_fscore = fscore_data["fscore"].mean()
+        high_quality = (fscore_data["fscore"] >= 8).sum()
+        medium_quality = ((fscore_data["fscore"] >= 6) & (fscore_data["fscore"] < 8)).sum()
+        low_quality = (fscore_data["fscore"] < 6).sum()
     else:
-        fscore_data = st.session_state['fscore_data']
-        
-        # Distribución de F-Score
-        st.markdown("#### 📊 F-Score Distribution")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            avg_fscore = fscore_data['fscore'].mean()
-            st.metric("F-Score Promedio", f"{avg_fscore:.1f}/9.0")
-        
-        with col2:
-            high_quality = (fscore_data['fscore'] >= 8).sum()
-            st.metric("High Quality (8-9)", high_quality)
-        
-        with col3:
-            medium_quality = ((fscore_data['fscore'] >= 6) & (fscore_data['fscore'] < 8)).sum()
-            st.metric("Medium Quality (6-7)", medium_quality)
-        
-        with col4:
-            low_quality = (fscore_data['fscore'] < 6).sum()
-            st.metric("Low Quality (0-5)", low_quality)
-        
-        # Histograma
-        hist_df = fscore_data['fscore'].value_counts().reset_index()
-        hist_df.columns = ['F-Score', 'Count']
-        
+        avg_fscore = np.nan; high_quality = medium_quality = low_quality = 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1: st.metric("F-Score Promedio", f"{avg_fscore:.1f}/9.0" if pd.notna(avg_fscore) else "—")
+    with col2: st.metric("High Quality (8-9)", int(high_quality))
+    with col3: st.metric("Medium (6-7)", int(medium_quality))
+    with col4: st.metric("Low (0-5)", int(low_quality))
+
+    # Histograma seguro
+    if "fscore" in fscore_data.columns:
+        hist_df = fscore_data["fscore"].round(0).value_counts().sort_index().reset_index()
+        hist_df.columns = ["F-Score","Count"]
         hist_chart = alt.Chart(hist_df).mark_bar().encode(
             x=alt.X('F-Score:O', title='F-Score'),
             y=alt.Y('Count:Q', title='Number of Stocks'),
-            color=alt.condition(
-                alt.datum['F-Score'] >= 6,
-                alt.value('steelblue'),
-                alt.value('lightgray')
-            )
+            color=alt.condition(alt.datum['F-Score'] >= 6, alt.value('steelblue'), alt.value('lightgray'))
         ).properties(height=300)
-        
         st.altair_chart(hist_chart, use_container_width=True)
-        
-        # Tabla por categoría
-        st.markdown("#### 📋 Stocks by F-Score Category")
-        
-        fscore_display = fscore_data[['symbol', 'fscore', 'roe', 'fcf', 'operating_cf']].copy()
-        fscore_display['category'] = pd.cut(
-            fscore_display['fscore'],
+
+    # Tabla segura (solo columnas disponibles)
+    st.markdown("#### 📋 Stocks by F-Score Category")
+    show_cols = ["symbol","fscore","roe","fcf","operating_cf"]
+    existing_cols = [c for c in show_cols if c in fscore_data.columns]
+    if "fscore" in existing_cols:
+        fscore_display = fscore_data[existing_cols].copy()
+        fscore_display["category"] = pd.cut(
+            fscore_display["fscore"],
             bins=[0, 5.5, 7.5, 9],
-            labels=['Low (0-5)', 'Medium (6-7)', 'High (8-9)']
+            labels=['Low (0-5)','Medium (6-7)','High (8-9)']
         )
-        
-        fscore_display = fscore_display.sort_values('fscore', ascending=False)
-        
-        st.dataframe(fscore_display, use_container_width=True, height=400)
+        st.dataframe(fscore_display.sort_values("fscore", ascending=False),
+                     use_container_width=True, height=400)
+    else:
+        st.info("No hay datos de F-Score para mostrar.")
 
 
 # ============================================================================
