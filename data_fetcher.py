@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 import pandas as pd
+import numpy as np
 
 # -----------------------------------------------------------------------------
 # Config
@@ -145,102 +146,147 @@ def fetch_screener(
     limit: int = 300,
     mcap_min: float = 2e9,
     volume_min: int = 1_000_000,
-    use_cache: bool = True
+    use_cache: bool = True,
+    enrich_with_profile: bool = True,   # ← enriquecer sector/industry desde Company Profile (bulk)
+    profile_page_size: int = 100,       # ← tamaño de lote para bulk
 ) -> pd.DataFrame:
     """
-    Usa /stock-screener (FMP) y devuelve SIEMPRE columnas normalizadas:
+    Trae universo desde /stock-screener (FMP) y garantiza columnas normalizadas:
       ['symbol','companyName','sector','market_cap','price','volume']
 
-    - sector: mapeado desde varias variantes posibles; fallback "Unknown"
+    - sector: se toma de la primera columna disponible: sector → sectorName → industry → industryTitle → subSector
+    - Si enrich_with_profile=True, completa/corrige 'sector' (y añade 'industry' internamente) usando Company Profile (bulk).
     - symbol: uppercase y sin espacios
     """
+    # ---------------- Screener base ----------------
     params = {
         "limit": int(limit),
         "marketCapMoreThan": float(mcap_min),
         "volumeMoreThan": int(volume_min),
-        # puedes agregar filtros opcionales: betaMoreThan, country, exchange, etc.
     }
     ttl = 900 if use_cache else None
     data = _http_get("stock-screener", params=params, ttl=ttl)
 
+    cols_final = ["symbol", "companyName", "sector", "market_cap", "price", "volume"]
     if not isinstance(data, list) or len(data) == 0:
-        return pd.DataFrame(columns=["symbol","companyName","sector","market_cap","price","volume"])
+        return pd.DataFrame(columns=cols_final)
 
     df = pd.DataFrame(data)
 
-    # --- Normalización de nombres base (cuando existen) ---
-    # FMP suele traer marketCap / price / volume / companyName / sector
+    # ---------------- Normalización rápida ----------------
     rename = {
         "marketCap": "market_cap",
-        "companyName": "companyName",
         "price": "price",
         "volume": "volume",
+        "companyName": "companyName",
+        "company": "companyName",  # fallback
         "symbol": "symbol",
-        # "sector": "sector"  # se maneja aparte con fallback inteligente
     }
-    for src, dst in rename.items():
-        if src in df.columns and src != dst:
-            df.rename(columns={src: dst}, inplace=True)
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
 
-    # --- Symbol limpio ---
-    if "symbol" in df.columns:
-        df["symbol"] = (
-            df["symbol"]
-            .astype(str)
-            .str.strip()
-            .str.upper()
-        )
-    else:
-        # Sin symbol no hay nada que hacer…
-        return pd.DataFrame(columns=["symbol","companyName","sector","market_cap","price","volume"])
+    # Symbol limpio (si no hay, no sirve el registro)
+    if "symbol" not in df.columns:
+        return pd.DataFrame(columns=cols_final)
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    df = df[df["symbol"].ne("")].drop_duplicates("symbol")
 
-    # --- Sector robusto: tomar primera columna disponible ---
-    # Orden de preferencia: 'sector' -> 'sectorName' -> 'industry' -> 'industryTitle' -> 'subSector'
-    sector_col = None
-    for cand in ["sector", "sectorName", "industry", "industryTitle", "subSector"]:
-        if cand in df.columns:
-            sector_col = cand
-            break
+    # ---------------- Sector “mejor esfuerzo” desde screener ----------------
+    sector_cands = [ "sector", "sectorName", "industry", "industryTitle", "subSector" ]
+    first_sector_col = next((c for c in sector_cands if c in df.columns), None)
 
-    if sector_col is None:
-        # crea columna sector si no existe ninguna fuente
-        df["sector"] = "Unknown"
-    else:
-        # copia y normaliza a string no nulo
-        df["sector"] = (
-            df[sector_col]
+    if first_sector_col is not None:
+        sec = (
+            df[first_sector_col]
             .astype(str)
             .str.strip()
             .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
-            .fillna("Unknown")
         )
+        df["sector"] = sec.fillna("Unknown")
+    else:
+        df["sector"] = "Unknown"
 
-    # --- market_cap / price / volume numéricos ---
-    for col, target in [
-        ("market_cap", "market_cap"),
-        ("price", "price"),
-        ("volume", "volume"),
-    ]:
-        if col in df.columns:
-            df[target] = pd.to_numeric(df[col], errors="coerce")
-        else:
-            df[target] = pd.NA
+    # numéricos
+    for c in ("market_cap", "price", "volume"):
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
 
-    # --- companyName opcional pero útil para UI ---
+    # companyName siempre presente (para UI)
     if "companyName" not in df.columns:
-        # algunos endpoints traen 'companyName', otros 'company'
-        if "company" in df.columns:
-            df["companyName"] = df["company"]
-        else:
-            df["companyName"] = pd.NA
+        df["companyName"] = pd.NA
 
-    # --- Selección y limpieza final ---
-    keep = ["symbol", "companyName", "sector", "market_cap", "price", "volume"]
+    # ---------------- Enriquecimiento opcional con Profile (bulk) ----------------
+    if enrich_with_profile:
+        # prefiltrar solo símbolos que aún están Unknown o NaN
+        need_enrich_mask = df["sector"].isna() | (df["sector"] == "Unknown")
+        if need_enrich_mask.any():
+            syms = df.loc[need_enrich_mask, "symbol"].unique().tolist()
+
+            profiles = []
+            if syms:
+                # paginar en tandas
+                for i in range(0, len(syms), profile_page_size):
+                    chunk = syms[i : i + profile_page_size]
+                    # Endpoint típico de FMP para perfiles en bulk (ajústalo a tu helper si usas otro path)
+                    # Muchas integraciones usan /profile/{comma-separated}, aquí lo dejamos como generic op:
+                    p = {"symbols": ",".join(chunk)}
+                    prof_data = _http_get("profile-bulk", params=p, ttl=ttl)  # <-- adapta el endpoint si tu helper usa otro
+                    if isinstance(prof_data, list) and prof_data:
+                        profiles.extend(prof_data)
+
+            if profiles:
+                prof_df = pd.DataFrame(profiles)
+                # normalizar columnas esperadas de profile
+                prof_rename = {
+                    "symbol": "symbol",
+                    "companyName": "companyName",
+                    "sector": "sector_p",
+                    "industry": "industry_p",
+                }
+                prof_df = prof_df.rename(columns={k: v for k, v in prof_rename.items() if k in prof_df.columns})
+                if "symbol" in prof_df.columns:
+                    prof_df["symbol"] = prof_df["symbol"].astype(str).str.strip().str.upper()
+                    # Reducir a columnas útiles
+                    keep_prof = ["symbol"]
+                    if "sector_p" in prof_df.columns:   keep_prof.append("sector_p")
+                    if "industry_p" in prof_df.columns: keep_prof.append("industry_p")
+                    prof_df = prof_df[keep_prof].drop_duplicates("symbol")
+
+                    # merge left para completar sector Unknown
+                    df = df.merge(prof_df, on="symbol", how="left")
+
+                    # Completar sector con profile si está Unknown/NaN
+                    if "sector_p" in df.columns:
+                        df["sector"] = np.where(
+                            df["sector"].isna() | (df["sector"] == "Unknown"),
+                            df["sector_p"],
+                            df["sector"],
+                        )
+                        # limpieza final
+                        df["sector"] = (
+                            df["sector"]
+                            .astype(str)
+                            .str.strip()
+                            .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+                            .fillna("Unknown")
+                        )
+
+                    # (opcional) podrías guardar también industry para diagnósticos internos
+                    # df["industry"] = df.get("industry", df.get("industry_p"))
+
+                    # limpiar columnas auxiliares
+                    for aux in ("sector_p", "industry_p"):
+                        if aux in df.columns:
+                            df.drop(columns=aux, inplace=True)
+
+    # ---------------- Salida canonizada ----------------
     out = (
-        df[keep]
+        df[["symbol", "companyName", "sector", "market_cap", "price", "volume"]]
         .dropna(subset=["symbol"])
         .drop_duplicates("symbol")
         .reset_index(drop=True)
+    )
+    # Asegura no-nulos básicos
+    out["sector"] = (
+        out["sector"].astype(str).str.strip().replace({"": "Unknown"}).fillna("Unknown")
     )
 
     return out
