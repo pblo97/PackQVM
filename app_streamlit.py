@@ -33,7 +33,7 @@ import altair as alt
 from data_fetcher import (
     fetch_screener,
     fetch_fundamentals_batch,
-    fetch_prices_daily,   # ← usamos daily con lookback
+    fetch_prices,   # ← usamos daily con lookback
 )
 
 from factor_calculator import compute_all_factors
@@ -86,23 +86,19 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .5rem 0; }
 # CACHÉ DE ESTADO (wrappers simplificados)
 # ============================================================================
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def cached_screener(limit: int, mcap_min: float, volume_min: int):
-    """Caché del screener (memo en sesión; data_fetcher ya usa caché a disco)."""
-    return fetch_screener(limit=limit, mcap_min=mcap_min, volume_min=volume_min)
 
-@st.cache_data(ttl=3600, show_spinner=False)
+
+@st.cache_data(ttl=3600)
+def cached_screener(limit, mcap_min, volume_min):
+    return fetch_screener(limit, mcap_min, volume_min, use_cache=True)
+
+@st.cache_data(ttl=3600)
 def cached_fundamentals(symbols: tuple):
-    """Caché de fundamentales."""
-    return fetch_fundamentals_batch(list(symbols))
+    return fetch_fundamentals_batch(list(symbols), use_cache=True)
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def cached_prices(symbol: str, start: str, end: str):
-    """
-    Caché de precios individuales.
-    Ignora start/end y pide ~800 días (~3 años bursátiles) con fetch_prices_daily.
-    """
-    return fetch_prices_daily(symbol, lookback_days=800)
+@st.cache_data(ttl=1800)
+def cached_prices(symbol, start, end):
+    return fetch_prices(symbol, start, end, use_cache=True)
 
 def clear_cache():
     """

@@ -1,22 +1,19 @@
+# data_fetcher.py
 """
-Data Fetcher - FMP client con rate limiting y caché
-===================================================
-
-Funciones públicas:
-- fetch_screener(limit, mcap_min, volume_min)
-- fetch_fundamentals_batch(symbols)
-- fetch_prices_daily(symbol, lookback_days=800)
-
-Requiere: export FMP_API_KEY=<tu_api_key>
+Data Fetcher - Módulo limpio desde cero
+========================================
+Responsabilidad única: Descargar datos desde FMP con rate limiting y caché.
+Variables de entorno:
+- FMP_API_KEY (obligatoria)
 """
 
 from __future__ import annotations
 import os
-import time
 import json
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timedelta
+import time
+import hashlib
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import requests
 import pandas as pd
@@ -26,337 +23,259 @@ import pandas as pd
 # -----------------------------------------------------------------------------
 FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
 BASE = "https://financialmodelingprep.com/api/v3"
-CACHE_DIR = Path(".cache/fmp")
+CACHE_DIR = Path(".cache_fmp")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Rate limiting simple (respetuoso)
-_MIN_INTERVAL = 0.15  # ~6-7 req/s
-_last_call_ts = 0.0
+# Ajusta a tu plan FMP (en seg por request)
+_MIN_INTERVAL = 0.15  # ~6–7 req/seg (360–420 rpm)
 _session = requests.Session()
-
-
-def _rate_limit():
-    global _last_call_ts
-    now = time.time()
-    dt = now - _last_call_ts
-    if dt < _MIN_INTERVAL:
-        time.sleep(_MIN_INTERVAL - dt)
-    _last_call_ts = time.time()
+_last_call = 0.0
 
 
 # -----------------------------------------------------------------------------
 # Utilidades de caché
 # -----------------------------------------------------------------------------
-def _cache_path(namespace: str, key: str) -> Path:
-    safe = key.replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_").replace(",", "_")
-    return CACHE_DIR / f"{namespace}__{safe}.json"
+def _cache_key(endpoint: str, params: Dict) -> Path:
+    payload = json.dumps({"endpoint": endpoint, "params": params}, sort_keys=True)
+    h = hashlib.sha256(payload.encode()).hexdigest()
+    return CACHE_DIR / f"{h}.json"
 
-
-def _cache_load(namespace: str, key: str, max_age_sec: int) -> Optional[dict]:
-    p = _cache_path(namespace, key)
-    if not p.exists():
+def _cache_get(endpoint: str, params: Dict, ttl: int | None) -> Optional[dict | list]:
+    if ttl is None:
+        return None
+    fp = _cache_key(endpoint, params)
+    if not fp.exists():
+        return None
+    age = time.time() - fp.stat().st_mtime
+    if age > ttl:
         return None
     try:
-        if time.time() - p.stat().st_mtime > max_age_sec:
-            return None
-        with p.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(fp.read_text(encoding="utf-8"))
     except Exception:
         return None
 
-
-def _cache_save(namespace: str, key: str, obj: dict) -> None:
-    p = _cache_path(namespace, key)
+def _cache_put(endpoint: str, params: Dict, data: dict | list) -> None:
+    fp = _cache_key(endpoint, params)
     try:
-        with p.open("w", encoding="utf-8") as f:
-            json.dump(obj, f)
+        fp.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
 
+def clear_cache() -> None:
+    for p in CACHE_DIR.glob("*.json"):
+        p.unlink(missing_ok=True)
+
 
 # -----------------------------------------------------------------------------
-# HTTP helper
+# Llamadas HTTP con rate limiting
 # -----------------------------------------------------------------------------
-def _http_get(path: str, params: Optional[Dict] = None, cache_ns: str = "", cache_key: str = "", max_age_sec: int = 3600):
+def _rate_limit():
+    global _last_call
+    now = time.time()
+    wait = _MIN_INTERVAL - (now - _last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call = time.time()
+
+def _http_get(endpoint: str, params: Optional[Dict] = None, ttl: int | None = 600) -> dict | list:
+    """
+    GET con rate limiting y caché por (endpoint, params, apikey)
+    """
     if not FMP_API_KEY:
-        raise RuntimeError("FMP_API_KEY no configurada en el entorno")
+        raise RuntimeError("FMP_API_KEY no configurada")
 
     params = dict(params or {})
     params["apikey"] = FMP_API_KEY
 
-    if cache_ns and cache_key:
-        hit = _cache_load(cache_ns, cache_key, max_age_sec)
-        if hit is not None:
-            return hit
+    # caché
+    cached = _cache_get(endpoint, params, ttl)
+    if cached is not None:
+        return cached
 
     _rate_limit()
-    url = f"{BASE}/{path.lstrip('/')}"
-    r = _session.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-
-    if cache_ns and cache_key:
-        _cache_save(cache_ns, cache_key, data)
-    return data
-
-
-# -----------------------------------------------------------------------------
-# Normalizadores
-# -----------------------------------------------------------------------------
-def _to_float(x):
+    url = f"{BASE}/{endpoint.lstrip('/')}"
     try:
-        return float(x)
-    except Exception:
-        return None
-
-
-def _clean_sector(x: Optional[str]) -> Optional[str]:
-    if not x:
-        return None
-    return str(x).strip()
+        r = _session.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        _cache_put(endpoint, params, data)
+        return data
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"FMP error: {e}") from e
 
 
 # -----------------------------------------------------------------------------
 # Screener
 # -----------------------------------------------------------------------------
-def fetch_screener(limit: int = 300, mcap_min: float = 2e9, volume_min: int = 1_000_000) -> pd.DataFrame:
+def fetch_screener(limit: int = 300, mcap_min: float = 2e9, volume_min: int = 1_000_000, use_cache: bool = True) -> pd.DataFrame:
     """
-    Devuelve un universo con columnas mínimas: symbol, sector, market_cap
-    Usamos /stock-screener para filtrar por marketCap y volumen.
+    Usa /stock-screener (FMP) y devuelve columnas:
+      symbol, companyName, sector, market_cap, price, volume
     """
-    # FMP stock-screener admite filtros; usamos un rango amplio y filtramos localmente
     params = {
-        "marketCapMoreThan": int(max(mcap_min, 0)),
-        "volumeMoreThan": int(max(volume_min, 0)),
-        "limit": int(limit * 2),  # pedimos más y luego recortamos
-        "exchange": "",           # all exchanges
-        "isEtf": "false",
-        "isActivelyTrading": "true",
+        "limit": int(limit),
+        "marketCapMoreThan": float(mcap_min),
+        "volumeMoreThan": int(volume_min),
+        # puedes agregar: "betaMoreThan", "country", etc.
     }
-    raw = _http_get(
-        "stock-screener",
-        params=params,
-        cache_ns="screener",
-        cache_key=f"mcap_{int(mcap_min)}_vol_{int(volume_min)}_limit_{int(limit)}",
-        max_age_sec=3600,
-    )
+    ttl = 900 if use_cache else None
+    data = _http_get("stock-screener", params=params, ttl=ttl)
+    if not isinstance(data, list) or len(data) == 0:
+        return pd.DataFrame(columns=["symbol","sector","market_cap","price","volume"])
 
-    rows = []
-    for it in raw or []:
-        sym = it.get("symbol")
-        if not sym:
-            continue
-        rows.append({
-            "symbol": sym,
-            "sector": _clean_sector(it.get("sector")),
-            "market_cap": _to_float(it.get("marketCap")),
-            "price": _to_float(it.get("price")),
-            "volume": int(it.get("volume") or 0),
-        })
+    df = pd.DataFrame(data)
+    # normaliza nombres
+    rename = {
+        "marketCap": "market_cap",
+        "companyName": "companyName",
+        "sector": "sector",
+        "price": "price",
+        "volume": "volume",
+        "symbol": "symbol",
+    }
+    for k, v in rename.items():
+        if k in df.columns:
+            df.rename(columns={k: v}, inplace=True)
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # Filtrado local por si el endpoint devolvió más
-    df = df.sort_values("market_cap", ascending=False)
-    df = df.head(limit).reset_index(drop=True)
-
-    # Fallback de sector si está vacío → intentamos /profile (light cache)
-    if df["sector"].isna().any():
-        missing = df[df["sector"].isna()]["symbol"].tolist()[:50]  # no saturar
-        for s in missing:
-            try:
-                prof = _http_get(
-                    f"profile/{s}",
-                    cache_ns="profile",
-                    cache_key=s,
-                    max_age_sec=24 * 3600,
-                )
-                if isinstance(prof, list) and prof:
-                    sec = _clean_sector(prof[0].get("sector"))
-                    if sec:
-                        df.loc[df["symbol"] == s, "sector"] = sec
-            except Exception:
-                pass
-
+    keep = [c for c in ["symbol","companyName","sector","market_cap","price","volume"] if c in df.columns]
+    df = df[keep].dropna(subset=["symbol"]).drop_duplicates("symbol").reset_index(drop=True)
     return df
 
 
 # -----------------------------------------------------------------------------
-# Fundamentales (batch)
+# Fundamentales (TTM)
 # -----------------------------------------------------------------------------
-def _fetch_ratios(symbol: str) -> dict:
-    # ratios TTM: PE, PB, EV/EBITDA (evEbitda)
-    data = _http_get(
-        f"ratios-ttm/{symbol}",
-        cache_ns="ratios_ttm",
-        cache_key=symbol,
-        max_age_sec=24 * 3600,
-    )
+def _get_key_metrics_ttm(symbol: str, use_cache: bool = True) -> Dict:
+    # ROIC, ROE, ratios TTM
+    ttl = 3600 if use_cache else None
+    data = _http_get(f"key-metrics-ttm/{symbol}", params={}, ttl=ttl)
     if isinstance(data, list) and data:
-        d = data[0]
-        return {
-            "pe": _to_float(d.get("priceEarningsRatioTTM")),
-            "pb": _to_float(d.get("priceToBookRatioTTM")),
-            "ev_ebitda": _to_float(d.get("enterpriseValueOverEBITDATTM")),
-        }
+        return data[0]
     return {}
 
-
-def _fetch_key_metrics(symbol: str) -> dict:
-    # key-metrics TTM: ROE, ROIC, grossMarginTTM, etc.
-    data = _http_get(
-        f"key-metrics-ttm/{symbol}",
-        cache_ns="keymetrics_ttm",
-        cache_key=symbol,
-        max_age_sec=24 * 3600,
-    )
+def _get_ratios_ttm(symbol: str, use_cache: bool = True) -> Dict:
+    # Margen bruto, PE, PB
+    ttl = 3600 if use_cache else None
+    data = _http_get(f"ratios-ttm/{symbol}", params={}, ttl=ttl)
     if isinstance(data, list) and data:
-        d = data[0]
-        return {
-            "roe": _to_float(d.get("roeTTM")),
-            "roic": _to_float(d.get("roicTTM")),
-            "gross_margin": _to_float(d.get("grossProfitMarginTTM")),
-        }
+        return data[0]
     return {}
 
-
-def _fetch_cashflow_ttm(symbol: str) -> dict:
-    # operatingCF TTM y CAPEX TTM para aproximar FCF
-    data = _http_get(
-        f"cash-flow-statement-ttm/{symbol}",
-        cache_ns="cf_ttm",
-        cache_key=symbol,
-        max_age_sec=24 * 3600,
-    )
+def _get_enterprise_values(symbol: str, use_cache: bool = True) -> Dict:
+    # EV/EBITDA TTM (a veces viene mejor en key-metrics-ttm; esto es backup)
+    ttl = 3600 if use_cache else None
+    data = _http_get(f"enterprise-values/{symbol}", params={"limit": 1}, ttl=ttl)
     if isinstance(data, list) and data:
-        d = data[0]
-        ocf = _to_float(d.get("operatingCashFlowTTM"))
-        capex = _to_float(d.get("capitalExpenditureTTM"))
-        fcf = None
-        if ocf is not None and capex is not None:
-            fcf = ocf - capex
-        return {
-            "operating_cf": ocf,
-            "capex": capex,
-            "fcf": fcf,
-        }
+        return data[0]
     return {}
 
+def _get_cashflow_ttm(symbol: str, use_cache: bool = True) -> Dict:
+    # OCF y FCF TTM
+    ttl = 3600 if use_cache else None
+    data = _http_get(f"cash-flow-statement-ttm/{symbol}", params={}, ttl=ttl)
+    if isinstance(data, list) and data:
+        return data[0]
+    return {}
 
-def fetch_fundamentals_batch(symbols: List[str]) -> pd.DataFrame:
+def fetch_fundamentals_batch(symbols: List[str], use_cache: bool = True) -> pd.DataFrame:
     """
-    Devuelve DataFrame con columnas:
-    symbol, ev_ebitda, pb, pe, roe, roic, gross_margin, fcf, operating_cf
+    Devuelve DataFrame con columnas estandarizadas:
+      symbol, ev_ebitda, pb, pe, roe, roic, gross_margin, fcf, operating_cf
     """
-    symbols = [s for s in (symbols or []) if isinstance(s, str)]
-    out_rows: List[Dict] = []
+    rows: List[Dict] = []
+    syms = [s for s in (symbols or []) if isinstance(s, str)]
+    for sym in syms:
+        sym = sym.strip().upper()
+        try:
+            km = _get_key_metrics_ttm(sym, use_cache)
+            rt = _get_ratios_ttm(sym, use_cache)
+            cf = _get_cashflow_ttm(sym, use_cache)
 
-    for s in symbols:
-        row = {"symbol": s}
-        try:
-            row.update(_fetch_ratios(s))
-        except Exception:
-            pass
-        try:
-            row.update(_fetch_key_metrics(s))
-        except Exception:
-            pass
-        try:
-            row.update(_fetch_cashflow_ttm(s))
-        except Exception:
-            pass
-        out_rows.append(row)
+            # Fuentes:
+            # - key-metrics-ttm: returnOnEquityTTM, returnOnInvestedCapitalTTM, enterpriseValueOverEBITDATTM
+            # - ratios-ttm: priceEarningsRatioTTM, priceToBookRatioTTM, grossProfitMarginTTM
+            # - cash-flow-statement-ttm: operatingCashFlowTTM, freeCashFlowTTM
 
-    df = pd.DataFrame(out_rows).drop_duplicates(subset=["symbol"])
+            row = {
+                "symbol": sym,
+                "ev_ebitda": float(km.get("enterpriseValueOverEBITDATTM") or rt.get("enterpriseValueOverEBITDATTM") or "nan"),
+                "pb": float(rt.get("priceToBookRatioTTM") or "nan"),
+                "pe": float(rt.get("priceEarningsRatioTTM") or "nan"),
+                "roe": float(km.get("returnOnEquityTTM") or rt.get("returnOnEquityTTM") or "nan"),
+                "roic": float(km.get("returnOnInvestedCapitalTTM") or "nan"),
+                "gross_margin": float(rt.get("grossProfitMarginTTM") or "nan"),
+                "operating_cf": float(cf.get("operatingCashFlowTTM") or "nan"),
+                "fcf": float(cf.get("freeCashFlowTTM") or "nan"),
+            }
+            rows.append(row)
+        except Exception:
+            # Si algo falla para un símbolo, empuja NaNs pero no detiene batch
+            rows.append({
+                "symbol": sym, "ev_ebitda": float("nan"), "pb": float("nan"), "pe": float("nan"),
+                "roe": float("nan"), "roic": float("nan"), "gross_margin": float("nan"),
+                "operating_cf": float("nan"), "fcf": float("nan"),
+            })
+
+    df = pd.DataFrame(rows).drop_duplicates("symbol")
     return df
 
 
 # -----------------------------------------------------------------------------
 # Precios diarios
 # -----------------------------------------------------------------------------
-def fetch_prices_daily(symbol: str, lookback_days: int = 800) -> pd.DataFrame:
+def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True) -> pd.DataFrame:
     """
-    Devuelve OHLCV diario (DataFrame) con al menos 'date' y 'close'.
-    Intenta traer ~lookback_days hacia atrás.
+    Devuelve DataFrame con columnas ['date','close'] en orden ascendente.
+    Usa /historical-price-full?from=&to=&serietype=line
     """
-    # FMP historical-price-full admite "serietype=line" para más compacto
-    params = {
-        "serietype": "line"
-    }
-    data = _http_get(
-        f"historical-price-full/{symbol}",
-        params=params,
-        cache_ns="prices",
-        cache_key=f"{symbol}_line",
-        max_age_sec=6 * 3600,
-    )
-
-    hist = (data or {}).get("historical") or []
+    params = {"from": start, "to": end, "serietype": "line"}
+    ttl = 3600 if use_cache else None
+    data = _http_get(f"historical-price-full/{symbol}", params=params, ttl=ttl)
+    hist = (data or {}).get("historical", [])
     if not hist:
-        # fallback OHLC completo (más pesado)
-        data2 = _http_get(
-            f"historical-price-full/{symbol}",
-            params={},
-            cache_ns="prices",
-            cache_key=f"{symbol}_full",
-            max_age_sec=6 * 3600,
-        )
-        hist = (data2 or {}).get("historical") or []
-
-    if not hist:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["date","close"])
 
     df = pd.DataFrame(hist)
-    # Asegurar columnas
-    if "date" not in df.columns:
-        return pd.DataFrame()
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.sort_values("date").dropna(subset=["date"]).reset_index(drop=True)
-
-    # Nos quedamos con la ventana requerida (últimos lookback_days)
-    if len(df) > lookback_days:
-        df = df.iloc[-lookback_days:].copy()
-
-    # Asegurar columnas mínimas
+    # normalizar
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
     if "close" not in df.columns:
-        # si usamos serietype=line, tendremos "close"; si no, la traemos
-        close_col = "close" if "close" in df.columns else None
-        if close_col is None:
-            return pd.DataFrame()
-
-    return df[["date", "close"]].copy()
+        # FMP devuelve 'close' en este endpoint; por si acaso:
+        for alt in ("adjClose", "Adj Close"):
+            if alt in df.columns:
+                df["close"] = df[alt]
+                break
+    df = df.dropna(subset=["date","close"]).sort_values("date")
+    return df[["date","close"]].reset_index(drop=True)
 
 
 # -----------------------------------------------------------------------------
-# Script de prueba
+# Prueba rápida
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     print("🧪 Testing data_fetcher...")
-    print("API key set?" , bool(FMP_API_KEY))
 
     try:
-        uni = fetch_screener(limit=20, mcap_min=2e9, volume_min=1_000_000)
-        print(f"Screener size: {len(uni)}")
-        print(uni.head())
+        scr = fetch_screener(limit=10, mcap_min=2e9, volume_min=1_000_000)
+        print(f"Screener: {len(scr)}")
+        print(scr.head())
     except Exception as e:
         print("Screener error:", e)
 
     try:
-        if not uni.empty:
-            sample = uni["symbol"].head(5).tolist()
-            fund = fetch_fundamentals_batch(sample)
-            print("Fundamentals cols:", fund.columns.tolist())
-            print(fund.head())
+        if not scr.empty:
+            syms = scr["symbol"].head(3).tolist()
+            fund = fetch_fundamentals_batch(syms)
+            print("\nFundamentals:")
+            print(fund)
     except Exception as e:
         print("Fundamentals error:", e)
 
     try:
-        if not uni.empty:
-            sym = uni["symbol"].iloc[0]
-            px = fetch_prices_daily(sym, 800)
-            print(sym, px.shape, px.head())
+        if not scr.empty:
+            sym = scr["symbol"].iloc[0]
+            px = fetch_prices(sym, "2022-01-01", "2025-12-31")
+            print("\nPrices:", sym, len(px))
+            print(px.head())
     except Exception as e:
         print("Prices error:", e)
