@@ -26,7 +26,7 @@ from datetime import datetime
 from data_fetcher import (
     fetch_screener,
     fetch_financial_statements_batch,
-    fetch_prices_daily,
+    fetch_fundamentals_batch,
 )
 from quality_value_score import (
     compute_quality_value_factors,
