@@ -3,7 +3,7 @@
 from __future__ import annotations
 import os, json, time, hashlib, math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterable
 
 import requests
 import pandas as pd
@@ -377,6 +377,48 @@ def fetch_financial_scores(symbols: list[str], use_cache: bool = True) -> pd.Dat
             df[k] = pd.NA
 
     return df[keep]
+
+
+
+def fetch_financial_scores(
+    symbols: Iterable[str],
+    use_cache: bool = True,
+) -> pd.DataFrame:
+    """
+    Llama /financial-scores?symbol=SYMB (FMP) por símbolo (es endpoint por-símbolo)
+    y devuelve: ['symbol','piotroskiScore','altmanZScore'].
+
+    - Robusto a respuestas vacías
+    - Normaliza 'symbol' a UPPER
+    """
+    syms = [str(s).strip().upper() for s in symbols if isinstance(s, str)]
+    if not syms:
+        return pd.DataFrame(columns=["symbol","piotroskiScore","altmanZScore"])
+
+    rows: List[dict] = []
+    ttl = 900 if use_cache else None
+
+    for s in syms:
+        try:
+            data = _http_get("financial-scores", {"symbol": s}, ttl=ttl)
+            # Puede venir como list con 1 dict o dict suelto
+            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                d = data[0]
+            elif isinstance(data, dict):
+                d = data
+            else:
+                d = {}
+
+            rows.append({
+                "symbol": s,
+                "piotroskiScore": pd.to_numeric(d.get("piotroskiScore"), errors="coerce"),
+                "altmanZScore": pd.to_numeric(d.get("altmanZScore"), errors="coerce"),
+            })
+        except Exception:
+            rows.append({"symbol": s, "piotroskiScore": pd.NA, "altmanZScore": pd.NA})
+
+    out = pd.DataFrame(rows).drop_duplicates("symbol")
+    return out
 
 # -----------------------------------------------------------------------------
 # Prueba rápida

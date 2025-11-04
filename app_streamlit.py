@@ -34,6 +34,7 @@ from data_fetcher import (
     fetch_screener,
     fetch_fundamentals_batch,
     fetch_prices,
+    fetch_financial_scores
 )
 
 from factor_calculator import compute_all_factors
@@ -262,28 +263,61 @@ if run_btn:
             st.error("❌ Ningún símbolo pasó los filtros de calidad.")
             st.stop()
 
+        try:
+            _syms_scope = passed_filters["symbol"].dropna().astype(str).str.upper().unique().tolist()
+        except Exception:
+            _syms_scope = universe["symbol"].dropna().astype(str).str.upper().unique().tolist()
+
+        scores_df = fetch_financial_scores(_syms_scope, use_cache=True)
+        st.session_state["financial_scores_raw"] = scores_df.copy()
+
+        # Mergear contra fundamentals para que esté disponible en todo el pipeline
+        fundamentals = fundamentals.merge(scores_df, on="symbol", how="left")
+        st.session_state["fundamentals_plus_scores"] = fundamentals.copy()
+
         # 4) F-Score
-        status.text("🏆 Paso 4/8: Calculando F-Score…")
-        progress.progress(40)
-        fcols_pref = ["symbol","roa","net_income","total_assets","operating_cf","fcf","capex","roe"]
-        base_cols = [c for c in fcols_pref if c in fundamentals.columns] or ["symbol"]
+        # ---------------------------------------------------------------------
+# PASO 4: F-SCORE (nativo FMP si viene; si no, calculado)
+# ---------------------------------------------------------------------
+        status.text("🏆 Paso 4/8: Calculando / Inyectando F-Score...")
+        progress.bar(40)
+
+        # Columnas básicas que intentaremos tener
+        fcols = ["symbol","roe","fcf","operating_cf","roa","net_income","total_assets","piotroskiScore"]
+        base_cols = [c for c in fcols if c in fundamentals.columns] or ["symbol"]
+
         df_for_fscore = passed_filters.merge(
             fundamentals[base_cols].drop_duplicates("symbol"),
             on="symbol", how="left"
         )
-        for c in ["roa","operating_cf","fcf","net_income","total_assets","capex"]:
-            if c not in df_for_fscore.columns:
-                df_for_fscore[c] = np.nan
-        df_for_fscore["fscore"] = calculate_simplified_fscore(df_for_fscore)
+
+        # Preferencia: usar piotroskiScore de FMP si hay al menos 1 no nulo
+        if "piotroskiScore" in df_for_fscore.columns and pd.to_numeric(df_for_fscore["piotroskiScore"], errors="coerce").notna().any():
+            df_for_fscore["fscore"] = pd.to_numeric(df_for_fscore["piotroskiScore"], errors="coerce")
+            fscore_source = "FMP (financial-scores)"
+        else:
+            # fallback a cálculo simplificado local
+            for c in ["roe","fcf","operating_cf","roa","net_income","total_assets"]:
+                if c not in df_for_fscore.columns:
+                    df_for_fscore[c] = np.nan
+            df_for_fscore["fscore"] = calculate_simplified_fscore(df_for_fscore)
+            fscore_source = "Local (simplificado)"
+
+        # Filtro por umbral si lo activaste en el sidebar
         if use_fscore:
             df_fscore_passed = df_for_fscore[df_for_fscore["fscore"] >= min_fscore].copy()
         else:
             df_fscore_passed = df_for_fscore.copy()
-        st.session_state["fscore_data"] = df_for_fscore
-        st.session_state["fscore_passed"] = df_fscore_passed
+
+        # Exponer para Tab 4 y para debugging
+        st.session_state["fscore_data"] = df_for_fscore.copy()
+        st.session_state["fscore_source"] = fscore_source
+        st.session_state["fscore_passed"] = df_fscore_passed.copy()
+
         if df_fscore_passed.empty:
-            st.error(f"❌ Ningún símbolo con F-Score >= {min_fscore}.")
+            st.error(f"❌ Ningún símbolo con F-Score >= {min_fscore} (source: {fscore_source})")
             st.stop()
+
 
         # 5) Precios
         status.text("📈 Paso 5/8: Descargando precios…")
@@ -722,109 +756,78 @@ with tab3:
 
 with tab4:
     st.markdown("### 🏆 F-Score Analysis")
+    fscore_data = st.session_state.get("fscore_data")
+    fscore_source = st.session_state.get("fscore_source", "—")
 
-    df_raw = st.session_state.get("fscore_data")
-    if not isinstance(df_raw, pd.DataFrame) or df_raw.empty:
+    if not isinstance(fscore_data, pd.DataFrame) or fscore_data.empty or "fscore" not in fscore_data.columns:
         st.info("Ejecuta el pipeline con F-Score habilitado.")
     else:
-        # Copia segura y coerción numérica
-        fdf = df_raw.copy()
-        if "fscore" not in fdf.columns:
-            st.info("No hay columna 'fscore' disponible; ejecuta el pipeline con F-Score.")
-            st.stop()
+        # ====== DEBUG PANEL ======
+        with st.expander("🔎 Debug F-Score (fuente / cobertura / merges)", expanded=False):
+            need_cols = ["piotroskiScore","roe","fcf","operating_cf","roa","net_income","total_assets"]
+            present = {c: (c in fscore_data.columns) for c in need_cols}
+            nonnull = {c: (int(pd.to_numeric(fscore_data[c], errors="coerce").notna().sum()) if c in fscore_data.columns else 0) for c in need_cols}
+            st.write("**Fuente del F-Score:**", fscore_source)
+            colA, colB = st.columns(2)
+            with colA: st.json({"present": present})
+            with colB: st.json({"nonnull": nonnull})
 
-        # Asegura numéricos
-        fdf["fscore"] = pd.to_numeric(fdf["fscore"], errors="coerce")
-        for col in ("roe", "fcf", "operating_cf"):
-            if col in fdf.columns:
-                fdf[col] = pd.to_numeric(fdf[col], errors="coerce")
+            # Muestra 10 filas crudas para validar merges
+            st.caption("Muestra cruda (10 filas):")
+            st.dataframe(fscore_data.head(10), use_container_width=True)
 
-        # Filtra filas válidas para métricas/histograma
-        valid = fdf["fscore"].between(0, 9, inclusive="both")
-        fdf_valid = fdf.loc[valid].copy()
+            # Si descargamos el endpoint de FMP, muéstralo también
+            fs_raw = st.session_state.get("financial_scores_raw")
+            if isinstance(fs_raw, pd.DataFrame) and not fs_raw.empty:
+                st.caption("financial-scores (FMP) crudo:")
+                st.dataframe(fs_raw.head(10), use_container_width=True)
 
-        if fdf_valid.empty:
-            st.info("No hay F-Scores válidos (0–9) para analizar.")
+        # ====== MÉTRICAS RESUMEN ======
+        fdf_valid = fscore_data.copy()
+        fdf_valid["fscore"] = pd.to_numeric(fdf_valid["fscore"], errors="coerce")
+        avg_f = float(fdf_valid["fscore"].mean()) if fdf_valid["fscore"].notna().any() else 0.0
+        hi  = int((fdf_valid["fscore"] >= 8).sum())
+        mid = int(((fdf_valid["fscore"] >= 6) & (fdf_valid["fscore"] < 8)).sum())
+        lo  = int((fdf_valid["fscore"] < 6).sum())
+
+        a, b, c, d = st.columns(4)
+        with a: st.metric("F-Score Promedio", f"{avg_f:.1f}/9.0")
+        with b: st.metric("High Quality (8–9)", hi)
+        with c: st.metric("Medium (6–7)", mid)
+        with d: st.metric("Low (0–5)", lo)
+
+        # ====== Histograma robusto ======
+        vc = (
+            fdf_valid["fscore"].round(0)
+            .value_counts(dropna=False)
+            .sort_index()
+            .reset_index()
+        )
+        if vc.shape[1] >= 2:
+            vc.columns = ["F-Score", "Count"]
         else:
-            # ===== Métricas =====
-            avg_f = float(fdf_valid["fscore"].mean())
-            hi  = int((fdf_valid["fscore"] >= 8).sum())
-            mid = int(((fdf_valid["fscore"] >= 6) & (fdf_valid["fscore"] < 8)).sum())
-            lo  = int((fdf_valid["fscore"] < 6).sum())
+            vc["F-Score"] = fdf_valid["fscore"].round(0)
+            vc["Count"] = 1
+            vc = vc.groupby("F-Score", as_index=False)["Count"].sum()
 
-            a, b, c, d = st.columns(4)
-            with a: st.metric("F-Score Promedio", f"{avg_f:.1f}/9.0")
-            with b: st.metric("High Quality (8–9)", hi)
-            with c: st.metric("Medium (6–7)", mid)
-            with d: st.metric("Low (0–5)", lo)
+        all_bins = pd.DataFrame({"F-Score": list(range(0, 10))}, dtype=float)
+        hist = all_bins.merge(vc, on="F-Score", how="left")
+        hist["Count"] = pd.to_numeric(hist["Count"], errors="coerce").fillna(0).astype(int)
 
-            # ===== Histograma =====
-            vc = (
-                fdf_valid["fscore"].round(0)
-                .value_counts(dropna=False)  # por si acaso
-                .sort_index()
-                .reset_index()
-            )
+        chart = alt.Chart(hist).mark_bar().encode(
+            x=alt.X("F-Score:O", title="F-Score"),
+            y=alt.Y("Count:Q", title="Número de acciones"),
+            color=alt.condition(alt.datum["F-Score"] >= 6, alt.value("steelblue"), alt.value("lightgray")),
+            tooltip=["F-Score:O","Count:Q"],
+        ).properties(height=300)
+        st.altair_chart(chart, use_container_width=True)
 
-            # Normaliza nombres sin asumir cómo los llama pandas
-            # La primera columna son los valores de F-Score, la segunda son los conteos
-            if vc.shape[1] >= 2:
-                vc.columns = ["F-Score", "Count"]
-            else:
-                # fallback improbable, pero por seguridad
-                vc["F-Score"] = fdf_valid["fscore"].round(0)
-                vc["Count"] = 1
-                vc = vc.groupby("F-Score", as_index=False)["Count"].sum()
-
-            # Asegura que existan barras 0..9 aunque no haya datos para todos
-            all_bins = pd.DataFrame({"F-Score": list(range(0, 10))}, dtype=float)
-            hist = all_bins.merge(vc, on="F-Score", how="left")
-            hist["Count"] = pd.to_numeric(hist["Count"], errors="coerce").fillna(0).astype(int)
-
-            chart = alt.Chart(hist).mark_bar().encode(
-                x=alt.X("F-Score:O", title="F-Score"),
-                y=alt.Y("Count:Q", title="Número de acciones"),
-                color=alt.condition(
-                    alt.datum["F-Score"] >= 6,
-                    alt.value("steelblue"),
-                    alt.value("lightgray"),
-                ),
-                tooltip=["F-Score:O", "Count:Q"],
-            ).properties(height=300)
-
-            st.altair_chart(chart, use_container_width=True)
-            # ===== Tabla categorizada =====
-            st.markdown("#### 📋 Stocks by F-Score Category")
-            show_cols = [c for c in ["symbol", "companyName", "fscore", "roe", "fcf", "operating_cf"] if c in fdf_valid.columns]
-            tbl = fdf_valid[show_cols].copy()
-
-            # Categorías (0–5, 6–7, 8–9)
-            tbl["category"] = pd.cut(
-                tbl["fscore"],
-                bins=[-0.1, 5.5, 7.5, 9.1],
-                labels=["Low (0–5)", "Medium (6–7)", "High (8–9)"]
-            )
-
-            # Formato amigable
-            if "roe" in tbl.columns:
-                tbl["roe"] = (pd.to_numeric(tbl["roe"], errors="coerce") * 100).round(1)
-            for col in ("fcf", "operating_cf"):
-                if col in tbl.columns:
-                    tbl[col] = pd.to_numeric(tbl[col], errors="coerce").round(0)
-
-            st.dataframe(
-                tbl.sort_values(["category", "fscore"], ascending=[True, False]),
-                use_container_width=True,
-                height=420,
-                column_config={
-                    "roe": st.column_config.NumberColumn(label="ROE", format="%.1f%%"),
-                    "fcf": st.column_config.NumberColumn(label="FCF", format="%.0f"),
-                    "operating_cf": st.column_config.NumberColumn(label="Operating CF", format="%.0f"),
-                    "fscore": st.column_config.NumberColumn(label="F-Score", format="%.1f"),
-                }
-            )
-
-
+        # ====== Tabla por categoría ======
+        show_cols = [c for c in ["symbol","fscore","piotroskiScore","roe","fcf","operating_cf"] if c in fscore_data.columns]
+        tbl = fdf_valid[show_cols].copy()
+        tbl["category"] = pd.cut(tbl["fscore"], bins=[-0.1,5.5,7.5,9.1],
+                                 labels=["Low (0–5)","Medium (6–7)","High (8–9)"])
+        st.dataframe(tbl.sort_values("fscore", ascending=False), use_container_width=True, height=420)
 # =============================================================================
 # TAB 5 — BACKTEST
 # =============================================================================
