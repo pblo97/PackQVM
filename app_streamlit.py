@@ -759,16 +759,27 @@ with tab4:
             with d: st.metric("Low (0–5)", lo)
 
             # ===== Histograma =====
-            hist = (
+            vc = (
                 fdf_valid["fscore"].round(0)
-                .value_counts()
+                .value_counts(dropna=False)  # por si acaso
                 .sort_index()
                 .reset_index()
-                .rename(columns={"index": "F-Score", "fscore": "Count"})
             )
-            # Asegura ejes 0..9 incluso si faltan barras
-            all_bins = pd.DataFrame({"F-Score": list(range(0, 10))})
-            hist = all_bins.merge(hist, on="F-Score", how="left").fillna({"Count": 0})
+
+            # Normaliza nombres sin asumir cómo los llama pandas
+            # La primera columna son los valores de F-Score, la segunda son los conteos
+            if vc.shape[1] >= 2:
+                vc.columns = ["F-Score", "Count"]
+            else:
+                # fallback improbable, pero por seguridad
+                vc["F-Score"] = fdf_valid["fscore"].round(0)
+                vc["Count"] = 1
+                vc = vc.groupby("F-Score", as_index=False)["Count"].sum()
+
+            # Asegura que existan barras 0..9 aunque no haya datos para todos
+            all_bins = pd.DataFrame({"F-Score": list(range(0, 10))}, dtype=float)
+            hist = all_bins.merge(vc, on="F-Score", how="left")
+            hist["Count"] = pd.to_numeric(hist["Count"], errors="coerce").fillna(0).astype(int)
 
             chart = alt.Chart(hist).mark_bar().encode(
                 x=alt.X("F-Score:O", title="F-Score"),
@@ -778,10 +789,10 @@ with tab4:
                     alt.value("steelblue"),
                     alt.value("lightgray"),
                 ),
-                tooltip=["F-Score:O", "Count:Q"]
+                tooltip=["F-Score:O", "Count:Q"],
             ).properties(height=300)
-            st.altair_chart(chart, use_container_width=True)
 
+            st.altair_chart(chart, use_container_width=True)
             # ===== Tabla categorizada =====
             st.markdown("#### 📋 Stocks by F-Score Category")
             show_cols = [c for c in ["symbol", "companyName", "fscore", "roe", "fcf", "operating_cf"] if c in fdf_valid.columns]
