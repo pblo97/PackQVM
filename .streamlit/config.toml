@@ -1,7 +1,7 @@
 [theme]
 base = "light"
-primaryColor = "#6B7280"            # gris medio
-backgroundColor = "#F8F1E7"         # sepia claro
-secondaryBackgroundColor = "#EFE7DC" # sepia suave
-textColor = "#2B2B2B"               # casi negro
-font = "serif"
+primaryColor = "#10B981"            # verde jade
+backgroundColor = "#FAFEFD"         # casi blanco con tinte verde
+secondaryBackgroundColor = "#ECFDF5" # mint muy suave
+textColor = "#0B1320"               # azul pizarra muy oscuro
+font = "sans serif"
