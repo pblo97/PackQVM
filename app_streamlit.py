@@ -467,18 +467,79 @@ with tab1:
 
 with tab2:
     st.markdown("### 💎 QVM Rankings")
-    if "portfolio" not in st.session_state:
+
+    def _ensure_sector(df: pd.DataFrame) -> pd.DataFrame:
+        """Garantiza columna 'sector' usando alias o el universo original como fallback."""
+        pf = df.copy()
+
+        # 1) Alias frecuentes dentro del propio DF
+        if "sector" not in pf.columns:
+            for cand in ("sectorName", "industry", "industryTitle", "subSector"):
+                if cand in pf.columns:
+                    pf["sector"] = (
+                        pf[cand].astype(str).str.strip().replace({"": "Unknown"}).fillna("Unknown")
+                    )
+                    break
+
+        # 2) Merge con universo original si aún falta
+        if "sector" not in pf.columns:
+            uni = st.session_state.get("universe", pd.DataFrame())
+            if not uni.empty:
+                # Normaliza 'sector' en el universo también
+                sector_src = None
+                for cand in ("sector", "sectorName", "industry", "industryTitle", "subSector"):
+                    if cand in uni.columns:
+                        sector_src = cand
+                        break
+                if sector_src is not None:
+                    look = (
+                        uni[["symbol", sector_src]].rename(columns={sector_src: "sector"})
+                        .dropna(subset=["symbol"])
+                        .drop_duplicates("symbol")
+                    )
+                    look["sector"] = (
+                        look["sector"].astype(str).str.strip().replace({"": "Unknown"}).fillna("Unknown")
+                    )
+                    pf = pf.drop(columns=["sector"], errors="ignore").merge(look, on="symbol", how="left")
+
+        # 3) Último recurso
+        if "sector" not in pf.columns:
+            pf["sector"] = "Unknown"
+
+        # Limpieza final
+        pf["sector"] = pf["sector"].astype(str).str.strip().replace({"": "Unknown"}).fillna("Unknown")
+        return pf
+
+    def _safe_metric(label: str, value, fmt: str | None = None):
+        """Evita excepciones en métricas cuando faltan columnas."""
+        try:
+            if value is None:
+                st.metric(label, "—")
+                return
+            st.metric(label, (fmt % value) if fmt else value)
+        except Exception:
+            st.metric(label, "—")
+
+    if "portfolio" not in st.session_state or st.session_state["portfolio"] is None or len(st.session_state["portfolio"]) == 0:
         st.info("Ejecuta el pipeline primero.")
     else:
         pf = st.session_state["portfolio"].copy()
+        pf = _ensure_sector(pf)
+
+        # ===== MÉTRICAS DE CABECERA =====
         a, b, c, d = st.columns(4)
-        with a: st.metric("Portfolio Size", len(pf))
-        with b: st.metric("Avg QVM Score", f"{pf['qvm_score_corrected'].mean():.3f}")
-        with c: st.metric("Avg F-Score", f"{pf['fscore'].mean():.1f}/9.0")
-        with d: st.metric("Sectores", pf["sector"].nunique())
+        with a:
+            _safe_metric("Portfolio Size", len(pf))
+        with b:
+            _safe_metric("Avg QVM Score", (pf["qvm_score_corrected"].mean() if "qvm_score_corrected" in pf.columns and len(pf) else None), "%.3f")
+        with c:
+            _safe_metric("Avg F-Score", (pf["fscore"].mean() if "fscore" in pf.columns and len(pf) else None), "%.1f/9.0")
+        with d:
+            _safe_metric("Sectores", (pf["sector"].nunique() if "sector" in pf.columns else None))
 
         st.markdown("---")
 
+        # ===== TABLA PRINCIPAL =====
         cols = [
             "symbol","sector","qvm_score_corrected","final_rank",
             "quality_extended","value_score","composite_momentum","fscore",
@@ -486,38 +547,41 @@ with tab2:
         ]
         cols = [c for c in cols if c in pf.columns]
         disp = pf[cols].copy()
+
         rename = {
-            "qvm_score_corrected":"QVM Score",
-            "final_rank":"Rank %ile",
-            "quality_extended":"Quality",
-            "value_score":"Value",
-            "composite_momentum":"Momentum",
-            "fscore":"F-Score",
-            "momentum_12m1m":"Mom 12M",
-            "above_ma200":"MA200✓",
-            "market_cap":"MCap",
+            "qvm_score_corrected": "QVM Score",
+            "final_rank": "Rank %ile",
+            "quality_extended": "Quality",
+            "value_score": "Value",
+            "composite_momentum": "Momentum",
+            "fscore": "F-Score",
+            "momentum_12m1m": "Mom 12M",
+            "above_ma200": "MA200✓",
+            "market_cap": "MCap",
         }
-        disp.rename(columns={k:v for k,v in rename.items() if k in disp.columns}, inplace=True)
+        disp.rename(columns={k: v for k, v in rename.items() if k in disp.columns}, inplace=True)
 
+        # Formateo seguro
         if "QVM Score" in disp.columns:
-            disp["QVM Score"] = disp["QVM Score"].round(3)
+            disp["QVM Score"] = pd.to_numeric(disp["QVM Score"], errors="coerce").round(3)
         if "Rank %ile" in disp.columns:
-            disp["Rank %ile"] = (disp["Rank %ile"] * 100).round(1)
+            disp["Rank %ile"] = (pd.to_numeric(disp["Rank %ile"], errors="coerce") * 100).round(1)
         if "Quality" in disp.columns:
-            disp["Quality"] = disp["Quality"].round(3)
+            disp["Quality"] = pd.to_numeric(disp["Quality"], errors="coerce").round(3)
         if "Value" in disp.columns:
-            disp["Value"] = disp["Value"].round(3)
+            disp["Value"] = pd.to_numeric(disp["Value"], errors="coerce").round(3)
         if "Momentum" in disp.columns:
-            disp["Momentum"] = disp["Momentum"].round(3)
+            disp["Momentum"] = pd.to_numeric(disp["Momentum"], errors="coerce").round(3)
         if "F-Score" in disp.columns:
-            disp["F-Score"] = disp["F-Score"].round(1)
+            disp["F-Score"] = pd.to_numeric(disp["F-Score"], errors="coerce").round(1)
         if "Mom 12M" in disp.columns:
-            disp["Mom 12M"] = (disp["Mom 12M"] * 100).round(1)
+            disp["Mom 12M"] = (pd.to_numeric(disp["Mom 12M"], errors="coerce") * 100).round(1)
         if "roe" in disp.columns:
-            disp["roe"] = (disp["roe"] * 100).round(1)
+            disp["roe"] = (pd.to_numeric(disp["roe"], errors="coerce") * 100).round(1)
         if "MCap" in disp.columns:
-            disp["MCap"] = (disp["MCap"] / 1e9).round(2)
+            disp["MCap"] = (pd.to_numeric(disp["MCap"], errors="coerce") / 1e9).round(2)
 
+        # Mostrar tabla
         st.dataframe(
             disp,
             use_container_width=True,
@@ -531,17 +595,37 @@ with tab2:
             },
         )
 
+        # ===== DISTRIBUCIÓN POR SECTOR =====
         st.markdown("#### 📊 Distribución por Sector")
-        if {"sector","qvm_score_corrected"}.issubset(pf.columns):
-            sec = pf.groupby("sector").agg(
-                Count=("symbol","count"),
-                Avg_QVM=("qvm_score_corrected","mean"),
-                Avg_F=("fscore","mean"),
-                Avg_Mom=("momentum_12m1m","mean"),
-            ).reset_index()
-            if "Avg_Mom" in sec.columns:
-                sec["Avg_Mom"] = (sec["Avg_Mom"] * 100).round(1)
+        needed = {"sector", "symbol"}
+        if needed.issubset(pf.columns):
+            # columnas opcionales para promedios (si no están, se omiten)
+            agg_dict = {"symbol": "count"}
+            if "qvm_score_corrected" in pf.columns:
+                agg_dict["qvm_score_corrected"] = "mean"
+            if "fscore" in pf.columns:
+                agg_dict["fscore"] = "mean"
+            if "momentum_12m1m" in pf.columns:
+                agg_dict["momentum_12m1m"] = "mean"
+
+            sec = pf.groupby("sector").agg(agg_dict).reset_index()
+            # Renombrar amigable
+            rename_sec = {"symbol": "Count"}
+            if "qvm_score_corrected" in sec.columns:
+                rename_sec["qvm_score_corrected"] = "Avg QVM"
+            if "fscore" in sec.columns:
+                rename_sec["fscore"] = "Avg F-Score"
+            if "momentum_12m1m" in sec.columns:
+                rename_sec["momentum_12m1m"] = "Avg Mom"
+            sec.rename(columns=rename_sec, inplace=True)
+
+            if "Avg Mom" in sec.columns:
+                sec["Avg Mom"] = (pd.to_numeric(sec["Avg Mom"], errors="coerce") * 100).round(1)
+
             st.dataframe(sec.sort_values("Count", ascending=False), use_container_width=True)
+        else:
+            st.info("No hay columnas suficientes para agrupar por sector.")
+
 
 # =============================================================================
 # TAB 3 — MOMENTUM + MA200
