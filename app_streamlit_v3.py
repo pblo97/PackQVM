@@ -699,94 +699,174 @@ if run_button or st.session_state.get('results') is not None:
 
             # Verificar si las columnas existen
             if 'value_score_component' in portfolio.columns and 'quality_score_component' in portfolio.columns:
-                fig_scatter = px.scatter(
-                    portfolio,
-                    x='value_score_component',
-                    y='quality_score_component',
-                    size='market_cap',
-                    color='sector',
-                    hover_data=['symbol', 'piotroski_score', 'qv_score'],
-                    title="Quality Score vs Value Score",
-                    labels={
-                        'value_score_component': 'Value Score',
-                        'quality_score_component': 'Quality Score (Piotroski Normalizado)'
-                    }
-                )
-                st.plotly_chart(fig_scatter, use_container_width=True)
+                try:
+                    # Filtrar datos válidos
+                    valid_scatter = portfolio[
+                        portfolio['value_score_component'].notna() &
+                        portfolio['quality_score_component'].notna()
+                    ].copy()
+
+                    if not valid_scatter.empty and len(valid_scatter) > 0:
+                        hover_cols = ['symbol']
+                        if 'piotroski_score' in valid_scatter.columns:
+                            hover_cols.append('piotroski_score')
+                        if 'qv_score' in valid_scatter.columns:
+                            hover_cols.append('qv_score')
+
+                        fig_scatter = px.scatter(
+                            valid_scatter,
+                            x='value_score_component',
+                            y='quality_score_component',
+                            size='market_cap' if 'market_cap' in valid_scatter.columns else None,
+                            color='sector' if 'sector' in valid_scatter.columns else None,
+                            hover_data=hover_cols,
+                            title="Quality Score vs Value Score",
+                            labels={
+                                'value_score_component': 'Value Score',
+                                'quality_score_component': 'Quality Score (Piotroski Normalizado)'
+                            }
+                        )
+                        st.plotly_chart(fig_scatter, use_container_width=True)
+                    else:
+                        st.info("No hay suficientes datos válidos para el scatter plot Quality vs Value.")
+                except Exception as e:
+                    st.warning(f"No se pudo generar el gráfico Quality vs Value: {str(e)}")
             else:
                 # Usar Piotroski como proxy de Quality
                 if 'piotroski_score' in portfolio.columns:
-                    fig_scatter = px.scatter(
-                        portfolio,
-                        x='ev_ebitda' if 'ev_ebitda' in portfolio.columns else 'pe',
-                        y='piotroski_score',
-                        size='market_cap',
-                        color='sector',
-                        hover_data=['symbol', 'qv_score'],
-                        title="Piotroski Score vs Valuation",
-                        labels={
-                            'piotroski_score': 'Piotroski Score (Quality)',
-                            'ev_ebitda': 'EV/EBITDA (Value)',
-                            'pe': 'P/E (Value)'
-                        }
-                    )
-                    st.plotly_chart(fig_scatter, use_container_width=True)
+                    try:
+                        # Determinar columna de valoración
+                        val_col = None
+                        if 'ev_ebitda' in portfolio.columns:
+                            val_col = 'ev_ebitda'
+                        elif 'pe' in portfolio.columns:
+                            val_col = 'pe'
+
+                        if val_col:
+                            valid_scatter = portfolio[
+                                portfolio['piotroski_score'].notna() &
+                                portfolio[val_col].notna()
+                            ].copy()
+
+                            if not valid_scatter.empty and len(valid_scatter) > 0:
+                                hover_cols = ['symbol']
+                                if 'qv_score' in valid_scatter.columns:
+                                    hover_cols.append('qv_score')
+
+                                fig_scatter = px.scatter(
+                                    valid_scatter,
+                                    x=val_col,
+                                    y='piotroski_score',
+                                    size='market_cap' if 'market_cap' in valid_scatter.columns else None,
+                                    color='sector' if 'sector' in valid_scatter.columns else None,
+                                    hover_data=hover_cols,
+                                    title="Piotroski Score vs Valuation",
+                                    labels={
+                                        'piotroski_score': 'Piotroski Score (Quality)',
+                                        val_col: val_col.upper().replace('_', '/')
+                                    }
+                                )
+                                st.plotly_chart(fig_scatter, use_container_width=True)
+                            else:
+                                st.info("No hay suficientes datos válidos para el scatter plot.")
+                        else:
+                            st.info("No hay métricas de valoración disponibles para el scatter plot.")
+                    except Exception as e:
+                        st.warning(f"No se pudo generar el gráfico alternativo: {str(e)}")
                 else:
                     st.info("Componentes de score no disponibles para visualización.")
 
         with tab2:
             st.subheader("Distribución por Sector")
 
-            sector_counts = portfolio['sector'].value_counts()
+            if 'sector' in portfolio.columns:
+                try:
+                    sector_counts = portfolio['sector'].value_counts()
 
-            fig_sector = px.pie(
-                values=sector_counts.values,
-                names=sector_counts.index,
-                title="Portfolio por Sector",
-            )
-            st.plotly_chart(fig_sector, use_container_width=True)
+                    if not sector_counts.empty:
+                        fig_sector = px.pie(
+                            values=sector_counts.values,
+                            names=sector_counts.index,
+                            title="Portfolio por Sector",
+                        )
+                        st.plotly_chart(fig_sector, use_container_width=True)
+                    else:
+                        st.info("No hay datos de sector disponibles.")
+                except Exception as e:
+                    st.warning(f"No se pudo generar el gráfico de sectores: {str(e)}")
+            else:
+                st.info("La columna 'sector' no está disponible en el portfolio.")
 
             # Piotroski por sector
             st.subheader("Piotroski Score por Sector")
 
-            fig_box = px.box(
-                portfolio,
-                x='sector',
-                y='piotroski_score',
-                title="Distribución de Piotroski Score por Sector",
-                labels={'piotroski_score': 'Piotroski Score', 'sector': 'Sector'}
-            )
-            st.plotly_chart(fig_box, use_container_width=True)
+            if 'sector' in portfolio.columns and 'piotroski_score' in portfolio.columns:
+                try:
+                    valid_data = portfolio[
+                        portfolio['sector'].notna() &
+                        portfolio['piotroski_score'].notna()
+                    ]
+
+                    if not valid_data.empty and len(valid_data) > 0:
+                        fig_box = px.box(
+                            valid_data,
+                            x='sector',
+                            y='piotroski_score',
+                            title="Distribución de Piotroski Score por Sector",
+                            labels={'piotroski_score': 'Piotroski Score', 'sector': 'Sector'}
+                        )
+                        st.plotly_chart(fig_box, use_container_width=True)
+                    else:
+                        st.info("No hay suficientes datos para el gráfico de Piotroski por sector.")
+                except Exception as e:
+                    st.warning(f"No se pudo generar el box plot: {str(e)}")
+            else:
+                st.info("Las columnas necesarias para Piotroski por sector no están disponibles.")
 
         with tab3:
             st.subheader("Piotroski Score Distribution")
 
-            piotroski_counts = portfolio['piotroski_score'].value_counts().sort_index()
+            if 'piotroski_score' in portfolio.columns:
+                try:
+                    valid_piotroski = portfolio[portfolio['piotroski_score'].notna()]
 
-            fig_piotroski = px.bar(
-                x=piotroski_counts.index,
-                y=piotroski_counts.values,
-                title="Distribución de Piotroski Score",
-                labels={'x': 'Piotroski Score', 'y': 'Cantidad'},
-            )
-            st.plotly_chart(fig_piotroski, use_container_width=True)
+                    if not valid_piotroski.empty:
+                        piotroski_counts = valid_piotroski['piotroski_score'].value_counts().sort_index()
+
+                        fig_piotroski = px.bar(
+                            x=piotroski_counts.index,
+                            y=piotroski_counts.values,
+                            title="Distribución de Piotroski Score",
+                            labels={'x': 'Piotroski Score', 'y': 'Cantidad'},
+                        )
+                        st.plotly_chart(fig_piotroski, use_container_width=True)
+                    else:
+                        st.info("No hay datos de Piotroski Score disponibles.")
+                except Exception as e:
+                    st.warning(f"No se pudo generar el gráfico de Piotroski: {str(e)}")
+            else:
+                st.info("La columna 'piotroski_score' no está disponible.")
 
             # Mostrar estadísticas de componentes si están disponibles
             piotroski_cols = [c for c in portfolio.columns if 'positive' in c or 'delta_' in c or 'accruals' in c]
 
             if piotroski_cols:
-                st.subheader("Piotroski Components Analysis")
+                try:
+                    st.subheader("Piotroski Components Analysis")
 
-                components_summary = portfolio[piotroski_cols].mean().sort_values(ascending=False)
+                    components_summary = portfolio[piotroski_cols].mean().sort_values(ascending=False)
 
-                fig_components = px.bar(
-                    x=components_summary.values * 100,
-                    y=components_summary.index,
-                    orientation='h',
-                    title="% de Stocks que Pasan cada Check de Piotroski",
-                    labels={'x': '% Pass Rate', 'y': 'Component'}
-                )
-                st.plotly_chart(fig_components, use_container_width=True)
+                    if not components_summary.empty:
+                        fig_components = px.bar(
+                            x=components_summary.values * 100,
+                            y=components_summary.index,
+                            orientation='h',
+                            title="% de Stocks que Pasan cada Check de Piotroski",
+                            labels={'x': '% Pass Rate', 'y': 'Component'}
+                        )
+                        st.plotly_chart(fig_components, use_container_width=True)
+                except Exception as e:
+                    st.warning(f"No se pudo generar el análisis de componentes: {str(e)}")
 
         with tab4:
             st.subheader("Métricas de Valoración")
