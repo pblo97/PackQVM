@@ -267,7 +267,7 @@ def fetch_fundamentals_batch(symbols: List[str], use_cache: bool = True, debug: 
 # -----------------------------------------------------------------------------
 # Precios diarios
 # -----------------------------------------------------------------------------
-def fetch_screener(
+def fetch_prices(
     limit: int = 300,
     mcap_min: float = 2e9,
     volume_min: int = 1_000_000,
