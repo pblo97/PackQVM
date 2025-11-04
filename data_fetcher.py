@@ -145,132 +145,6 @@ def fetch_screener(
     limit: int = 300,
     mcap_min: float = 2e9,
     volume_min: int = 1_000_000,
-    use_cache: bool = True,
-    exchange: Optional[str] = "NYSE,NASDAQ",   # <- ayuda a que TTM exista
-    country: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Usa /stock-screener y devuelve:
-      symbol, companyName, sector, market_cap, price, volume
-    """
-    params = {
-        "limit": int(limit),
-        "marketCapMoreThan": float(mcap_min),
-        "volumeMoreThan": int(volume_min),
-    }
-    if exchange:
-        params["exchange"] = exchange
-    if country:
-        params["country"] = country
-
-    ttl = 900 if use_cache else None
-    data = _http_get("stock-screener", params=params, ttl=ttl)
-    if not isinstance(data, list) or len(data) == 0:
-        return pd.DataFrame(columns=["symbol","companyName","sector","market_cap","price","volume"])
-
-    df = pd.DataFrame(data)
-    rename = {
-        "symbol": "symbol",
-        "companyName": "companyName",
-        "sector": "sector",
-        "marketCap": "market_cap",
-        "price": "price",
-        "volume": "volume",
-    }
-    for src, dst in rename.items():
-        if src in df.columns:
-            df.rename(columns={src: dst}, inplace=True)
-
-    keep = [c for c in ["symbol","companyName","sector","market_cap","price","volume"] if c in df.columns]
-    df = (
-        df[keep]
-        .dropna(subset=["symbol"])
-        .drop_duplicates("symbol")
-        .reset_index(drop=True)
-    )
-    if "sector" not in df.columns:
-        df["sector"] = "Unknown"
-    return df
-
-
-# -----------------------------------------------------------------------------
-# Fundamentales (TTM)
-# -----------------------------------------------------------------------------
-def _get_key_metrics_ttm(symbol: str, use_cache: bool = True) -> Dict:
-    ttl = 3600 if use_cache else None
-    # probar variantes del símbolo
-    for candidate in _sanitize_symbol(symbol):
-        data = _http_get(f"key-metrics-ttm/{candidate}", params={}, ttl=ttl)
-        if isinstance(data, list) and data:
-            return data[0]
-    return {}
-
-def _get_ratios_ttm(symbol: str, use_cache: bool = True) -> Dict:
-    ttl = 3600 if use_cache else None
-    for candidate in _sanitize_symbol(symbol):
-        data = _http_get(f"ratios-ttm/{candidate}", params={}, ttl=ttl)
-        if isinstance(data, list) and data:
-            return data[0]
-    return {}
-
-def _get_cashflow_ttm(symbol: str, use_cache: bool = True) -> Dict:
-    ttl = 3600 if use_cache else None
-    for candidate in _sanitize_symbol(symbol):
-        data = _http_get(f"cash-flow-statement-ttm/{candidate}", params={}, ttl=ttl)
-        if isinstance(data, list) and data:
-            return data[0]
-    return {}
-
-def fetch_fundamentals_batch(symbols: List[str], use_cache: bool = True, debug: bool = False) -> pd.DataFrame:
-    """
-    Devuelve columnas:
-      symbol, ev_ebitda, pb, pe, roe, roic, gross_margin, fcf, operating_cf
-    """
-    rows: List[Dict] = []
-    syms = [s for s in (symbols or []) if isinstance(s, str)]
-    for sym in syms:
-        s = sym.strip().upper()
-        try:
-            km = _get_key_metrics_ttm(s, use_cache)
-            rt = _get_ratios_ttm(s, use_cache)
-            cf = _get_cashflow_ttm(s, use_cache)
-
-            row = {
-                "symbol": s,
-                "ev_ebitda": _safe_float(km.get("enterpriseValueOverEBITDATTM") or rt.get("enterpriseValueOverEBITDATTM")),
-                "pb": _safe_float(rt.get("priceToBookRatioTTM")),
-                "pe": _safe_float(rt.get("priceEarningsRatioTTM")),
-                "roe": _safe_float(km.get("returnOnEquityTTM") or rt.get("returnOnEquityTTM")),
-                "roic": _safe_float(km.get("returnOnInvestedCapitalTTM")),
-                "gross_margin": _safe_float(rt.get("grossProfitMarginTTM")),
-                "operating_cf": _safe_float(cf.get("operatingCashFlowTTM")),
-                "fcf": _safe_float(cf.get("freeCashFlowTTM")),
-            }
-            rows.append(row)
-        except Exception:
-            rows.append({
-                "symbol": s, "ev_ebitda": float("nan"), "pb": float("nan"), "pe": float("nan"),
-                "roe": float("nan"), "roic": float("nan"), "gross_margin": float("nan"),
-                "operating_cf": float("nan"), "fcf": float("nan"),
-            })
-
-    df = pd.DataFrame(rows).drop_duplicates("symbol")
-
-    if debug and not df.empty:
-        numeric_cols = ["ev_ebitda","pb","pe","roe","roic","gross_margin","operating_cf","fcf"]
-        coverage = df[numeric_cols].notna().sum().to_dict()
-        total = len(df)
-        print("Fundamentals coverage:", {k: f"{v}/{total}" for k, v in coverage.items()})
-    return df
-
-
-# -----------------------------------------------------------------------------
-# Precios diarios
-# -----------------------------------------------------------------------------
-def fetch_prices(
-    limit: int = 300,
-    mcap_min: float = 2e9,
-    volume_min: int = 1_000_000,
     use_cache: bool = True
 ) -> pd.DataFrame:
     """
@@ -371,6 +245,109 @@ def fetch_prices(
 
     return out
 
+
+# -----------------------------------------------------------------------------
+# Fundamentales (TTM)
+# -----------------------------------------------------------------------------
+def _get_key_metrics_ttm(symbol: str, use_cache: bool = True) -> Dict:
+    ttl = 3600 if use_cache else None
+    # probar variantes del símbolo
+    for candidate in _sanitize_symbol(symbol):
+        data = _http_get(f"key-metrics-ttm/{candidate}", params={}, ttl=ttl)
+        if isinstance(data, list) and data:
+            return data[0]
+    return {}
+
+def _get_ratios_ttm(symbol: str, use_cache: bool = True) -> Dict:
+    ttl = 3600 if use_cache else None
+    for candidate in _sanitize_symbol(symbol):
+        data = _http_get(f"ratios-ttm/{candidate}", params={}, ttl=ttl)
+        if isinstance(data, list) and data:
+            return data[0]
+    return {}
+
+def _get_cashflow_ttm(symbol: str, use_cache: bool = True) -> Dict:
+    ttl = 3600 if use_cache else None
+    for candidate in _sanitize_symbol(symbol):
+        data = _http_get(f"cash-flow-statement-ttm/{candidate}", params={}, ttl=ttl)
+        if isinstance(data, list) and data:
+            return data[0]
+    return {}
+
+def fetch_fundamentals_batch(symbols: List[str], use_cache: bool = True, debug: bool = False) -> pd.DataFrame:
+    """
+    Devuelve columnas:
+      symbol, ev_ebitda, pb, pe, roe, roic, gross_margin, fcf, operating_cf
+    """
+    rows: List[Dict] = []
+    syms = [s for s in (symbols or []) if isinstance(s, str)]
+    for sym in syms:
+        s = sym.strip().upper()
+        try:
+            km = _get_key_metrics_ttm(s, use_cache)
+            rt = _get_ratios_ttm(s, use_cache)
+            cf = _get_cashflow_ttm(s, use_cache)
+
+            row = {
+                "symbol": s,
+                "ev_ebitda": _safe_float(km.get("enterpriseValueOverEBITDATTM") or rt.get("enterpriseValueOverEBITDATTM")),
+                "pb": _safe_float(rt.get("priceToBookRatioTTM")),
+                "pe": _safe_float(rt.get("priceEarningsRatioTTM")),
+                "roe": _safe_float(km.get("returnOnEquityTTM") or rt.get("returnOnEquityTTM")),
+                "roic": _safe_float(km.get("returnOnInvestedCapitalTTM")),
+                "gross_margin": _safe_float(rt.get("grossProfitMarginTTM")),
+                "operating_cf": _safe_float(cf.get("operatingCashFlowTTM")),
+                "fcf": _safe_float(cf.get("freeCashFlowTTM")),
+            }
+            rows.append(row)
+        except Exception:
+            rows.append({
+                "symbol": s, "ev_ebitda": float("nan"), "pb": float("nan"), "pe": float("nan"),
+                "roe": float("nan"), "roic": float("nan"), "gross_margin": float("nan"),
+                "operating_cf": float("nan"), "fcf": float("nan"),
+            })
+
+    df = pd.DataFrame(rows).drop_duplicates("symbol")
+
+    if debug and not df.empty:
+        numeric_cols = ["ev_ebitda","pb","pe","roe","roic","gross_margin","operating_cf","fcf"]
+        coverage = df[numeric_cols].notna().sum().to_dict()
+        total = len(df)
+        print("Fundamentals coverage:", {k: f"{v}/{total}" for k, v in coverage.items()})
+    return df
+
+
+# -----------------------------------------------------------------------------
+# Precios diarios
+# -----------------------------------------------------------------------------
+def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True) -> pd.DataFrame:
+    """
+    Devuelve ['date','close'] ascendente usando historical-price-full (serietype=line)
+    """
+    params = {"from": start, "to": end, "serietype": "line"}
+    ttl = 3600 if use_cache else None
+
+    # probar variantes del símbolo aquí también por si acaso
+    hist = []
+    for candidate in _sanitize_symbol(symbol):
+        data = _http_get(f"historical-price-full/{candidate}", params=params, ttl=ttl)
+        hist = (data or {}).get("historical", [])
+        if hist:
+            break
+
+    if not hist:
+        return pd.DataFrame(columns=["date","close"])
+
+    df = pd.DataFrame(hist)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    if "close" not in df.columns:
+        for alt in ("adjClose", "Adj Close"):
+            if alt in df.columns:
+                df["close"] = df[alt]
+                break
+    df = df.dropna(subset=["date","close"]).sort_values("date")
+    return df[["date","close"]].reset_index(drop=True)
 
 
 # -----------------------------------------------------------------------------
