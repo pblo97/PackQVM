@@ -267,34 +267,110 @@ def fetch_fundamentals_batch(symbols: List[str], use_cache: bool = True, debug: 
 # -----------------------------------------------------------------------------
 # Precios diarios
 # -----------------------------------------------------------------------------
-def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True) -> pd.DataFrame:
+def fetch_screener(
+    limit: int = 300,
+    mcap_min: float = 2e9,
+    volume_min: int = 1_000_000,
+    use_cache: bool = True
+) -> pd.DataFrame:
     """
-    Devuelve ['date','close'] ascendente usando historical-price-full (serietype=line)
-    """
-    params = {"from": start, "to": end, "serietype": "line"}
-    ttl = 3600 if use_cache else None
+    Usa /stock-screener (FMP) y devuelve SIEMPRE columnas normalizadas:
+      ['symbol','companyName','sector','market_cap','price','volume']
 
-    # probar variantes del símbolo aquí también por si acaso
-    hist = []
-    for candidate in _sanitize_symbol(symbol):
-        data = _http_get(f"historical-price-full/{candidate}", params=params, ttl=ttl)
-        hist = (data or {}).get("historical", [])
-        if hist:
+    - sector: mapeado desde varias variantes posibles; fallback "Unknown"
+    - symbol: uppercase y sin espacios
+    """
+    params = {
+        "limit": int(limit),
+        "marketCapMoreThan": float(mcap_min),
+        "volumeMoreThan": int(volume_min),
+        # puedes agregar filtros opcionales: betaMoreThan, country, exchange, etc.
+    }
+    ttl = 900 if use_cache else None
+    data = _http_get("stock-screener", params=params, ttl=ttl)
+
+    if not isinstance(data, list) or len(data) == 0:
+        return pd.DataFrame(columns=["symbol","companyName","sector","market_cap","price","volume"])
+
+    df = pd.DataFrame(data)
+
+    # --- Normalización de nombres base (cuando existen) ---
+    # FMP suele traer marketCap / price / volume / companyName / sector
+    rename = {
+        "marketCap": "market_cap",
+        "companyName": "companyName",
+        "price": "price",
+        "volume": "volume",
+        "symbol": "symbol",
+        # "sector": "sector"  # se maneja aparte con fallback inteligente
+    }
+    for src, dst in rename.items():
+        if src in df.columns and src != dst:
+            df.rename(columns={src: dst}, inplace=True)
+
+    # --- Symbol limpio ---
+    if "symbol" in df.columns:
+        df["symbol"] = (
+            df["symbol"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+    else:
+        # Sin symbol no hay nada que hacer…
+        return pd.DataFrame(columns=["symbol","companyName","sector","market_cap","price","volume"])
+
+    # --- Sector robusto: tomar primera columna disponible ---
+    # Orden de preferencia: 'sector' -> 'sectorName' -> 'industry' -> 'industryTitle' -> 'subSector'
+    sector_col = None
+    for cand in ["sector", "sectorName", "industry", "industryTitle", "subSector"]:
+        if cand in df.columns:
+            sector_col = cand
             break
 
-    if not hist:
-        return pd.DataFrame(columns=["date","close"])
+    if sector_col is None:
+        # crea columna sector si no existe ninguna fuente
+        df["sector"] = "Unknown"
+    else:
+        # copia y normaliza a string no nulo
+        df["sector"] = (
+            df[sector_col]
+            .astype(str)
+            .str.strip()
+            .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+            .fillna("Unknown")
+        )
 
-    df = pd.DataFrame(hist)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    if "close" not in df.columns:
-        for alt in ("adjClose", "Adj Close"):
-            if alt in df.columns:
-                df["close"] = df[alt]
-                break
-    df = df.dropna(subset=["date","close"]).sort_values("date")
-    return df[["date","close"]].reset_index(drop=True)
+    # --- market_cap / price / volume numéricos ---
+    for col, target in [
+        ("market_cap", "market_cap"),
+        ("price", "price"),
+        ("volume", "volume"),
+    ]:
+        if col in df.columns:
+            df[target] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[target] = pd.NA
+
+    # --- companyName opcional pero útil para UI ---
+    if "companyName" not in df.columns:
+        # algunos endpoints traen 'companyName', otros 'company'
+        if "company" in df.columns:
+            df["companyName"] = df["company"]
+        else:
+            df["companyName"] = pd.NA
+
+    # --- Selección y limpieza final ---
+    keep = ["symbol", "companyName", "sector", "market_cap", "price", "volume"]
+    out = (
+        df[keep]
+        .dropna(subset=["symbol"])
+        .drop_duplicates("symbol")
+        .reset_index(drop=True)
+    )
+
+    return out
+
 
 
 # -----------------------------------------------------------------------------
