@@ -290,7 +290,7 @@ if run_btn:
 # PASO 4: F-SCORE (nativo FMP si viene; si no, calculado)
 # ---------------------------------------------------------------------
         status.text("🏆 Paso 4/8: Calculando / Inyectando F-Score...")
-        progress.bar(40)
+        progress.progress(40)
 
         # Columnas básicas que intentaremos tener
         fcols = ["symbol","roe","fcf","operating_cf","roa","net_income","total_assets","piotroskiScore"]
