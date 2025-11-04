@@ -34,7 +34,8 @@ from data_fetcher import (
     fetch_screener,
     fetch_fundamentals_batch,
     fetch_prices,
-    fetch_financial_scores
+    fetch_financial_scores,
+    fetch_financial_basics
 )
 
 from factor_calculator import compute_all_factors
@@ -274,6 +275,15 @@ if run_btn:
         # Mergear contra fundamentals para que esté disponible en todo el pipeline
         fundamentals = fundamentals.merge(scores_df, on="symbol", how="left")
         st.session_state["fundamentals_plus_scores"] = fundamentals.copy()
+
+        symbols_scope = passed_filters["symbol"].dropna().astype(str).str.upper().unique().tolist()
+
+        # 2a) Traer básicos (IS/CF/BS) y mergearlos a fundamentals
+        basics = fetch_financial_basics(symbols_scope, period="annual", use_cache=True)
+        st.session_state["financial_basics_raw"] = basics.copy()
+
+        fundamentals = fundamentals.merge(basics, on="symbol", how="left")
+        st.session_state["fundamentals_plus_basics"] = fundamentals.copy()
 
         # 4) F-Score
         # ---------------------------------------------------------------------

@@ -447,3 +447,94 @@ if __name__ == "__main__":
             print("\nPrices:", sym, len(px)); print(px.head())
     except Exception as e:
         print("Prices error:", e)
+
+
+# data_fetcher.py
+import pandas as pd
+from typing import Iterable, List, Dict
+
+def fetch_financial_basics(
+    symbols: Iterable[str],
+    period: str = "annual",   # "annual" | "quarter"
+    use_cache: bool = True,
+) -> pd.DataFrame:
+    """
+    Descarga el MINIMO necesario para F-Score local desde 3 endpoints FMP
+    y lo normaliza a columnas estándar que usa el pipeline:
+
+      symbol, revenue, gross_margin, net_income, total_assets,
+      operating_cf, capex, fcf, current_ratio, long_term_debt,
+      shares_outstanding, asset_turnover, roa
+
+    - IS: income-statement
+    - CF: cash-flow-statement
+    - BS: balance-sheet-statement
+    """
+    syms = [str(s).strip().upper() for s in symbols if isinstance(s, str)]
+    if not syms:
+        cols = [
+            "symbol","revenue","gross_margin","net_income","total_assets",
+            "operating_cf","capex","fcf","current_ratio","long_term_debt",
+            "shares_outstanding","asset_turnover","roa"
+        ]
+        return pd.DataFrame(columns=cols)
+
+    ttl = 900 if use_cache else None
+    rows: List[Dict] = []
+
+    for s in syms:
+        try:
+            is_ = _http_get("income-statement", {"symbol": s, "period": period, "limit": 1}, ttl=ttl)
+            cf_ = _http_get("cash-flow-statement", {"symbol": s, "period": period, "limit": 1}, ttl=ttl)
+            bs_ = _http_get("balance-sheet-statement", {"symbol": s, "period": period, "limit": 1}, ttl=ttl)
+
+            is_d = (is_[0] if isinstance(is_, list) and is_ else {}) if isinstance(is_, (list, dict)) else {}
+            cf_d = (cf_[0] if isinstance(cf_, list) and cf_ else {}) if isinstance(cf_, (list, dict)) else {}
+            bs_d = (bs_[0] if isinstance(bs_, list) and bs_ else {}) if isinstance(bs_, (list, dict)) else {}
+
+            # ------- Income Statement -------
+            revenue       = pd.to_numeric(is_d.get("revenue"), errors="coerce")
+            gross_profit  = pd.to_numeric(is_d.get("grossProfit"), errors="coerce")
+            net_income    = pd.to_numeric(is_d.get("netIncome"), errors="coerce")
+            # shares (usa weighted average si está; si no, outstanding del BS)
+            shs           = pd.to_numeric(is_d.get("weightedAverageShsOut"), errors="coerce")
+
+            # ------- Cash Flow -------
+            ocf           = pd.to_numeric(cf_d.get("netCashProvidedByOperatingActivities") or cf_d.get("operatingCashFlow"), errors="coerce")
+            capex         = pd.to_numeric(cf_d.get("capitalExpenditure"), errors="coerce")  # suele venir NEGATIVO en FMP
+            # FCF = OCF - CapEx (capex negativo ⇒ resta un negativo = suma)
+            fcf           = (ocf - capex) if pd.notna(ocf) and pd.notna(capex) else pd.NA
+
+            # ------- Balance Sheet -------
+            total_assets  = pd.to_numeric(bs_d.get("totalAssets"), errors="coerce")
+            current_assets= pd.to_numeric(bs_d.get("totalCurrentAssets"), errors="coerce")
+            current_liabs = pd.to_numeric(bs_d.get("totalCurrentLiabilities"), errors="coerce")
+            long_debt     = pd.to_numeric(bs_d.get("longTermDebt") or bs_d.get("longTermDebtNoncurrent"), errors="coerce")
+            shs_out       = pd.to_numeric(bs_d.get("commonStockSharesOutstanding"), errors="coerce")
+
+            # ------- Derivados -------
+            gross_margin  = (gross_profit / revenue) if pd.notna(gross_profit) and pd.notna(revenue) and revenue != 0 else pd.NA
+            current_ratio = (current_assets / current_liabs) if pd.notna(current_assets) and pd.notna(current_liabs) and current_liabs != 0 else pd.NA
+            asset_turnover= (revenue / total_assets) if pd.notna(revenue) and pd.notna(total_assets) and total_assets != 0 else pd.NA
+            roa           = (net_income / total_assets) if pd.notna(net_income) and pd.notna(total_assets) and total_assets != 0 else pd.NA
+
+            rows.append({
+                "symbol": s,
+                "revenue": revenue,
+                "gross_margin": gross_margin,
+                "net_income": net_income,
+                "total_assets": total_assets,
+                "operating_cf": ocf,
+                "capex": capex,
+                "fcf": fcf,
+                "current_ratio": current_ratio,
+                "long_term_debt": long_debt,
+                "shares_outstanding": shs if pd.notna(shs) else shs_out,
+                "asset_turnover": asset_turnover,
+                "roa": roa,
+            })
+        except Exception:
+            rows.append({"symbol": s})
+
+    out = pd.DataFrame(rows).drop_duplicates("symbol")
+    return out
