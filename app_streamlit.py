@@ -1,578 +1,960 @@
+# app_streamlit.py
 """
-QVM Screener App V2 - Con Piotroski Real y Parámetros Ajustables
-================================================================
+QVM Screener V2 - Con Momentum Real + MA200 + F-Score
+======================================================
 
-Interfaz Streamlit con:
-✅ Piotroski Score real (9 checks completos)
-✅ Quality-Value Score sin multicolinealidad
-✅ Sliders para ajustar TODOS los parámetros
-✅ Análisis por pasos con checks y visualizaciones
-✅ Tablas interactivas y exportables
+Implementación académica completa con:
+✅ Momentum real desde precios (Jegadeesh & Titman, 1993)
+✅ Filtro MA200 obligatorio (Faber, 2007)
+✅ Piotroski F-Score (Piotroski, 2000) — Forma B (sin ROE histórico)
+✅ Sector-neutral factors
+✅ Reglas heurísticas robustas (filtros optimizados)
+
+Módulos requeridos:
+- data_fetcher.py: fetch_screener, fetch_fundamentals_batch, fetch_prices
+- factor_calculator.py: compute_all_factors (V2 con neutralización)
+- momentum_calculator.py: calculate_momentum_batch (12M-1M), etc.
+- piotroski_fscore.py: calculate_simplified_fscore_no_roe, filter_by_fscore
+- screener_filters.py: FilterConfig, apply_all_filters
+- backtest_engine.py: backtest_portfolio, calculate_portfolio_metrics, TradingCosts
 """
 
-import streamlit as st
+from __future__ import annotations
+import os
+import shutil
+from datetime import datetime, timedelta
+
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from datetime import datetime
-import json
+import streamlit as st
+import altair as alt
 
-# Imports del pipeline
-from qvm_pipeline_v2 import (
-    run_qvm_pipeline_v2,
-    QVMConfig,
-    analyze_portfolio_v2,
+# ----------------------------- Imports proyecto -----------------------------
+from data_fetcher import (
+    fetch_screener,
+    fetch_fundamentals_batch,
+    fetch_prices,
+    fetch_financial_scores,
+    fetch_financial_basics
 )
 
+from factor_calculator import compute_all_factors
 
-# ============================================================================
-# CONFIGURACIÓN DE LA APP
-# ============================================================================
+from screener_filters import (
+    apply_all_filters,
+    filter_by_qvm,
+    FilterConfig,
+)
+
+from backtest_engine import (
+    backtest_portfolio,
+    calculate_portfolio_metrics,
+    TradingCosts,
+)
+
+# ⭐ Módulos nuevos / reforzados
+from momentum_calculator import (
+    calculate_momentum_batch,  # batch(dict<symbol->df_prices>) → df con momentum y MA200
+)
+
+# Alias Forma B (sin ROE histórico) para mantener compatibilidad
+from piotroski_fscore import (
+    calculate_simplified_fscore_no_roe as calculate_simplified_fscore,
+    filter_by_fscore,  # disponible si quisieras exponer filtro directo
+)
+
+# =============================================================================
+# CONFIG INICIAL DE PÁGINA
+# =============================================================================
 
 st.set_page_config(
-    page_title="QVM Screener V2 - Piotroski Real",
-    page_icon="🎯",
+    page_title="QVM Screener V2",
+    page_icon="🚀",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# CSS personalizado
-st.markdown("""
+st.markdown(
+    """
 <style>
-    .block-container { padding-top: 1rem; padding-bottom: 2rem; }
-    .stAlert { padding: 0.6rem 1rem; margin-bottom: 0.5rem; }
-    h1 { font-size: 2.5rem !important; letter-spacing: -0.5px; }
-    h2 { font-size: 1.8rem !important; margin-top: 1.5rem; }
-    h3 { font-size: 1.4rem !important; }
-    .metric-card {
-        background: rgba(255,255,255,0.05);
-        border-radius: 8px;
-        padding: 1rem;
-        margin: 0.5rem 0;
-    }
+.block-container { padding-top: 0.8rem; padding-bottom: 1.0rem; }
+h1, h2, h3 { letter-spacing: .2px; }
+hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .5rem 0; }
+.stAlert { padding: 0.5rem 1rem; }
 </style>
-""", unsafe_allow_html=True)
-
-
-# ============================================================================
-# HEADER
-# ============================================================================
-
-st.title("🎯 QVM Screener V2")
-st.markdown("**Quality-Value Momentum Strategy** con Piotroski Score Real y Zero Multicolinealidad")
-
-st.divider()
-
-
-# ============================================================================
-# SIDEBAR - PARÁMETROS AJUSTABLES
-# ============================================================================
-
-with st.sidebar:
-    st.header("⚙️ Configuración")
-
-    st.subheader("📊 Universo")
-
-    universe_size = st.slider(
-        "Tamaño del universo",
-        min_value=50,
-        max_value=500,
-        value=200,
-        step=50,
-        help="Número de stocks a considerar inicialmente"
-    )
-
-    min_market_cap = st.slider(
-        "Market Cap mínimo ($B)",
-        min_value=0.5,
-        max_value=10.0,
-        value=2.0,
-        step=0.5,
-        help="Market cap mínimo en miles de millones"
-    )
-
-    min_volume = st.slider(
-        "Volumen diario mínimo (K)",
-        min_value=100,
-        max_value=2000,
-        value=500,
-        step=100,
-        help="Volumen diario mínimo en miles de acciones"
-    )
-
-    st.divider()
-
-    st.subheader("🎯 Quality-Value Weights")
-
-    st.info("Los pesos se normalizarán automáticamente para sumar 100%")
-
-    w_quality = st.slider(
-        "📈 Quality (Piotroski)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.40,
-        step=0.05,
-        help="Peso del Piotroski Score"
-    )
-
-    w_value = st.slider(
-        "💰 Value (Multiples)",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.35,
-        step=0.05,
-        help="Peso de los múltiplos de valoración"
-    )
-
-    w_fcf_yield = st.slider(
-        "💵 FCF Yield",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.15,
-        step=0.05,
-        help="Peso del FCF Yield"
-    )
-
-    w_momentum = st.slider(
-        "🚀 Momentum",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.10,
-        step=0.05,
-        help="Peso del momentum (actualmente placeholder)"
-    )
-
-    # Mostrar suma de pesos
-    total_weight = w_quality + w_value + w_fcf_yield + w_momentum
-    st.caption(f"Total: {total_weight:.2f} (se normalizará a 1.0)")
-
-    st.divider()
-
-    st.subheader("🔍 Filtros")
-
-    min_piotroski = st.slider(
-        "Piotroski Score mínimo",
-        min_value=0,
-        max_value=9,
-        value=5,
-        step=1,
-        help="Mínimo Piotroski Score (0-9). Recomendado: 6+"
-    )
-
-    min_qv_score = st.slider(
-        "QV Score mínimo",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.40,
-        step=0.05,
-        help="Mínimo Quality-Value Score (0-1). Recomendado: 0.5+"
-    )
-
-    max_pe = st.slider(
-        "P/E máximo",
-        min_value=10.0,
-        max_value=100.0,
-        value=50.0,
-        step=5.0,
-        help="P/E máximo permitido"
-    )
-
-    max_ev_ebitda = st.slider(
-        "EV/EBITDA máximo",
-        min_value=5.0,
-        max_value=50.0,
-        value=25.0,
-        step=5.0,
-        help="EV/EBITDA máximo permitido"
-    )
-
-    require_positive_fcf = st.checkbox(
-        "Requerir FCF positivo",
-        value=True,
-        help="Solo incluir empresas con Free Cash Flow positivo"
-    )
-
-    st.divider()
-
-    st.subheader("📋 Portfolio")
-
-    portfolio_size = st.slider(
-        "Tamaño del portfolio",
-        min_value=10,
-        max_value=50,
-        value=30,
-        step=5,
-        help="Número de stocks en el portfolio final"
-    )
-
-    st.divider()
-
-    # Botón de ejecución
-    run_button = st.button("🚀 Ejecutar Screening", type="primary", use_container_width=True)
-
-    # Botón para limpiar caché
-    if st.button("🗑️ Limpiar Caché", use_container_width=True):
-        st.cache_data.clear()
-        st.success("Caché limpiado!")
-
-
-# ============================================================================
-# CREAR CONFIGURACIÓN
-# ============================================================================
-
-config = QVMConfig(
-    universe_size=universe_size,
-    min_market_cap=min_market_cap * 1e9,  # Convertir a dólares
-    min_volume=min_volume * 1000,          # Convertir a unidades
-    w_quality=w_quality,
-    w_value=w_value,
-    w_fcf_yield=w_fcf_yield,
-    w_momentum=w_momentum,
-    min_piotroski_score=min_piotroski,
-    min_qv_score=min_qv_score,
-    max_pe=max_pe,
-    max_ev_ebitda=max_ev_ebitda,
-    require_positive_fcf=require_positive_fcf,
-    portfolio_size=portfolio_size,
+""",
+    unsafe_allow_html=True,
 )
 
+# =============================================================================
+# CACHÉ / WRAPPERS
+# =============================================================================
+@st.cache_data(ttl=900)
+def cached_scores(symbols: tuple):
+    from data_fetcher import fetch_financial_scores
+    return fetch_financial_scores(list(symbols), use_cache=True)
 
-# ============================================================================
-# MAIN APP
-# ============================================================================
+@st.cache_data(ttl=3600)
+def cached_screener(limit: int, mcap_min: float, volume_min: int) -> pd.DataFrame:
+    return fetch_screener(limit, mcap_min, volume_min, use_cache=True)
 
-# Mostrar configuración actual
-with st.expander("📋 Ver Configuración Completa", expanded=False):
-    config_df = pd.DataFrame([config.to_dict()]).T
-    config_df.columns = ['Valor']
-    st.dataframe(config_df, use_container_width=True)
+@st.cache_data(ttl=3600)
+def cached_fundamentals(symbols: tuple[str, ...]) -> pd.DataFrame:
+    return fetch_fundamentals_batch(list(symbols), use_cache=True)
 
+@st.cache_data(ttl=1800)
+def cached_prices(symbol: str, start: str, end: str) -> pd.DataFrame | None:
+    return fetch_prices(symbol, start, end, use_cache=True)
 
-# Ejecutar pipeline
-if run_button or st.session_state.get('results') is not None:
+def clear_cache_disk_and_memory() -> bool:
+    """
+    Limpia caché en disco usada por data_fetcher (.cache/fmp) y Streamlit cache.
+    """
+    cache_dir = ".cache/fmp"
+    try:
+        if os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        st.cache_data.clear()
+        return True
+    except Exception:
+        return False
 
-    if run_button:
-        # Limpiar resultados anteriores
-        st.session_state.results = None
+# =============================================================================
+# HEADER
+# =============================================================================
 
-    if st.session_state.get('results') is None:
-        with st.spinner("🔄 Ejecutando pipeline..."):
+c1, c2 = st.columns([0.85, 0.15])
+with c1:
+    st.markdown("<h1 style='margin-bottom:0'>🚀 QVM Screener V2</h1>", unsafe_allow_html=True)
+    st.caption("Quality × Value × Momentum × F-Score | Implementación Académica Completa")
+with c2:
+    st.caption(datetime.now().strftime("%d %b %Y • %H:%M"))
+
+st.markdown("<hr/>", unsafe_allow_html=True)
+
+# =============================================================================
+# SIDEBAR
+# =============================================================================
+
+with st.sidebar:
+    st.markdown("### ⚙️ Configuración")
+
+    # Universo
+    with st.expander("🌍 Universo", expanded=True):
+        limit = st.slider("Tamaño universo", 50, 500, 300, 50)
+        mcap_min = st.number_input("Market Cap mín. (USD)", value=2e9, step=1e8, format="%.0f")
+        volume_min = st.number_input("Volumen mín. diario", value=1_000_000, step=100_000)
+
+    # Filtros de calidad
+    with st.expander("🛡️ Quality Filters", expanded=True):
+        min_roe = st.slider("ROE mín.", 0.0, 0.50, 0.15, 0.05)
+        min_gm = st.slider("Gross Margin mín.", 0.0, 0.80, 0.30, 0.05)
+        req_fcf = st.toggle("Exigir FCF > 0", value=True)
+        req_ocf = st.toggle("Exigir Operating CF > 0", value=True)
+
+    # F-Score
+    with st.expander("🏆 F-Score (Piotroski)", expanded=True):
+        use_fscore = st.toggle("Usar F-Score filter", value=True)
+        min_fscore = st.slider("F-Score mínimo", 0, 9, 6, 1) if use_fscore else 0
+        if use_fscore:
+            st.caption("6-7: Medium quality | 8-9: High quality")
+
+    # Momentum + MA200
+    with st.expander("🎯 Momentum + MA200", expanded=True):
+        require_ma200 = st.toggle("⭐ Exigir Price > MA200", value=True,
+                                  help="Filtro crítico: históricamente reduce drawdowns.")
+        if require_ma200:
+            st.caption("✅ Solo acciones en uptrend (price > MA200)")
+        min_momentum = st.slider("Momentum 12M mín.", -0.50, 0.50, 0.05, 0.05, format="%.2f")
+
+    # Pesos
+    with st.expander("💎 Factor Weights", expanded=True):
+        w_quality = st.slider("Peso Quality", 0.0, 1.0, 0.35, 0.05)
+        w_value = st.slider("Peso Value", 0.0, 1.0, 0.25, 0.05)
+        w_momentum = st.slider("Peso Momentum", 0.0, 1.0, 0.25, 0.05)
+        w_fscore = st.slider("Peso F-Score", 0.0, 1.0, 0.15, 0.05)
+        total_w = max(w_quality + w_value + w_momentum + w_fscore, 1e-9)
+        w_quality, w_value, w_momentum, w_fscore = (
+            w_quality / total_w, w_value / total_w, w_momentum / total_w, w_fscore / total_w
+        )
+        st.caption(f"Normalizado: Q={w_quality:.2f} V={w_value:.2f} M={w_momentum:.2f} F={w_fscore:.2f}")
+
+    # Selección final
+    with st.expander("📋 Portfolio Selection", expanded=True):
+        top_n = st.slider("Top N símbolos", 5, 100, 30, 5)
+
+    st.markdown("---")
+    run_btn = st.button("🚀 Ejecutar Pipeline", type="primary", use_container_width=True)
+
+    cA, cB = st.columns(2)
+    with cA:
+        if st.button("🗑️ Limpiar caché", use_container_width=True):
+            if clear_cache_disk_and_memory():
+                st.success("✅ Caché limpiada")
+            else:
+                st.warning("⚠️ No se pudo limpiar toda la caché")
+    with cB:
+        if st.button("ℹ️ Info", use_container_width=True):
+            st.info(
+                "- Momentum 12M-1M real\n"
+                "- MA200 filter obligatorio (recomendado)\n"
+                "- F-Score simplificado (0-9)\n"
+                "- Neutralización por sector en factores"
+            )
+
+# =============================================================================
+# TABS
+# =============================================================================
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Pipeline",
+    "💎 QVM Rankings",
+    "🎯 Momentum + MA200",
+    "🏆 F-Score Analysis",
+    "📈 Backtest",
+    "💾 Export",
+])
+
+# =============================================================================
+# PIPELINE
+# =============================================================================
+
+if run_btn:
+    progress = st.progress(0)
+    status = st.empty()
+
+    try:
+        # 1) Screener
+        status.text("📊 Paso 1/8: Descargando universo…")
+        progress.progress(10)
+        universe = cached_screener(limit, mcap_min, volume_min)
+        if universe is None or universe.empty:
+            st.error("❌ Screener vacío.")
+            st.stop()
+        st.session_state["universe"] = universe
+
+        # 2) Fundamentals
+        status.text("📊 Paso 2/8: Descargando fundamentales…")
+        progress.progress(20)
+        fundamentals = cached_fundamentals(tuple(universe["symbol"].tolist()))
+        if fundamentals is None or fundamentals.empty:
+            st.error("❌ No se obtuvieron fundamentales.")
+            st.stop()
+        st.session_state["fundamentals"] = fundamentals
+
+        # 3) Filtros de calidad optimizados
+        status.text("🛡️ Paso 3/8: Aplicando filtros de calidad…")
+        progress.progress(30)
+
+        fcfg = FilterConfig(
+            min_roe=min_roe,
+            min_gross_margin=min_gm,
+            require_positive_fcf=req_fcf,
+            require_positive_ocf=req_ocf,
+            max_pe=50.0,
+            max_ev_ebitda=25.0,
+            min_volume=volume_min,
+            min_market_cap=mcap_min,
+        )
+
+        # Merge inicial para evaluar filtros sobre un DF coherente
+        df_merged = universe.merge(fundamentals, on="symbol", how="left")
+        passed_filters, diagnostics = apply_all_filters(df_merged, fcfg)
+        st.session_state["passed_filters"] = passed_filters
+        st.session_state["diagnostics"] = diagnostics
+
+        if passed_filters.empty:
+            st.error("❌ Ningún símbolo pasó los filtros de calidad.")
+            st.stop()
+
+        # Scope único y consistente para todo lo que sigue
+        def _extract_symbols(*dfs) -> list[str]:
+            for df in dfs:
+                if isinstance(df, pd.DataFrame) and not df.empty and "symbol" in df.columns:
+                    return (
+                        df["symbol"]
+                        .dropna()
+                        .astype(str).str.strip().str.upper()
+                        .unique().tolist()
+                    )
+            return []
+
+        symbols_scope = _extract_symbols(passed_filters, universe)
+        st.session_state["symbols_scope"] = symbols_scope
+        if not symbols_scope:
+            st.error("No hay símbolos válidos tras los filtros.")
+            st.stop()
+
+        # --------- BASICS (IS/CF/BS) y MERGE ordenado ---------
+        basics = fetch_financial_basics(symbols_scope, period="annual", use_cache=True)
+        st.session_state["financial_basics_raw"] = basics.copy()
+
+        # 1) fundamentales (ttm) ⟵ basics (IS/CF/BS)  → coalesce de solapados
+        fundamentals = fundamentals.merge(basics, on="symbol", how="left", suffixes=("", "_b"))
+
+        def _coalesce(col: str):
+            bcol = f"{col}_b"
+            if col in fundamentals.columns and bcol in fundamentals.columns:
+                fundamentals[col] = fundamentals[col].combine_first(fundamentals[bcol])
+                fundamentals.drop(columns=[bcol], inplace=True, errors="ignore")
+            elif bcol in fundamentals.columns and col not in fundamentals.columns:
+                fundamentals.rename(columns={bcol: col}, inplace=True)
+
+        for col in [
+            "revenue","gross_margin","net_income","total_assets",
+            "operating_cf","capex","fcf","current_ratio","long_term_debt",
+            "shares_outstanding","asset_turnover","roa"
+        ]:
+            _coalesce(col)
+
+        # Guarda versión coalescida (útil para Tab debug)
+        st.session_state["fundamentals_plus_basics"] = fundamentals.copy()
+
+        # --------- FINANCIAL SCORES (Piotroski/Altman) ---------
+        # Usa un solo scope y guarda crudo para Tab 4 debug
+        scores_df = fetch_financial_scores(symbols_scope, use_cache=True)
+        st.session_state["financial_scores_raw"] = scores_df.copy()
+
+        # Mergea scores al fundamental coalescido para que quede disponible globalmente
+        fundamentals = fundamentals.merge(scores_df, on="symbol", how="left")
+        st.session_state["fundamentals_plus_scores"] = fundamentals.copy()
+
+        # ---------------- PASO 4: F-SCORE (nativo si hay; sino local) ----------------
+        status.text("🏆 Paso 4/8: Calculando / Inyectando F-Score…")
+        progress.progress(40)
+
+        # Columnas que intentaremos traer; si faltan para el local, las rellenamos con NaN
+        need_for_local = ["roe","fcf","operating_cf","roa","net_income","total_assets"]
+        fcols = ["symbol","piotroskiScore"] + [c for c in need_for_local if c in fundamentals.columns]
+        base_cols = [c for c in fcols if c in fundamentals.columns] or ["symbol"]
+
+        df_for_fscore = (
+            passed_filters[["symbol"]]
+            .drop_duplicates("symbol")
+            .merge(fundamentals[base_cols].drop_duplicates("symbol"), on="symbol", how="left")
+        )
+
+        # ¿Tenemos algún piotroskiScore válido?
+        has_native = (
+            "piotroskiScore" in df_for_fscore.columns
+            and pd.to_numeric(df_for_fscore["piotroskiScore"], errors="coerce").notna().any()
+        )
+
+        if has_native:
+            df_for_fscore["fscore"] = pd.to_numeric(df_for_fscore["piotroskiScore"], errors="coerce")
+            fscore_source = "FMP (financial-scores)"
+        else:
+            # Asegura columnas requeridas para forma B local
+            for c in need_for_local:
+                if c not in df_for_fscore.columns:
+                    df_for_fscore[c] = np.nan
+            df_for_fscore["fscore"] = calculate_simplified_fscore(df_for_fscore)
+            fscore_source = "Local (simplificado)"
+
+        # Filtro por umbral si está activado
+        df_fscore_passed = df_for_fscore[df_for_fscore["fscore"] >= (min_fscore if use_fscore else -9)].copy()
+
+        # Exponer para Tab 4 y pipeline
+        st.session_state["fscore_data"] = df_for_fscore.copy()
+        st.session_state["fscore_source"] = fscore_source
+        st.session_state["fscore_passed"] = df_fscore_passed.copy()
+
+        if df_fscore_passed.empty:
+            st.error(f"❌ Ningún símbolo con F-Score ≥ {min_fscore} (source: {fscore_source})")
+            st.stop()
+
+        # 5) Precios
+        status.text("📈 Paso 5/8: Descargando precios…")
+        progress.progress(55)
+        symbols_to_fetch = df_fscore_passed["symbol"].dropna().astype(str).unique().tolist()[:limit]
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=2 * 365)).strftime("%Y-%m-%d")  # 2 años
+        prices_dict: dict[str, pd.DataFrame] = {}
+        step = 20 / max(len(symbols_to_fetch), 1)
+        for i, sym in enumerate(symbols_to_fetch, 1):
             try:
-                results = run_qvm_pipeline_v2(config=config, verbose=False)
-                st.session_state.results = results
-            except Exception as e:
-                st.error(f"❌ Error al ejecutar pipeline: {str(e)}")
-                st.stop()
+                px = cached_prices(sym, start_date, end_date)
+                if px is not None and len(px) >= 252:
+                    prices_dict[sym] = px
+            except Exception:
+                pass
+            if not (i % 10):
+                progress.progress(min(55 + int(i * step), 75))
+        if not prices_dict:
+            st.error("❌ No se obtuvieron precios suficientes (>=252 sesiones).")
+            st.stop()
+        st.session_state["prices_dict"] = prices_dict
 
-    results = st.session_state.results
+        # 6) Momentum real + MA200
+        status.text("🎯 Paso 6/8: Calculando momentum real + MA200…")
+        progress.progress(80)
+        momentum_df = calculate_momentum_batch(prices_dict)
+        st.session_state["momentum_df"] = momentum_df
+        df_with_mom = df_fscore_passed.merge(
+            momentum_df[["symbol","momentum_12m1m","momentum_6m","composite_momentum","above_ma200","ma200","trend_strength"]],
+            on="symbol", how="left"
+        )
+        if require_ma200:
+            df_with_mom = df_with_mom[df_with_mom["above_ma200"] == True].copy()
+        df_with_mom = df_with_mom[df_with_mom["momentum_12m1m"] >= min_momentum].copy()
+        if df_with_mom.empty:
+            st.error("❌ Ningún símbolo pasó MA200/momentum.")
+            st.stop()
+        st.session_state["after_momentum"] = df_with_mom
 
-    # Verificar si hubo error
-    if 'error' in results:
-        st.error(f"❌ Pipeline failed: {results['error']}")
+        # 7) Factores QVM (sector-neutral)
+        status.text("💎 Paso 7/8: Calculando factores QVM…")
+        progress.progress(90)
+
+        # Universo limpio (conservar sector/mcap del universo)
+        in_scope = df_with_mom["symbol"].dropna().astype(str).unique().tolist()
+        df_universe_clean = (
+            universe.loc[:, ["symbol","sector","market_cap"]]
+            .drop_duplicates("symbol")
+            .merge(pd.DataFrame({"symbol": in_scope}), on="symbol", how="inner")
+        )
+
+        needed_fund_cols = ["symbol","ev_ebitda","pb","pe","roe","roic","gross_margin","fcf","operating_cf"]
+        df_fundamentals_clean = (
+            fundamentals.loc[:, [c for c in needed_fund_cols if c in fundamentals.columns]]
+            .drop_duplicates("symbol")
+            .merge(pd.DataFrame({"symbol": in_scope}), on="symbol", how="inner")
+        )
+        for c in needed_fund_cols:
+            if c not in df_fundamentals_clean.columns:
+                df_fundamentals_clean[c] = np.nan
+
+        # QVM con neutralización; reponderamos (1 - peso F) dentro de Q,V,M
+        renorm = max(w_quality + w_value + w_momentum, 1e-9)
+        wQ, wV, wM = (w_quality / renorm, w_value / renorm, w_momentum / renorm)
+
+        df_qvm = compute_all_factors(
+            df_universe_clean,
+            df_fundamentals_clean[needed_fund_cols],
+            sector_neutral=True,
+            w_quality=wQ,
+            w_value=wV,
+            w_momentum=wM,
+        )
+
+        keep_cols = ["symbol","momentum_12m1m","momentum_6m","composite_momentum","above_ma200","fscore","roe","sector","market_cap"]
+        keep_cols = [c for c in keep_cols if c in df_with_mom.columns]
+        df_qvm = df_qvm.merge(df_with_mom[keep_cols], on="symbol", how="left")
+
+        # Composite final incorporando F-Score
+        df_qvm["qvm_score_corrected"] = (
+            w_quality * df_qvm["quality_extended"]
+            + w_value * df_qvm["value_score"]
+            + w_momentum * df_qvm["composite_momentum"]
+            + w_fscore * (df_qvm["fscore"] / 9.0).fillna(0.0)
+        )
+        df_qvm["final_rank"] = df_qvm["qvm_score_corrected"].rank(pct=True, method="average")
+
+        st.session_state["df_with_factors"] = df_qvm
+
+        # 8) Selección final
+        status.text("📋 Paso 8/8: Seleccionando Top portfolio…")
+        progress.progress(97)
+        portfolio = df_qvm.nlargest(top_n, "qvm_score_corrected").reset_index(drop=True)
+        st.session_state["portfolio"] = portfolio
+
+        # Precios del portfolio
+        portfolio_prices = {sym: st.session_state["prices_dict"][sym]
+                            for sym in portfolio["symbol"] if sym in st.session_state["prices_dict"]}
+        st.session_state["portfolio_prices"] = portfolio_prices
+
+        progress.progress(100)
+        status.empty()
+        progress.empty()
+
+        st.success(f"✅ Pipeline completado: {len(portfolio)} acciones seleccionadas")
+
+        # Métricas rápidas
+        m1, m2, m3, m4, m5 = st.columns(5)
+        with m1: st.metric("Universo inicial", len(universe))
+        with m2: st.metric("Después filtros", len(passed_filters))
+        with m3:
+            if use_fscore:
+                st.metric(f"F-Score ≥ {min_fscore}", len(st.session_state.get("fscore_passed", [])))
+            else:
+                st.metric("F-Score", "No usado")
+        with m4:
+            tot_mom = len(st.session_state.get("after_momentum", []))
+            tot_before = len(df_fscore_passed)
+            rej_ma = max(tot_before - tot_mom, 0)
+            st.metric("Rechazados por MA200/Mom", rej_ma)
+        with m5: st.metric("Portfolio final", len(portfolio))
+
+    except Exception as e:
+        st.error(f"❌ Error en pipeline: {e}")
+        import traceback
+        with st.expander("🐛 Debug info"):
+            st.code(traceback.format_exc())
         st.stop()
 
-    # ========================================================================
-    # RESULTADOS
-    # ========================================================================
+# =============================================================================
+# TAB 1 — PIPELINE OVERVIEW
+# =============================================================================
 
-    st.success(f"✅ Pipeline completado exitosamente!")
+with tab1:
+    st.markdown("### 📊 Pipeline Overview")
+    if "portfolio" not in st.session_state:
+        st.info("👆 Configura parámetros y ejecuta el pipeline.")
+    else:
+        funnel = pd.DataFrame({
+            "Stage": [
+                "1. Universo inicial",
+                "2. Filtros calidad",
+                "3. F-Score filter",
+                "4. Precios válidos",
+                "5. MA200 + Momentum",
+                "6. Portfolio final",
+            ],
+            "Count": [
+                len(st.session_state.get("universe", [])),
+                len(st.session_state.get("passed_filters", [])),
+                len(st.session_state.get("fscore_passed", [])),
+                len(st.session_state.get("prices_dict", {})),
+                len(st.session_state.get("after_momentum", [])),
+                len(st.session_state.get("portfolio", [])),
+            ],
+        })
+        chart = alt.Chart(funnel).mark_bar().encode(
+            x=alt.X("Count:Q", title="Número de símbolos"),
+            y=alt.Y("Stage:N", sort=None, title=""),
+            color=alt.Color("Count:Q", scale=alt.Scale(scheme="blues"), legend=None),
+        ).properties(height=300)
+        st.altair_chart(chart, use_container_width=True)
 
-    # ------------------------------------------------------------------------
-    # ANÁLISIS POR PASOS
-    # ------------------------------------------------------------------------
-    st.header("📊 Análisis por Pasos")
+        st.markdown("#### 🛡️ Diagnóstico de Filtros")
+        diag = st.session_state.get("diagnostics")
+        if isinstance(diag, pd.DataFrame) and not diag.empty:
+            total = len(diag)
+            passed = int(diag["pass_all"].sum())
+            rejected = total - passed
+            c1, c2, c3 = st.columns(3)
+            with c1: st.metric("Total evaluados", total)
+            with c2: st.metric("Pasaron todos", passed, delta=f"{(passed/total*100):.1f}%")
+            with c3: st.metric("Rechazados", rejected, delta=f"-{(rejected/total*100):.1f}%", delta_color="inverse")
 
-    steps = results.get('steps', [])
+            if rejected > 0:
+                st.markdown("**Top razones de rechazo:**")
+                reasons = diag.loc[~diag["pass_all"], "reason"].value_counts().head(5)
+                for r, c in reasons.items():
+                    st.write(f"- {r}: {c} ({(c/rejected*100):.1f}%)")
 
-    if steps:
-        # Crear visualización de funnel
-        funnel_data = []
-        for i, step in enumerate(steps):
-            funnel_data.append({
-                'Step': f"{step.name}\n{step.description}",
-                'Count': step.output_count,
-                'Stage': i + 1
-            })
+# =============================================================================
+# TAB 2 — QVM RANKINGS
+# =============================================================================
 
-        funnel_df = pd.DataFrame(funnel_data)
+with tab2:
+    st.markdown("### 💎 QVM Rankings")
 
-        # Gráfico de funnel
-        fig_funnel = px.funnel(
-            funnel_df,
-            x='Count',
-            y='Step',
-            title="Pipeline Funnel - Stocks en Cada Paso",
-            labels={'Count': 'Número de Stocks'},
+    # ---------- Helpers locales ----------
+    def _ensure_sector(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Garantiza columna 'sector' usando alias comunes o merge con 'universe' si falta.
+        Mantiene idempotencia (no rompe si ya existe).
+        """
+        pf = df.copy()
+
+        # 1) Alias frecuentes dentro del propio DF
+        if "sector" not in pf.columns:
+            for cand in ("sector", "sectorName", "industry", "industryTitle", "subSector"):
+                if cand in pf.columns:
+                    pf["sector"] = (
+                        pf[cand].astype(str).str.strip()
+                        .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+                        .fillna("Unknown")
+                    )
+                    break
+
+        # 2) Merge con universo original si aún falta
+        if "sector" not in pf.columns:
+            uni = st.session_state.get("universe", pd.DataFrame())
+            if isinstance(uni, pd.DataFrame) and not uni.empty and "symbol" in uni.columns:
+                # Detecta columna sector en universo
+                sector_src = None
+                for cand in ("sector", "sectorName", "industry", "industryTitle", "subSector"):
+                    if cand in uni.columns:
+                        sector_src = cand
+                        break
+                if sector_src is not None:
+                    look = (
+                        uni[["symbol", sector_src]]
+                        .rename(columns={sector_src: "sector"})
+                        .dropna(subset=["symbol"])
+                        .drop_duplicates("symbol")
+                    )
+                    look["sector"] = (
+                        look["sector"].astype(str).str.strip()
+                        .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+                        .fillna("Unknown")
+                    )
+                    pf = (
+                        pf.drop(columns=["sector"], errors="ignore")
+                          .merge(look, on="symbol", how="left")
+                    )
+
+        # 3) Último recurso: crea la columna
+        if "sector" not in pf.columns:
+            pf["sector"] = "Unknown"
+
+        # Limpieza final
+        pf["sector"] = (
+            pf["sector"].astype(str).str.strip()
+              .replace({"": "Unknown", "None": "Unknown", "nan": "Unknown"})
+              .fillna("Unknown")
         )
-        fig_funnel.update_layout(height=400)
-        st.plotly_chart(fig_funnel, use_container_width=True)
+        return pf
 
-        # Tabla de detalles por paso
-        st.subheader("Detalles por Paso")
+    def _safe_metric(label: str, value, fmt: str | None = None):
+        """Evita excepciones en métricas cuando faltan columnas o hay NaNs."""
+        try:
+            if value is None or (isinstance(value, float) and (pd.isna(value) or np.isinf(value))):
+                st.metric(label, "—")
+            else:
+                st.metric(label, (fmt % value) if fmt else value)
+        except Exception:
+            st.metric(label, "—")
 
-        for step in steps:
-            status_emoji = "✅" if step.success else "❌"
-            pass_rate = step.get_pass_rate() * 100
+    # ---------- Cuerpo Tab ----------
+    pf_raw = st.session_state.get("portfolio", None)
 
-            with st.expander(f"{status_emoji} {step.name}: {step.output_count} stocks ({pass_rate:.1f}%)"):
-                col1, col2 = st.columns(2)
+    if pf_raw is None or not isinstance(pf_raw, pd.DataFrame) or pf_raw.empty:
+        st.info("Ejecuta el pipeline primero.")
+    else:
+        pf = pf_raw.copy()
+        # Garantiza 'sector'
+        pf = _ensure_sector(pf)
 
-                with col1:
-                    st.metric("Input", step.input_count)
-                    st.metric("Output", step.output_count)
+        # ===== MÉTRICAS DE CABECERA =====
+        a, b, c, d = st.columns(4)
+        with a:
+            _safe_metric("Portfolio Size", int(len(pf)))
+        with b:
+            avg_qvm = pf["qvm_score_corrected"].mean() if "qvm_score_corrected" in pf.columns and len(pf) else None
+            _safe_metric("Avg QVM Score", avg_qvm, "%.3f")
+        with c:
+            avg_f = pf["fscore"].mean() if "fscore" in pf.columns and len(pf) else None
+            _safe_metric("Avg F-Score", avg_f, "%.1f/9.0")
+        with d:
+            _safe_metric("Sectores", (pf["sector"].nunique() if "sector" in pf.columns else None))
 
-                with col2:
-                    st.metric("Pass Rate", f"{pass_rate:.1f}%")
-                    st.metric("Rejected", step.input_count - step.output_count)
+        st.markdown("---")
 
-                # Métricas adicionales
-                if step.metrics:
-                    st.markdown("**📊 Métricas:**")
-                    metrics_df = pd.DataFrame([step.metrics]).T
-                    metrics_df.columns = ['Valor']
-                    st.dataframe(metrics_df, use_container_width=True)
+        # ===== TABLA PRINCIPAL =====
+        cols = [
+            "symbol", "companyName", "sector",
+            "qvm_score_corrected", "final_rank",
+            "quality_extended", "value_score", "composite_momentum", "fscore",
+            "momentum_12m1m", "above_ma200", "roe", "market_cap",
+        ]
+        cols = [c for c in cols if c in pf.columns]
+        disp = pf[cols].copy()
 
-                # Warnings
-                if step.warnings:
-                    st.warning("⚠️ Warnings:")
-                    for warning in step.warnings:
-                        st.write(f"- {warning}")
+        # Renombres amigables
+        rename = {
+            "companyName": "Company",
+            "qvm_score_corrected": "QVM Score",
+            "final_rank": "Rank %ile",
+            "quality_extended": "Quality",
+            "value_score": "Value",
+            "composite_momentum": "Momentum",
+            "fscore": "F-Score",
+            "momentum_12m1m": "Mom 12M",
+            "above_ma200": "MA200✓",
+            "market_cap": "MCap",
+        }
+        disp.rename(columns={k: v for k, v in rename.items() if k in disp.columns}, inplace=True)
 
-    st.divider()
+        # Formateo seguro
+        if "QVM Score" in disp.columns:
+            disp["QVM Score"] = pd.to_numeric(disp["QVM Score"], errors="coerce").round(3)
+        if "Rank %ile" in disp.columns:
+            disp["Rank %ile"] = (pd.to_numeric(disp["Rank %ile"], errors="coerce") * 100).round(1)
+        if "Quality" in disp.columns:
+            disp["Quality"] = pd.to_numeric(disp["Quality"], errors="coerce").round(3)
+        if "Value" in disp.columns:
+            disp["Value"] = pd.to_numeric(disp["Value"], errors="coerce").round(3)
+        if "Momentum" in disp.columns:
+            disp["Momentum"] = pd.to_numeric(disp["Momentum"], errors="coerce").round(3)
+        if "F-Score" in disp.columns:
+            disp["F-Score"] = pd.to_numeric(disp["F-Score"], errors="coerce").round(1)
+        if "Mom 12M" in disp.columns:
+            disp["Mom 12M"] = (pd.to_numeric(disp["Mom 12M"], errors="coerce") * 100).round(1)
+        if "roe" in disp.columns:
+            disp["roe"] = (pd.to_numeric(disp["roe"], errors="coerce") * 100).round(1)
+        if "MCap" in disp.columns:
+            disp["MCap"] = (pd.to_numeric(disp["MCap"], errors="coerce") / 1e9).round(2)
 
-    # ------------------------------------------------------------------------
-    # PORTFOLIO FINAL
-    # ------------------------------------------------------------------------
-    st.header("📋 Portfolio Final")
+        # Orden sugerido (si existen)
+        preferred_order = [
+            "symbol", "Company", "sector",
+            "QVM Score", "Rank %ile",
+            "Quality", "Value", "Momentum", "F-Score",
+            "Mom 12M", "MA200✓", "roe", "MCap",
+        ]
+        ordered_cols = [c for c in preferred_order if c in disp.columns] + [c for c in disp.columns if c not in preferred_order]
+        disp = disp[ordered_cols]
 
-    portfolio = results.get('portfolio')
+        st.dataframe(
+            disp,
+            use_container_width=True,
+            height=600,
+            column_config={
+                "MA200✓": st.column_config.CheckboxColumn(),
+                "Rank %ile": st.column_config.ProgressColumn(min_value=0, max_value=100),
+                "Mom 12M": st.column_config.NumberColumn(format="%.1f%%"),
+                "roe": st.column_config.NumberColumn(format="%.1f%%"),
+                "MCap": st.column_config.NumberColumn(format="%.2fB"),
+            },
+        )
 
-    if portfolio is not None and not portfolio.empty:
-        col1, col2, col3, col4 = st.columns(4)
+        # ===== DISTRIBUCIÓN POR SECTOR =====
+        st.markdown("#### 📊 Distribución por Sector")
+        if {"sector", "symbol"}.issubset(pf.columns):
+            agg = {"symbol": "count"}
+            if "qvm_score_corrected" in pf.columns: agg["qvm_score_corrected"] = "mean"
+            if "fscore" in pf.columns:               agg["fscore"] = "mean"
+            if "momentum_12m1m" in pf.columns:      agg["momentum_12m1m"] = "mean"
 
-        with col1:
-            st.metric(
-                "Stocks Seleccionados",
-                len(portfolio)
-            )
+            sec = pf.groupby("sector").agg(agg).reset_index()
 
-        with col2:
-            avg_piotroski = portfolio['piotroski_score'].mean()
-            st.metric(
-                "Piotroski Promedio",
-                f"{avg_piotroski:.1f}/9"
-            )
-
-        with col3:
-            avg_qv = portfolio['qv_score'].mean()
-            st.metric(
-                "QV Score Promedio",
-                f"{avg_qv:.3f}"
-            )
-
-        with col4:
-            n_sectors = portfolio['sector'].nunique()
-            st.metric(
-                "Sectores Únicos",
-                n_sectors
-            )
-
-        st.divider()
-
-        # Análisis detallado
-        st.subheader("🏆 Top Stocks")
-
-        analysis = analyze_portfolio_v2(results, n_top=portfolio_size)
-
-        if not analysis.empty:
-            # Formatear para mostrar
-            display_df = analysis.copy()
-
-            # Formatear columnas numéricas
-            for col in display_df.columns:
-                if 'score' in col.lower() or 'component' in col.lower():
-                    if display_df[col].dtype in [float, np.float64]:
-                        display_df[col] = display_df[col].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "-")
-                elif col in ['roic', 'roe', 'gross_margin', 'fcf_yield']:
-                    if col in display_df.columns:
-                        display_df[col] = display_df[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "-")
-                elif col in ['pe', 'pb', 'ev_ebitda']:
-                    if col in display_df.columns:
-                        display_df[col] = display_df[col].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
+            # Renombres y formateo
+            rn = {"symbol": "Count"}
+            if "qvm_score_corrected" in sec.columns: rn["qvm_score_corrected"] = "Avg QVM"
+            if "fscore" in sec.columns:               rn["fscore"] = "Avg F-Score"
+            if "momentum_12m1m" in sec.columns:      rn["momentum_12m1m"] = "Avg Mom"
+            sec.rename(columns=rn, inplace=True)
+            if "Avg Mom" in sec.columns:
+                sec["Avg Mom"] = (pd.to_numeric(sec["Avg Mom"], errors="coerce") * 100).round(1)
 
             st.dataframe(
-                display_df,
-                use_container_width=True,
-                height=600
+                sec.sort_values("Count", ascending=False),
+                use_container_width=True
             )
+        else:
+            st.info("No hay columnas suficientes para agrupar por sector.")
 
-            # Botón de descarga
-            csv = analysis.to_csv(index=False)
-            st.download_button(
-                label="📥 Descargar Portfolio (CSV)",
-                data=csv,
-                file_name=f"qvm_portfolio_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
 
-        st.divider()
+# =============================================================================
+# TAB 3 — MOMENTUM + MA200
+# =============================================================================
 
-        # ------------------------------------------------------------------------
-        # VISUALIZACIONES
-        # ------------------------------------------------------------------------
-        st.header("📈 Visualizaciones")
-
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "Score Distribution",
-            "Sector Analysis",
-            "Piotroski Components",
-            "Valuation Metrics"
-        ])
-
-        with tab1:
-            st.subheader("Distribución de QV Score")
-
-            fig_score = px.histogram(
-                portfolio,
-                x='qv_score',
-                nbins=20,
-                title="Distribución de Quality-Value Score",
-                labels={'qv_score': 'QV Score', 'count': 'Frecuencia'},
-            )
-            st.plotly_chart(fig_score, use_container_width=True)
-
-            # Scatter plot: Quality vs Value
-            st.subheader("Quality vs Value")
-
-            fig_scatter = px.scatter(
-                portfolio,
-                x='value_score_component',
-                y='quality_score_component',
-                size='market_cap',
-                color='sector',
-                hover_data=['symbol', 'piotroski_score', 'qv_score'],
-                title="Quality Score vs Value Score",
-                labels={
-                    'value_score_component': 'Value Score',
-                    'quality_score_component': 'Quality Score (Piotroski Normalizado)'
-                }
-            )
-            st.plotly_chart(fig_scatter, use_container_width=True)
-
-        with tab2:
-            st.subheader("Distribución por Sector")
-
-            sector_counts = portfolio['sector'].value_counts()
-
-            fig_sector = px.pie(
-                values=sector_counts.values,
-                names=sector_counts.index,
-                title="Portfolio por Sector",
-            )
-            st.plotly_chart(fig_sector, use_container_width=True)
-
-            # Piotroski por sector
-            st.subheader("Piotroski Score por Sector")
-
-            fig_box = px.box(
-                portfolio,
-                x='sector',
-                y='piotroski_score',
-                title="Distribución de Piotroski Score por Sector",
-                labels={'piotroski_score': 'Piotroski Score', 'sector': 'Sector'}
-            )
-            st.plotly_chart(fig_box, use_container_width=True)
-
-        with tab3:
-            st.subheader("Piotroski Score Distribution")
-
-            piotroski_counts = portfolio['piotroski_score'].value_counts().sort_index()
-
-            fig_piotroski = px.bar(
-                x=piotroski_counts.index,
-                y=piotroski_counts.values,
-                title="Distribución de Piotroski Score",
-                labels={'x': 'Piotroski Score', 'y': 'Cantidad'},
-            )
-            st.plotly_chart(fig_piotroski, use_container_width=True)
-
-            # Mostrar estadísticas de componentes si están disponibles
-            piotroski_cols = [c for c in portfolio.columns if 'positive' in c or 'delta_' in c or 'accruals' in c]
-
-            if piotroski_cols:
-                st.subheader("Piotroski Components Analysis")
-
-                components_summary = portfolio[piotroski_cols].mean().sort_values(ascending=False)
-
-                fig_components = px.bar(
-                    x=components_summary.values * 100,
-                    y=components_summary.index,
-                    orientation='h',
-                    title="% de Stocks que Pasan cada Check de Piotroski",
-                    labels={'x': '% Pass Rate', 'y': 'Component'}
-                )
-                st.plotly_chart(fig_components, use_container_width=True)
-
-        with tab4:
-            st.subheader("Métricas de Valoración")
-
-            valuation_cols = []
-            for col in ['pe', 'pb', 'ev_ebitda']:
-                if col in portfolio.columns:
-                    valuation_cols.append(col)
-
-            if valuation_cols:
-                col1, col2 = st.columns(2)
-
-                for i, col in enumerate(valuation_cols):
-                    with col1 if i % 2 == 0 else col2:
-                        fig = px.histogram(
-                            portfolio,
-                            x=col,
-                            title=f"Distribución de {col.upper()}",
-                            labels={col: col.upper(), 'count': 'Frecuencia'}
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
+with tab3:
+    st.markdown("### 🎯 Momentum + MA200 Analysis")
+    momdf = st.session_state.get("momentum_df")
+    if not isinstance(momdf, pd.DataFrame) or momdf.empty:
+        st.info("Ejecuta el pipeline primero.")
     else:
-        st.warning("No hay stocks en el portfolio final.")
+        a, b, c, d = st.columns(4)
+        with a:
+            pos = int((momdf["momentum_12m1m"] > 0).sum())
+            st.metric("Momentum Positivo", f"{pos}/{len(momdf)}", delta=f"{pos/len(momdf)*100:.1f}%")
+        with b:
+            above = int(momdf["above_ma200"].sum())
+            st.metric("Arriba de MA200", f"{above}/{len(momdf)}", delta=f"{above/len(momdf)*100:.1f}%")
+        with c:
+            st.metric("Momentum Promedio", f"{momdf['momentum_12m1m'].mean():.1%}")
+        with d:
+            both = int(((momdf["momentum_12m1m"] > 0) & momdf["above_ma200"]).sum())
+            st.metric("Ambos ✓", f"{both}/{len(momdf)}", delta=f"{both/len(momdf)*100:.1f}%")
 
-else:
-    # Instrucciones iniciales
-    st.info("""
-    👈 **Ajusta los parámetros en la barra lateral y presiona "Ejecutar Screening"**
+        st.markdown("---")
+        st.markdown("#### 📊 Momentum vs MA200 Status")
+        plot_df = momdf.copy()
+        plot_df["MA200_status"] = plot_df["above_ma200"].map({True:"Above MA200", False:"Below MA200"})
+        scatter = alt.Chart(plot_df).mark_circle(size=60).encode(
+            x=alt.X("momentum_12m1m:Q", title="12M-1M Momentum", scale=alt.Scale(domain=[-0.5, 1.0])),
+            y=alt.Y("composite_momentum:Q", title="Composite Momentum Score"),
+            color=alt.Color("MA200_status:N", title="MA200 Status", scale=alt.Scale(scheme="category10")),
+            tooltip=["symbol","momentum_12m1m","above_ma200","composite_momentum"],
+        ).properties(height=400)
+        st.altair_chart(scatter, use_container_width=True)
 
-    **Guía de Parámetros:**
+        st.markdown("#### 📋 Momentum Detail Table")
+        cols = ["symbol","momentum_12m1m","momentum_6m","above_ma200","ma200","trend_strength"]
+        disp = plot_df[[c for c in cols if c in plot_df.columns]].copy()
+        if "momentum_12m1m" in disp.columns:
+            disp["momentum_12m1m"] = (disp["momentum_12m1m"] * 100).round(1)
+        if "momentum_6m" in disp.columns:
+            disp["momentum_6m"] = (disp["momentum_6m"] * 100).round(1)
+        if "trend_strength" in disp.columns:
+            disp["trend_strength"] = (disp["trend_strength"] * 100).round(0)
+        st.dataframe(
+            disp,
+            use_container_width=True,
+            height=420,
+            column_config={
+                "momentum_12m1m": st.column_config.NumberColumn(format="%.1f%%"),
+                "momentum_6m": st.column_config.NumberColumn(format="%.1f%%"),
+                "above_ma200": st.column_config.CheckboxColumn(),
+                "trend_strength": st.column_config.ProgressColumn(min_value=0, max_value=100),
+            },
+        )
 
-    - **Quality (Piotroski)**: Mide salud financiera operacional (9 checks)
-    - **Value (Multiples)**: Mide cuán barato está el stock (EV/EBITDA, P/E, P/B)
-    - **FCF Yield**: Free Cash Flow / Market Cap (mayor es mejor)
-    - **Momentum**: Retornos históricos (actualmente placeholder)
+# =============================================================================
+# TAB 4 — F-SCORE ANALYSIS
+# =============================================================================
 
-    **Piotroski Score:**
-    - 8-9: Excelente calidad (STRONG BUY)
-    - 6-7: Buena calidad (BUY)
-    - 4-5: Calidad media (HOLD)
-    - 0-3: Baja calidad (AVOID)
+with tab4:
+    st.markdown("### 🏆 F-Score Analysis")
+    fscore_data = st.session_state.get("fscore_data")
+    fscore_source = st.session_state.get("fscore_source", "—")
 
-    **QV Score:**
-    - > 0.70: Muy atractivo (STRONG BUY)
-    - 0.50-0.70: Atractivo (BUY)
-    - 0.30-0.50: Neutral (HOLD)
-    - < 0.30: No atractivo (AVOID)
-    """)
+    if not isinstance(fscore_data, pd.DataFrame) or fscore_data.empty or "fscore" not in fscore_data.columns:
+        st.info("Ejecuta el pipeline con F-Score habilitado.")
+    else:
+        # ====== DEBUG PANEL ======
+        with st.expander("🔎 Debug F-Score (fuente / cobertura / merges)", expanded=False):
+            need_cols = ["piotroskiScore","roe","fcf","operating_cf","roa","net_income","total_assets"]
+            present = {c: (c in fscore_data.columns) for c in need_cols}
+            nonnull = {c: (int(pd.to_numeric(fscore_data[c], errors="coerce").notna().sum()) if c in fscore_data.columns else 0) for c in need_cols}
+            st.write("**Fuente del F-Score:**", fscore_source)
+            colA, colB = st.columns(2)
+            with colA: st.json({"present": present})
+            with colB: st.json({"nonnull": nonnull})
 
+            # Muestra 10 filas crudas para validar merges
+            st.caption("Muestra cruda (10 filas):")
+            st.dataframe(fscore_data.head(10), use_container_width=True)
 
-# ============================================================================
+            # Si descargamos el endpoint de FMP, muéstralo también
+            fs_raw = st.session_state.get("financial_scores_raw")
+            if isinstance(fs_raw, pd.DataFrame) and not fs_raw.empty:
+                st.caption("financial-scores (FMP) crudo:")
+                st.dataframe(fs_raw.head(10), use_container_width=True)
+
+        # ====== MÉTRICAS RESUMEN ======
+        fdf_valid = fscore_data.copy()
+        fdf_valid["fscore"] = pd.to_numeric(fdf_valid["fscore"], errors="coerce")
+        avg_f = float(fdf_valid["fscore"].mean()) if fdf_valid["fscore"].notna().any() else 0.0
+        hi  = int((fdf_valid["fscore"] >= 8).sum())
+        mid = int(((fdf_valid["fscore"] >= 6) & (fdf_valid["fscore"] < 8)).sum())
+        lo  = int((fdf_valid["fscore"] < 6).sum())
+
+        a, b, c, d = st.columns(4)
+        with a: st.metric("F-Score Promedio", f"{avg_f:.1f}/9.0")
+        with b: st.metric("High Quality (8–9)", hi)
+        with c: st.metric("Medium (6–7)", mid)
+        with d: st.metric("Low (0–5)", lo)
+
+        # ====== Histograma robusto ======
+        vc = (
+            fdf_valid["fscore"].round(0)
+            .value_counts(dropna=False)
+            .sort_index()
+            .reset_index()
+        )
+        if vc.shape[1] >= 2:
+            vc.columns = ["F-Score", "Count"]
+        else:
+            vc["F-Score"] = fdf_valid["fscore"].round(0)
+            vc["Count"] = 1
+            vc = vc.groupby("F-Score", as_index=False)["Count"].sum()
+
+        all_bins = pd.DataFrame({"F-Score": list(range(0, 10))}, dtype=float)
+        hist = all_bins.merge(vc, on="F-Score", how="left")
+        hist["Count"] = pd.to_numeric(hist["Count"], errors="coerce").fillna(0).astype(int)
+
+        chart = alt.Chart(hist).mark_bar().encode(
+            x=alt.X("F-Score:O", title="F-Score"),
+            y=alt.Y("Count:Q", title="Número de acciones"),
+            color=alt.condition(alt.datum["F-Score"] >= 6, alt.value("steelblue"), alt.value("lightgray")),
+            tooltip=["F-Score:O","Count:Q"],
+        ).properties(height=300)
+        st.altair_chart(chart, use_container_width=True)
+
+        # ====== Tabla por categoría ======
+        show_cols = [c for c in ["symbol","fscore","piotroskiScore","roe","fcf","operating_cf"] if c in fscore_data.columns]
+        tbl = fdf_valid[show_cols].copy()
+        tbl["category"] = pd.cut(tbl["fscore"], bins=[-0.1,5.5,7.5,9.1],
+                                 labels=["Low (0–5)","Medium (6–7)","High (8–9)"])
+        st.dataframe(tbl.sort_values("fscore", ascending=False), use_container_width=True, height=420)
+# =============================================================================
+# TAB 5 — BACKTEST
+# =============================================================================
+
+with tab5:
+    st.markdown("### 📈 Backtest Results")
+    if st.button("🚀 Ejecutar Backtest", type="primary"):
+        prx = st.session_state.get("portfolio_prices")
+        if not isinstance(prx, dict) or not prx:
+            st.info("Ejecuta el pipeline primero (no hay precios de portfolio).")
+        else:
+            with st.spinner("Ejecutando backtest…"):
+                costs = TradingCosts(commission_bps=5, slippage_bps=5, market_impact_bps=2)
+                metrics, equity_curves = backtest_portfolio(prx, costs=costs, execution_lag_days=1)
+                port_metrics = calculate_portfolio_metrics(equity_curves, costs)
+                st.session_state["backtest_metrics"] = metrics
+                st.session_state["portfolio_metrics"] = port_metrics
+                st.session_state["equity_curves"] = equity_curves
+
+    if isinstance(st.session_state.get("portfolio_metrics"), dict):
+        pm = st.session_state["portfolio_metrics"]
+        a, b, c, d, e = st.columns(5)
+        with a: st.metric("CAGR", f"{pm['CAGR']:.2%}")
+        with b: st.metric("Sharpe", f"{pm['Sharpe']:.2f}")
+        with c: st.metric("Sortino", f"{pm['Sortino']:.2f}")
+        with d: st.metric("Max Drawdown", f"{pm['MaxDD']:.2%}")
+        with e: st.metric("Calmar", f"{pm['Calmar']:.2f}")
+
+        st.markdown("---")
+        st.markdown("#### 📈 Portfolio Equity Curve")
+        eq = st.session_state["equity_curves"]
+        eq_df = pd.DataFrame(eq)
+        port_eq = eq_df.mean(axis=1)
+        plot_df = pd.DataFrame({"Date": port_eq.index, "Equity": port_eq.values})
+        curve = alt.Chart(plot_df).mark_line(color="steelblue").encode(
+            x="Date:T", y=alt.Y("Equity:Q", title="Portfolio Value ($)"),
+            tooltip=["Date:T","Equity:Q"]
+        ).properties(height=400)
+        st.altair_chart(curve, use_container_width=True)
+
+        st.markdown("#### 📊 Individual Stock Performance")
+        st.dataframe(st.session_state["backtest_metrics"], use_container_width=True, height=420)
+
+# =============================================================================
+# TAB 6 — EXPORT
+# =============================================================================
+
+with tab6:
+    st.markdown("### 💾 Export Data")
+    pf = st.session_state.get("portfolio")
+    if not isinstance(pf, pd.DataFrame) or pf.empty:
+        st.info("Ejecuta el pipeline primero.")
+    else:
+        csv = pf.to_csv(index=False)
+        st.download_button(
+            label="⬇️ Descargar Portfolio (CSV)",
+            data=csv,
+            file_name=f"qvm_portfolio_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.markdown("**Preview:**")
+        st.dataframe(pf.head(10), use_container_width=True)
+
+        if isinstance(st.session_state.get("backtest_metrics"), pd.DataFrame):
+            st.markdown("---")
+            bm = st.session_state["backtest_metrics"]
+            csv_b = bm.to_csv(index=False)
+            st.download_button(
+                label="⬇️ Descargar Backtest Metrics (CSV)",
+                data=csv_b,
+                file_name=f"qvm_backtest_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+# =============================================================================
 # FOOTER
-# ============================================================================
+# =============================================================================
 
-st.divider()
-
-st.caption("""
-**QVM Screener V2** | Powered by Financial Modeling Prep API
-- Piotroski (2000): Value Investing
-- Asness et al. (2019): Quality Minus Junk
-- Fama & French (1992, 2015): Multi-factor Models
-""")
+st.markdown("---")
+st.caption(
+    "**QVM Screener V2** | Implementación académica con Momentum Real + MA200 + F-Score  \n"
+    "Basado en: Jegadeesh & Titman (1993), Faber (2007), Piotroski (2000), Asness et al. (2019)"
+)
