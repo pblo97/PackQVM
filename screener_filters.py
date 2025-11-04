@@ -257,7 +257,10 @@ def apply_all_filters(
     df['reason'] = df.apply(_rejection_reason, axis=1)
     
     # Split
-    passed = df[df['pass_all'] == True][['symbol']].copy()
+    # Conservar columnas base del screener para pasos futuros (sector, market cap, etc.)
+    base_cols = [c for c in ['symbol', 'sector', 'market_cap', 'volume'] if c in df.columns]
+    passed = df.loc[df['pass_all'] == True, base_cols].copy()
+
     
     diag_cols = ['symbol'] + filter_cols + ['pass_all', 'reason']
     diagnostics = df[diag_cols].copy()

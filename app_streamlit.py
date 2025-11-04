@@ -16,10 +16,11 @@ Módulos:
 - piotroski_fscore.py: F-Score de 9 puntos ⭐ NUEVO
 - screener_filters.py: Guardrails
 - backtest_engine.py: Backtest (corregido)
-- qvm_pipeline_corrected.py: Pipeline completo ⭐ NUEVO
 """
 
 from __future__ import annotations
+import os
+import shutil
 import time
 from datetime import datetime, timedelta
 
@@ -28,13 +29,13 @@ import numpy as np
 import streamlit as st
 import altair as alt
 
-# Imports de módulos base
+# Imports de módulos base (ajustados)
 from data_fetcher import (
     fetch_screener,
     fetch_fundamentals_batch,
-    fetch_prices,
-    clear_cache,
+    fetch_prices_daily,   # ← usamos daily con lookback
 )
+
 from factor_calculator import compute_all_factors
 from screener_filters import (
     apply_all_filters,
@@ -53,9 +54,10 @@ from momentum_calculator import (
     filter_above_ma200,
     calculate_momentum_batch,
 )
+# Alias a la Forma B (sin ROE) para mantener el nombre usado en la app
 from piotroski_fscore import (
     filter_by_fscore,
-    calculate_simplified_fscore,
+    calculate_simplified_fscore_no_roe as calculate_simplified_fscore,
 )
 
 
@@ -81,25 +83,39 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .5rem 0; }
 
 
 # ============================================================================
-# CACHÉ DE ESTADO
+# CACHÉ DE ESTADO (wrappers simplificados)
 # ============================================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_screener(limit: int, mcap_min: float, volume_min: int):
-    """Caché del screener"""
-    return fetch_screener(limit, mcap_min, volume_min, use_cache=True)
-
+    """Caché del screener (memo en sesión; data_fetcher ya usa caché a disco)."""
+    return fetch_screener(limit=limit, mcap_min=mcap_min, volume_min=volume_min)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_fundamentals(symbols: tuple):
-    """Caché de fundamentales"""
-    return fetch_fundamentals_batch(list(symbols), use_cache=True)
-
+    """Caché de fundamentales."""
+    return fetch_fundamentals_batch(list(symbols))
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_prices(symbol: str, start: str, end: str):
-    """Caché de precios individuales"""
-    return fetch_prices(symbol, start, end)
+    """
+    Caché de precios individuales.
+    Ignora start/end y pide ~800 días (~3 años bursátiles) con fetch_prices_daily.
+    """
+    return fetch_prices_daily(symbol, lookback_days=800)
+
+def clear_cache():
+    """
+    Limpia caché en disco usada por data_fetcher (.cache/fmp) y la memo de Streamlit.
+    """
+    cache_dir = ".cache/fmp"
+    try:
+        if os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -143,13 +159,13 @@ with st.sidebar:
         min_roe = st.slider(
             "ROE mín.", 
             0.0, 0.50, 
-            0.15,  # ⭐ Aumentado a 15%
+            0.15,  # ⭐ 15%
             0.05
         )
         min_gm = st.slider(
             "Gross Margin mín.", 
             0.0, 0.80, 
-            0.30,  # ⭐ Aumentado a 30%
+            0.30,  # ⭐ 30%
             0.05
         )
         req_fcf = st.toggle("Exigir FCF > 0", value=True)
@@ -211,9 +227,12 @@ with st.sidebar:
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("🗑️ Limpiar caché", use_container_width=True):
-            clear_cache()
+            cleared = clear_cache()
             st.cache_data.clear()
-            st.success("✅ Caché limpiado")
+            if cleared:
+                st.success("✅ Caché limpiado")
+            else:
+                st.warning("⚠️ No se pudo limpiar toda la caché en disco")
     
     with col_btn2:
         if st.button("ℹ️ Info", use_container_width=True):
@@ -221,7 +240,7 @@ with st.sidebar:
             **V2 Features:**
             - ✅ Momentum real (12M-1M)
             - ✅ MA200 filter obligatorio
-            - ✅ F-Score de Piotroski
+            - ✅ F-Score de Piotroski (Forma B simplificada)
             - ✅ Sector-neutral factors
             """)
 
@@ -289,7 +308,7 @@ if run_btn:
             min_gross_margin=min_gm,
             require_positive_fcf=req_fcf,
             require_positive_ocf=req_ocf,
-            max_pe=50.0,  # ⭐ Conservador
+            max_pe=50.0,            # ⭐ Conservador
             max_ev_ebitda=25.0,
             min_volume=volume_min,
             min_market_cap=mcap_min,
@@ -306,7 +325,7 @@ if run_btn:
             st.stop()
         
         # ---------------------------------------------------------------------
-        # PASO 4: F-SCORE
+        # PASO 4: F-SCORE (Forma B ya alias)
         # ---------------------------------------------------------------------
         if use_fscore:
             status_text.text("🏆 Paso 4/8: Calculando F-Score...")
@@ -338,20 +357,19 @@ if run_btn:
         prices_dict = {}
         failed_count = 0
         
+        # Fechas no usadas por cached_prices (se dejan por compatibilidad)
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")  # 2 años
         
-        progress_step = 30 / len(symbols_to_fetch)
+        progress_step = 30 / max(len(symbols_to_fetch), 1)
         
         for i, symbol in enumerate(symbols_to_fetch):
             try:
                 prices = cached_prices(symbol, start_date, end_date)
-                
                 if prices is not None and len(prices) >= 252:
                     prices_dict[symbol] = prices
                 else:
                     failed_count += 1
-            
             except Exception:
                 failed_count += 1
             
@@ -371,7 +389,6 @@ if run_btn:
         progress_bar.progress(80)
         
         momentum_df = calculate_momentum_batch(prices_dict)
-        
         st.session_state['momentum_df'] = momentum_df
         
         # Merge con datos existentes
@@ -401,6 +418,20 @@ if run_btn:
         # ---------------------------------------------------------------------
         status_text.text("💎 Paso 7/8: Calculando factores QVM...")
         progress_bar.progress(90)
+
+        # Blindaje: recuperar sector/market_cap desde el universo original si faltan
+        needed = ['sector', 'market_cap']
+        missing = [c for c in needed if c not in df_final.columns]
+        if missing and 'universe' in st.session_state:
+            uni = st.session_state['universe'][['symbol'] + [c for c in needed if c in st.session_state['universe'].columns]].drop_duplicates('symbol')
+            df_final = df_final.merge(uni, on='symbol', how='left')
+        for c in needed:
+            if c not in df_final.columns:
+                df_final[c] = np.nan
+
+        # Si no hubo F-Score (use_fscore False), asegura columna para el merge posterior
+        if 'fscore' not in df_final.columns:
+            df_final['fscore'] = np.nan
         
         df_universe_clean = df_final[['symbol', 'sector', 'market_cap']].copy()
         df_fundamentals_clean = df_final[['symbol', 'ev_ebitda', 'pb', 'pe', 
@@ -411,7 +442,7 @@ if run_btn:
             df_universe_clean,
             df_fundamentals_clean,
             sector_neutral=True,
-            w_quality=w_quality * (1 - w_fscore),  # Ajustar por F-Score weight
+            w_quality=w_quality * (1 - w_fscore),  # Ajustar por peso de F-Score
             w_value=w_value * (1 - w_fscore),
             w_momentum=w_momentum * (1 - w_fscore),
         )
@@ -444,7 +475,6 @@ if run_btn:
         progress_bar.progress(95)
         
         portfolio = df_with_factors.nlargest(top_n, 'qvm_score_corrected')
-        
         st.session_state['portfolio'] = portfolio
         
         # Filtrar precios solo de portfolio
@@ -453,7 +483,6 @@ if run_btn:
             for sym in portfolio['symbol'] 
             if sym in prices_dict
         }
-        
         st.session_state['portfolio_prices'] = portfolio_prices
         
         # ---------------------------------------------------------------------
@@ -476,7 +505,7 @@ if run_btn:
         
         with col3:
             if use_fscore:
-                st.metric(f"F-Score >= {min_fscore}", len(df_fscore_passed))
+                st.metric(f"F-Score >= {min_fscore}", len(st.session_state.get('fscore_passed', [])))
             else:
                 st.metric("F-Score", "No usado", delta_color="off")
         
