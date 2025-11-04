@@ -246,6 +246,7 @@ if run_btn:
         # 3) Filtros de calidad optimizados
         status.text("🛡️ Paso 3/8: Aplicando filtros de calidad…")
         progress.progress(30)
+
         fcfg = FilterConfig(
             min_roe=min_roe,
             min_gross_margin=min_gm,
@@ -256,78 +257,112 @@ if run_btn:
             min_volume=volume_min,
             min_market_cap=mcap_min,
         )
+
+        # Merge inicial para evaluar filtros sobre un DF coherente
         df_merged = universe.merge(fundamentals, on="symbol", how="left")
         passed_filters, diagnostics = apply_all_filters(df_merged, fcfg)
         st.session_state["passed_filters"] = passed_filters
         st.session_state["diagnostics"] = diagnostics
+
         if passed_filters.empty:
             st.error("❌ Ningún símbolo pasó los filtros de calidad.")
             st.stop()
 
-        try:
-            _syms_scope = passed_filters["symbol"].dropna().astype(str).str.upper().unique().tolist()
-        except Exception:
-            _syms_scope = universe["symbol"].dropna().astype(str).str.upper().unique().tolist()
+        # Scope único y consistente para todo lo que sigue
+        def _extract_symbols(*dfs) -> list[str]:
+            for df in dfs:
+                if isinstance(df, pd.DataFrame) and not df.empty and "symbol" in df.columns:
+                    return (
+                        df["symbol"]
+                        .dropna()
+                        .astype(str).str.strip().str.upper()
+                        .unique().tolist()
+                    )
+            return []
 
-        scores_df = fetch_financial_scores(_syms_scope, use_cache=True)
-        st.session_state["financial_scores_raw"] = scores_df.copy()
+        symbols_scope = _extract_symbols(passed_filters, universe)
+        st.session_state["symbols_scope"] = symbols_scope
+        if not symbols_scope:
+            st.error("No hay símbolos válidos tras los filtros.")
+            st.stop()
 
-        # Mergear contra fundamentals para que esté disponible en todo el pipeline
-        fundamentals = fundamentals.merge(scores_df, on="symbol", how="left")
-        st.session_state["fundamentals_plus_scores"] = fundamentals.copy()
-
-        symbols_scope = passed_filters["symbol"].dropna().astype(str).str.upper().unique().tolist()
-
-        # 2a) Traer básicos (IS/CF/BS) y mergearlos a fundamentals
+        # --------- BASICS (IS/CF/BS) y MERGE ordenado ---------
         basics = fetch_financial_basics(symbols_scope, period="annual", use_cache=True)
         st.session_state["financial_basics_raw"] = basics.copy()
 
-        fundamentals = fundamentals.merge(basics, on="symbol", how="left")
+        # 1) fundamentales (ttm) ⟵ basics (IS/CF/BS)  → coalesce de solapados
+        fundamentals = fundamentals.merge(basics, on="symbol", how="left", suffixes=("", "_b"))
+
+        def _coalesce(col: str):
+            bcol = f"{col}_b"
+            if col in fundamentals.columns and bcol in fundamentals.columns:
+                fundamentals[col] = fundamentals[col].combine_first(fundamentals[bcol])
+                fundamentals.drop(columns=[bcol], inplace=True, errors="ignore")
+            elif bcol in fundamentals.columns and col not in fundamentals.columns:
+                fundamentals.rename(columns={bcol: col}, inplace=True)
+
+        for col in [
+            "revenue","gross_margin","net_income","total_assets",
+            "operating_cf","capex","fcf","current_ratio","long_term_debt",
+            "shares_outstanding","asset_turnover","roa"
+        ]:
+            _coalesce(col)
+
+        # Guarda versión coalescida (útil para Tab debug)
         st.session_state["fundamentals_plus_basics"] = fundamentals.copy()
 
-        # 4) F-Score
-        # ---------------------------------------------------------------------
-# PASO 4: F-SCORE (nativo FMP si viene; si no, calculado)
-# ---------------------------------------------------------------------
-        status.text("🏆 Paso 4/8: Calculando / Inyectando F-Score...")
+        # --------- FINANCIAL SCORES (Piotroski/Altman) ---------
+        # Usa un solo scope y guarda crudo para Tab 4 debug
+        scores_df = fetch_financial_scores(symbols_scope, use_cache=True)
+        st.session_state["financial_scores_raw"] = scores_df.copy()
+
+        # Mergea scores al fundamental coalescido para que quede disponible globalmente
+        fundamentals = fundamentals.merge(scores_df, on="symbol", how="left")
+        st.session_state["fundamentals_plus_scores"] = fundamentals.copy()
+
+        # ---------------- PASO 4: F-SCORE (nativo si hay; sino local) ----------------
+        status.text("🏆 Paso 4/8: Calculando / Inyectando F-Score…")
         progress.progress(40)
 
-        # Columnas básicas que intentaremos tener
-        fcols = ["symbol","roe","fcf","operating_cf","roa","net_income","total_assets","piotroskiScore"]
+        # Columnas que intentaremos traer; si faltan para el local, las rellenamos con NaN
+        need_for_local = ["roe","fcf","operating_cf","roa","net_income","total_assets"]
+        fcols = ["symbol","piotroskiScore"] + [c for c in need_for_local if c in fundamentals.columns]
         base_cols = [c for c in fcols if c in fundamentals.columns] or ["symbol"]
 
-        df_for_fscore = passed_filters.merge(
-            fundamentals[base_cols].drop_duplicates("symbol"),
-            on="symbol", how="left"
+        df_for_fscore = (
+            passed_filters[["symbol"]]
+            .drop_duplicates("symbol")
+            .merge(fundamentals[base_cols].drop_duplicates("symbol"), on="symbol", how="left")
         )
 
-        # Preferencia: usar piotroskiScore de FMP si hay al menos 1 no nulo
-        if "piotroskiScore" in df_for_fscore.columns and pd.to_numeric(df_for_fscore["piotroskiScore"], errors="coerce").notna().any():
+        # ¿Tenemos algún piotroskiScore válido?
+        has_native = (
+            "piotroskiScore" in df_for_fscore.columns
+            and pd.to_numeric(df_for_fscore["piotroskiScore"], errors="coerce").notna().any()
+        )
+
+        if has_native:
             df_for_fscore["fscore"] = pd.to_numeric(df_for_fscore["piotroskiScore"], errors="coerce")
             fscore_source = "FMP (financial-scores)"
         else:
-            # fallback a cálculo simplificado local
-            for c in ["roe","fcf","operating_cf","roa","net_income","total_assets"]:
+            # Asegura columnas requeridas para forma B local
+            for c in need_for_local:
                 if c not in df_for_fscore.columns:
                     df_for_fscore[c] = np.nan
             df_for_fscore["fscore"] = calculate_simplified_fscore(df_for_fscore)
             fscore_source = "Local (simplificado)"
 
-        # Filtro por umbral si lo activaste en el sidebar
-        if use_fscore:
-            df_fscore_passed = df_for_fscore[df_for_fscore["fscore"] >= min_fscore].copy()
-        else:
-            df_fscore_passed = df_for_fscore.copy()
+        # Filtro por umbral si está activado
+        df_fscore_passed = df_for_fscore[df_for_fscore["fscore"] >= (min_fscore if use_fscore else -9)].copy()
 
-        # Exponer para Tab 4 y para debugging
+        # Exponer para Tab 4 y pipeline
         st.session_state["fscore_data"] = df_for_fscore.copy()
         st.session_state["fscore_source"] = fscore_source
         st.session_state["fscore_passed"] = df_fscore_passed.copy()
 
         if df_fscore_passed.empty:
-            st.error(f"❌ Ningún símbolo con F-Score >= {min_fscore} (source: {fscore_source})")
+            st.error(f"❌ Ningún símbolo con F-Score ≥ {min_fscore} (source: {fscore_source})")
             st.stop()
-
 
         # 5) Precios
         status.text("📈 Paso 5/8: Descargando precios…")

@@ -320,138 +320,68 @@ def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True) -> p
     df = df.dropna(subset=["date","close"]).sort_values("date")
     return df[["date","close"]].reset_index(drop=True)
 
-def fetch_financial_scores(symbols: list[str], use_cache: bool = True) -> pd.DataFrame:
+def fetch_financial_scores(symbols: Iterable[str], use_cache: bool = True) -> pd.DataFrame:
     """
-    Llama a FMP /stable/financial-scores y retorna SIEMPRE columnas normalizadas:
-      ['symbol','altmanZScore','piotroskiScore','date']
-    - Si hay múltiples filas por símbolo, conserva la MÁS RECIENTE por 'date'
-    - 'symbol' upper/strip
-    """
-    if not symbols:
-        return pd.DataFrame(columns=["symbol","altmanZScore","piotroskiScore","date"])
+    Intenta primero el endpoint batched:
+      /stable/financial-scores?symbol=AAPL,MSFT,...
+    Si no trae nada, cae al endpoint por-símbolo:
+      /financial-scores?symbol=SYMB
 
-    # FMP acepta múltiples símbolos en una sola query (separa por coma).
-    # Para listas largas: chunkea (p.ej., 100 por request).
-    out = []
-    chunk_size = 100
-    ttl = 900 if use_cache else None
-    for i in range(0, len(symbols), chunk_size):
-        chunk = symbols[i:i+chunk_size]
-        params = {"symbol": ",".join(chunk)}
-        data = _http_get("stable/financial-scores", params=params, ttl=ttl)
-        if isinstance(data, list) and data:
-            out.extend(data)
-
-    if not out:
-        return pd.DataFrame(columns=["symbol","altmanZScore","piotroskiScore","date"])
-
-    df = pd.DataFrame(out)
-
-    # Normalizar columnas esperadas
-    if "symbol" in df.columns:
-        df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
-    else:
-        df["symbol"] = pd.NA
-
-    # Coerce numéricas
-    for col in ["altmanZScore", "piotroskiScore"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        else:
-            df[col] = pd.NA
-
-    # Fecha (si existe)
-    if "date" not in df.columns:
-        df["date"] = pd.NaT
-    else:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-
-    # Mantener SOLO la fila más reciente por símbolo
-    df = df.sort_values(["symbol","date"], ascending=[True, False])
-    df = df.drop_duplicates("symbol", keep="first").reset_index(drop=True)
-
-    # Solo columnas útiles (con default si faltan)
-    keep = ["symbol","altmanZScore","piotroskiScore","date"]
-    for k in keep:
-        if k not in df.columns:
-            df[k] = pd.NA
-
-    return df[keep]
-
-
-
-def fetch_financial_scores(
-    symbols: Iterable[str],
-    use_cache: bool = True,
-) -> pd.DataFrame:
-    """
-    Llama /financial-scores?symbol=SYMB (FMP) por símbolo (es endpoint por-símbolo)
-    y devuelve: ['symbol','piotroskiScore','altmanZScore'].
-
-    - Robusto a respuestas vacías
-    - Normaliza 'symbol' a UPPER
+    Devuelve SIEMPRE: ['symbol','piotroskiScore','altmanZScore','date? (si hubo)']
     """
     syms = [str(s).strip().upper() for s in symbols if isinstance(s, str)]
     if not syms:
-        return pd.DataFrame(columns=["symbol","piotroskiScore","altmanZScore"])
+        return pd.DataFrame(columns=["symbol","piotroskiScore","altmanZScore","date"])
 
-    rows: List[dict] = []
     ttl = 900 if use_cache else None
 
+    # -------- intento batched --------
+    try:
+        out = []
+        chunk = 100
+        for i in range(0, len(syms), chunk):
+            seg = syms[i:i+chunk]
+            data = _http_get("stable/financial-scores", {"symbol": ",".join(seg)}, ttl=ttl)
+            if isinstance(data, list) and data:
+                out.extend(data)
+        if out:
+            df = pd.DataFrame(out)
+            df["symbol"] = df.get("symbol", pd.NA).astype(str).str.strip().str.upper()
+            for c in ["piotroskiScore","altmanZScore"]:
+                df[c] = pd.to_numeric(df.get(c), errors="coerce")
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            else:
+                df["date"] = pd.NaT
+            df = df.sort_values(["symbol","date"], ascending=[True, False]).drop_duplicates("symbol", keep="first")
+            keep = ["symbol","piotroskiScore","altmanZScore","date"]
+            for k in keep:
+                if k not in df.columns:
+                    df[k] = pd.NA
+            return df[keep]
+    except Exception:
+        pass
+
+    # -------- fallback por símbolo --------
+    rows = []
     for s in syms:
         try:
-            data = _http_get("financial-scores", {"symbol": s}, ttl=ttl)
-            # Puede venir como list con 1 dict o dict suelto
-            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
-                d = data[0]
-            elif isinstance(data, dict):
-                d = data
-            else:
+            d = _http_get("financial-scores", {"symbol": s}, ttl=ttl)
+            if isinstance(d, list) and d and isinstance(d[0], dict):
+                d = d[0]
+            elif not isinstance(d, dict):
                 d = {}
-
             rows.append({
                 "symbol": s,
                 "piotroskiScore": pd.to_numeric(d.get("piotroskiScore"), errors="coerce"),
                 "altmanZScore": pd.to_numeric(d.get("altmanZScore"), errors="coerce"),
+                "date": pd.NaT,
             })
         except Exception:
-            rows.append({"symbol": s, "piotroskiScore": pd.NA, "altmanZScore": pd.NA})
+            rows.append({"symbol": s, "piotroskiScore": pd.NA, "altmanZScore": pd.NA, "date": pd.NaT})
 
-    out = pd.DataFrame(rows).drop_duplicates("symbol")
-    return out
+    return pd.DataFrame(rows).drop_duplicates("symbol")
 
-# -----------------------------------------------------------------------------
-# Prueba rápida
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    print("🧪 Testing data_fetcher...")
-
-    try:
-        scr = fetch_screener(limit=20, mcap_min=2e9, volume_min=1_000_000, exchange="NYSE,NASDAQ")
-        print(f"Screener: {len(scr)}"); print(scr.head())
-    except Exception as e:
-        print("Screener error:", e)
-
-    try:
-        if not scr.empty:
-            syms = scr["symbol"].head(5).tolist()
-            fund = fetch_fundamentals_batch(syms, debug=True)
-            print("\nFundamentals:"); print(fund.head())
-    except Exception as e:
-        print("Fundamentals error:", e)
-
-    try:
-        if not scr.empty:
-            sym = scr["symbol"].iloc[0]
-            px = fetch_prices(sym, "2022-01-01", "2025-12-31")
-            print("\nPrices:", sym, len(px)); print(px.head())
-    except Exception as e:
-        print("Prices error:", e)
-
-
-# data_fetcher.py
-import pandas as pd
-from typing import Iterable, List, Dict
 
 def fetch_financial_basics(
     symbols: Iterable[str],
@@ -538,3 +468,36 @@ def fetch_financial_basics(
 
     out = pd.DataFrame(rows).drop_duplicates("symbol")
     return out
+# -----------------------------------------------------------------------------
+# Prueba rápida
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    print("🧪 Testing data_fetcher...")
+
+    try:
+        scr = fetch_screener(limit=20, mcap_min=2e9, volume_min=1_000_000, exchange="NYSE,NASDAQ")
+        print(f"Screener: {len(scr)}"); print(scr.head())
+    except Exception as e:
+        print("Screener error:", e)
+
+    try:
+        if not scr.empty:
+            syms = scr["symbol"].head(5).tolist()
+            fund = fetch_fundamentals_batch(syms, debug=True)
+            print("\nFundamentals:"); print(fund.head())
+    except Exception as e:
+        print("Fundamentals error:", e)
+
+    try:
+        if not scr.empty:
+            sym = scr["symbol"].iloc[0]
+            px = fetch_prices(sym, "2022-01-01", "2025-12-31")
+            print("\nPrices:", sym, len(px)); print(px.head())
+    except Exception as e:
+        print("Prices error:", e)
+
+
+# data_fetcher.py
+
+
+
