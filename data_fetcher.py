@@ -12,7 +12,14 @@ import numpy as np
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
+# Try to get API key from Streamlit secrets first, then fall back to env variable
+try:
+    import streamlit as st
+    FMP_API_KEY = st.secrets.get("FMP_API_KEY", "")
+except:
+    FMP_API_KEY = os.getenv("FMP_API_KEY", "")
+
+FMP_API_KEY = FMP_API_KEY.strip()
 BASE = "https://financialmodelingprep.com/api/v3"
 
 # Unifica caché (puedes setear FMP_CACHE_DIR si quieres otro path)

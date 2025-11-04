@@ -1,0 +1,12 @@
+# Core dependencies
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+
+# Streamlit and visualization
+streamlit>=1.28.0
+plotly>=5.18.0
+altair>=5.0.0
+
+# Optional: for better performance
+pyarrow>=14.0.0
