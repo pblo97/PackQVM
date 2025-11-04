@@ -197,14 +197,13 @@ with st.sidebar:
     )
 
     min_roic = st.slider(
-        "ROIC mínimo",
-        min_value=0.0,
-        max_value=0.50,
-        value=0.10,
-        step=0.05,
-        format="%.0f%%",
+        "ROIC mínimo (%)",
+        min_value=0,
+        max_value=50,
+        value=10,
+        step=5,
         help="ROIC mínimo requerido (Return on Invested Capital)"
-    )
+    ) / 100.0  # Convertir de % a decimal
 
     st.divider()
 
@@ -219,14 +218,13 @@ with st.sidebar:
 
     # Momentum
     min_momentum_12m = st.slider(
-        "Momentum 12M mínimo",
-        min_value=-0.20,
-        max_value=0.50,
-        value=0.10,
-        step=0.05,
-        format="%.0f%%",
+        "Momentum 12M mínimo (%)",
+        min_value=-20,
+        max_value=50,
+        value=10,
+        step=5,
         help="Retorno mínimo 12M-1M (Jegadeesh & Titman 1993)"
-    )
+    ) / 100.0  # Convertir de % a decimal
 
     # 52-Week High
     require_near_52w_high = st.checkbox(
@@ -237,14 +235,13 @@ with st.sidebar:
 
     min_pct_from_52w_high = st.slider(
         "% mínimo del 52w high",
-        min_value=0.50,
-        max_value=1.0,
-        value=0.80,
-        step=0.05,
-        format="%.0f%%",
+        min_value=50,
+        max_value=100,
+        value=80,
+        step=5,
         help="Precio actual >= X% del máximo de 52 semanas",
         disabled=not require_near_52w_high
-    )
+    ) / 100.0  # Convertir de % a decimal
 
     # ROIC > WACC
     require_roic_above_wacc = st.checkbox(
@@ -542,33 +539,60 @@ if run_button or st.session_state.get('results') is not None:
             )
 
         # Curva de equity
-        if 'equity_curves' in backtest:
+        if 'equity_curves' in backtest and backtest['equity_curves']:
             st.subheader("Curva de Equity del Portfolio")
 
             equity_curves = backtest['equity_curves']
 
-            # Crear gráfico de equity curve
-            fig_equity = go.Figure()
+            # Calcular curva promedio del portfolio (equal-weight)
+            try:
+                # Convertir dict de Series a DataFrame
+                ec_df = pd.concat(equity_curves.values(), axis=1)
+                ec_df.columns = list(equity_curves.keys())
+                ec_df = ec_df.dropna(how='all').ffill().dropna(how='all')
 
-            for symbol, curve in equity_curves.items():
-                if symbol == 'portfolio':
-                    fig_equity.add_trace(go.Scatter(
-                        x=curve.index,
-                        y=curve.values,
-                        mode='lines',
-                        name='Portfolio',
-                        line=dict(color='gold', width=3)
-                    ))
+                # Equity promedio (equal-weight)
+                portfolio_curve = ec_df.mean(axis=1)
 
-            fig_equity.update_layout(
-                title="Portfolio Equity Curve",
-                xaxis_title="Fecha",
-                yaxis_title="Valor Normalizado",
-                height=500,
-                hovermode='x unified'
-            )
+                # Crear gráfico de equity curve
+                fig_equity = go.Figure()
 
-            st.plotly_chart(fig_equity, use_container_width=True)
+                # Agregar curva del portfolio
+                fig_equity.add_trace(go.Scatter(
+                    x=portfolio_curve.index,
+                    y=portfolio_curve.values,
+                    mode='lines',
+                    name='Portfolio (Equal Weight)',
+                    line=dict(color='gold', width=3)
+                ))
+
+                # Opcionalmente, agregar curvas individuales (semi-transparentes)
+                show_individual = st.checkbox("Mostrar stocks individuales", value=False)
+                if show_individual:
+                    for symbol, curve in equity_curves.items():
+                        fig_equity.add_trace(go.Scatter(
+                            x=curve.index,
+                            y=curve.values,
+                            mode='lines',
+                            name=symbol,
+                            line=dict(width=1),
+                            opacity=0.3
+                        ))
+
+                fig_equity.update_layout(
+                    title="Portfolio Equity Curve (Equal-Weighted)",
+                    xaxis_title="Fecha",
+                    yaxis_title="Valor Normalizado (Base 1.0)",
+                    height=500,
+                    hovermode='x unified'
+                )
+
+                st.plotly_chart(fig_equity, use_container_width=True)
+
+            except Exception as e:
+                st.warning(f"No se pudo generar la equity curve: {str(e)}")
+        else:
+            st.info("No hay datos de equity curve disponibles. Verifica que el backtest se ejecutó correctamente.")
 
         # Estadísticas detalladas
         with st.expander("📊 Estadísticas Detalladas del Backtest"):
