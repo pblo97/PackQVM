@@ -73,6 +73,43 @@ def _rank_score(series: pd.Series) -> pd.Series:
     return s.rank(pct=True, method='average').fillna(0.5)
 
 
+def _normalize_by_sector(df: pd.DataFrame, column: str, lower_is_better: bool = False) -> pd.Series:
+    """
+    Normaliza una métrica DENTRO de cada sector (industry-adjusted).
+
+    Problema: EV/EBITDA=15 es caro para Utilities (promedio ~8) pero
+              barato para Technology (promedio ~25).
+
+    Solución: Normalizar cada stock vs su sector, no vs todo el universo.
+
+    Args:
+        df: DataFrame con columna 'sector' y la métrica a normalizar
+        column: Nombre de la columna a normalizar
+        lower_is_better: Si True, valores bajos = mejores scores
+
+    Returns:
+        Series normalizada [0, 1] ajustada por sector
+    """
+    if 'sector' not in df.columns or column not in df.columns:
+        # Fallback: normalizar cross-sectional si no hay sector
+        return _normalize_score(df[column], lower_is_better=lower_is_better)
+
+    result = pd.Series(0.5, index=df.index)
+
+    for sector in df['sector'].unique():
+        if pd.isna(sector):
+            continue
+
+        mask = df['sector'] == sector
+        sector_data = df.loc[mask, column]
+
+        # Normalizar dentro del sector
+        sector_normalized = _normalize_score(sector_data, lower_is_better=lower_is_better)
+        result.loc[mask] = sector_normalized
+
+    return result
+
+
 # ============================================================================
 # QUALITY SCORE (basado en Piotroski)
 # ============================================================================
@@ -103,7 +140,7 @@ def calculate_quality_score(df: pd.DataFrame) -> pd.Series:
 # VALUE SCORE (múltiplos de valoración)
 # ============================================================================
 
-def calculate_value_score(df: pd.DataFrame) -> pd.Series:
+def calculate_value_score(df: pd.DataFrame, industry_adjusted: bool = True) -> pd.Series:
     """
     Value Score basado en múltiplos de valoración.
 
@@ -113,33 +150,62 @@ def calculate_value_score(df: pd.DataFrame) -> pd.Series:
     - P/E (lower is better)
 
     Ponderación: 40% EV/EBITDA, 30% P/B, 30% P/E
+
+    Args:
+        df: DataFrame con métricas de valoración
+        industry_adjusted: Si True, normaliza dentro de cada sector (RECOMENDADO)
+                          Si False, normaliza cross-sectional (old behavior)
+
+    IMPORTANTE: industry_adjusted=True corrige el sesgo donde EV/EBITDA=15
+    es "barato" para Technology pero "caro" para Utilities.
     """
     scores = []
     weights = []
+
+    # Crear copia temporal del DataFrame para normalización
+    df_temp = df.copy()
 
     # EV/EBITDA (más peso porque es más completo)
     if 'ev_ebitda' in df.columns:
         ev_ebitda = pd.to_numeric(df['ev_ebitda'], errors='coerce')
         # Filtrar valores negativos o extremos
         ev_ebitda = ev_ebitda.where((ev_ebitda > 0) & (ev_ebitda < 100), np.nan)
+        df_temp['ev_ebitda_clean'] = ev_ebitda
+
         if ev_ebitda.notna().sum() > 1:
-            scores.append(_normalize_score(ev_ebitda, lower_is_better=True))
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'ev_ebitda_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(ev_ebitda, lower_is_better=True)
+            scores.append(score)
             weights.append(0.40)
 
     # P/B
     if 'pb' in df.columns:
         pb = pd.to_numeric(df['pb'], errors='coerce')
         pb = pb.where((pb > 0) & (pb < 50), np.nan)
+        df_temp['pb_clean'] = pb
+
         if pb.notna().sum() > 1:
-            scores.append(_normalize_score(pb, lower_is_better=True))
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'pb_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(pb, lower_is_better=True)
+            scores.append(score)
             weights.append(0.30)
 
     # P/E
     if 'pe' in df.columns:
         pe = pd.to_numeric(df['pe'], errors='coerce')
         pe = pe.where((pe > 0) & (pe < 100), np.nan)
+        df_temp['pe_clean'] = pe
+
         if pe.notna().sum() > 1:
-            scores.append(_normalize_score(pe, lower_is_better=True))
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'pe_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(pe, lower_is_better=True)
+            scores.append(score)
             weights.append(0.30)
 
     if not scores:
@@ -216,20 +282,30 @@ def calculate_fcf_yield_score(df: pd.DataFrame) -> pd.Series:
 
 def calculate_quality_value_score(
     df: pd.DataFrame,
-    w_quality: float = 0.40,
-    w_value: float = 0.35,
-    w_fcf_yield: float = 0.15,
-    w_momentum: float = 0.10,
+    w_quality: float = 0.35,      # Actualizado según análisis
+    w_value: float = 0.40,        # Actualizado
+    w_fcf_yield: float = 0.10,    # Actualizado
+    w_momentum: float = 0.15,     # Actualizado
     normalize_output: bool = True,
+    industry_adjusted: bool = True,  # NUEVO: ajuste por sector
 ) -> pd.DataFrame:
     """
     Calcula Quality-Value Score compuesto SIN multicolinealidad.
 
-    Componentes:
-    1. Quality (40%): Piotroski Score normalizado
-    2. Value (35%): Múltiplos de valoración (EV/EBITDA, P/B, P/E)
-    3. FCF Yield (15%): Free Cash Flow Yield
-    4. Momentum (10%): Retornos de precio
+    Componentes (pesos actualizados según ANALISIS_ACADEMICO.md):
+    1. Quality (35%): Piotroski Score normalizado (reducido de 40%)
+    2. Value (40%): Múltiplos de valoración ajustados por sector (aumentado de 35%)
+    3. FCF Yield (10%): Free Cash Flow Yield (reducido de 15% por overlap)
+    4. Momentum (15%): Retornos de precio (aumentado de 10%)
+
+    Args:
+        df: DataFrame con datos fundamentales y de mercado
+        w_quality: Peso del componente Quality
+        w_value: Peso del componente Value
+        w_fcf_yield: Peso del componente FCF Yield
+        w_momentum: Peso del componente Momentum
+        normalize_output: Si True, calcula rank percentil del score final
+        industry_adjusted: Si True, normaliza valoración por sector (RECOMENDADO)
 
     Returns:
         DataFrame con columnas adicionales:
@@ -244,7 +320,7 @@ def calculate_quality_value_score(
 
     # Calcular componentes
     df['quality_score_component'] = calculate_quality_score(df)
-    df['value_score_component'] = calculate_value_score(df)
+    df['value_score_component'] = calculate_value_score(df, industry_adjusted=industry_adjusted)
     df['fcf_yield_component'] = calculate_fcf_yield_score(df)
     df['momentum_component'] = calculate_momentum_score(df)
 
@@ -279,10 +355,11 @@ def calculate_quality_value_score(
 def compute_quality_value_factors(
     df_universe: pd.DataFrame,
     df_fundamentals: pd.DataFrame,
-    w_quality: float = 0.40,
-    w_value: float = 0.35,
-    w_fcf_yield: float = 0.15,
-    w_momentum: float = 0.10,
+    w_quality: float = 0.35,       # Actualizado
+    w_value: float = 0.40,         # Actualizado
+    w_fcf_yield: float = 0.10,     # Actualizado
+    w_momentum: float = 0.15,      # Actualizado
+    industry_adjusted: bool = True, # NUEVO
 ) -> pd.DataFrame:
     """
     Función principal que combina datos del universo y fundamentales,
@@ -291,10 +368,11 @@ def compute_quality_value_factors(
     Args:
         df_universe: DataFrame con symbol, sector, market_cap, etc.
         df_fundamentals: DataFrame con piotroski_score, ev_ebitda, pb, pe, fcf, etc.
-        w_quality: Peso del componente Quality (default 40%)
-        w_value: Peso del componente Value (default 35%)
-        w_fcf_yield: Peso del FCF Yield (default 15%)
-        w_momentum: Peso del Momentum (default 10%)
+        w_quality: Peso del componente Quality (default 35%, actualizado)
+        w_value: Peso del componente Value (default 40%, actualizado)
+        w_fcf_yield: Peso del FCF Yield (default 10%, actualizado)
+        w_momentum: Peso del Momentum (default 15%, actualizado)
+        industry_adjusted: Ajuste por sector en valoración (default True, RECOMENDADO)
 
     Returns:
         DataFrame ordenado por qv_score descendente
@@ -309,6 +387,7 @@ def compute_quality_value_factors(
         w_value=w_value,
         w_fcf_yield=w_fcf_yield,
         w_momentum=w_momentum,
+        industry_adjusted=industry_adjusted,
     )
 
     # Ordenar por score descendente
