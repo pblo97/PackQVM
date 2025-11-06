@@ -89,19 +89,178 @@ def calculate_risk_adjusted_momentum(prices: pd.DataFrame) -> float:
 def calculate_6m_momentum(prices: pd.DataFrame) -> float:
     """
     Momentum de 6 meses (alternativa más responsive).
-    
+
     Usado por: Fama-French 6-month momentum factor
     """
     if len(prices) < 126:
         return np.nan
-    
+
     try:
         p_6m = prices['close'].iloc[-126]
         p_now = prices['close'].iloc[-1]
-        
+
         momentum = (p_now / p_6m) - 1
         return float(momentum)
-    
+
+    except Exception:
+        return np.nan
+
+
+def calculate_3m_momentum(prices: pd.DataFrame) -> float:
+    """
+    Momentum de 3 meses (más responsive para detectar cambios tempranos).
+
+    Paper: Novy-Marx (2012) - "Intermediate Horizon Returns"
+    """
+    if len(prices) < 63:
+        return np.nan
+
+    try:
+        p_3m = prices['close'].iloc[-63]
+        p_now = prices['close'].iloc[-1]
+
+        momentum = (p_now / p_3m) - 1
+        return float(momentum)
+
+    except Exception:
+        return np.nan
+
+
+def calculate_multi_timeframe_momentum(
+    prices: pd.DataFrame,
+    w_3m: float = 0.25,
+    w_6m: float = 0.40,
+    w_12m: float = 0.35,
+) -> float:
+    """
+    Momentum compuesto multi-timeframe (Novy-Marx 2012).
+
+    Paper: Novy-Marx (2012) - "Intermediate Horizon Returns"
+    Hallazgo: 6M momentum tiene mejor Sharpe que 12M solo.
+
+    Combina:
+    - 3M momentum (25%): Detecta cambios tempranos
+    - 6M momentum (40%): Mejor Sharpe según paper
+    - 12M momentum (35%): Clásico J&T (1993)
+
+    Returns:
+        Composite momentum score
+    """
+    mom_3m = calculate_3m_momentum(prices)
+    mom_6m = calculate_6m_momentum(prices)
+    mom_12m = calculate_12m_1m_momentum(prices)
+
+    # Si alguno es NaN, ajustar pesos
+    scores = []
+    weights = []
+
+    if not pd.isna(mom_3m):
+        scores.append(mom_3m)
+        weights.append(w_3m)
+
+    if not pd.isna(mom_6m):
+        scores.append(mom_6m)
+        weights.append(w_6m)
+
+    if not pd.isna(mom_12m):
+        scores.append(mom_12m)
+        weights.append(w_12m)
+
+    if not scores:
+        return np.nan
+
+    # Weighted average
+    total_weight = sum(weights)
+    composite = sum(s * w for s, w in zip(scores, weights)) / total_weight
+
+    return float(composite)
+
+
+def filter_short_term_reversal(
+    prices: pd.DataFrame,
+    threshold: float = -0.08,
+) -> bool:
+    """
+    Filtrar stocks con reversal de corto plazo (1 semana).
+
+    Paper: Jegadeesh (1990) - "Evidence of Predictable Behavior"
+    Hallazgo: Stocks que cayeron >8% last week tienden a rebotar (mean reversion)
+
+    Args:
+        prices: DataFrame de precios
+        threshold: Umbral de retorno semanal (default -8%)
+
+    Returns:
+        True si PASS el filtro (no tiene reversal extremo), False si FAIL
+    """
+    if len(prices) < 5:
+        return False
+
+    try:
+        # Retorno última semana
+        ret_1w = prices['close'].iloc[-1] / prices['close'].iloc[-5] - 1
+
+        # Pass si NO cayó más del threshold
+        return ret_1w > threshold
+
+    except Exception:
+        return False
+
+
+def calculate_sector_relative_momentum(
+    symbol: str,
+    sector: str,
+    prices_dict: Dict[str, pd.DataFrame],
+    sector_map: Dict[str, str],
+) -> float:
+    """
+    Momentum relativo al sector (Levy 1967, O'Shaughnessy 2005).
+
+    Calcula: Momentum(stock) - Momentum(sector_average)
+
+    Rationale: Evita "best of the worst" (mejor minera pero sector minero en bear)
+
+    Args:
+        symbol: Símbolo del stock
+        sector: Sector del stock
+        prices_dict: {symbol: prices_df}
+        sector_map: {symbol: sector}
+
+    Returns:
+        Relative momentum score (puede ser negativo si underperforma sector)
+    """
+    if symbol not in prices_dict:
+        return np.nan
+
+    try:
+        # Momentum del stock
+        stock_mom = calculate_12m_1m_momentum(prices_dict[symbol])
+
+        if pd.isna(stock_mom):
+            return np.nan
+
+        # Calcular momentum promedio del sector
+        sector_stocks = [s for s, sec in sector_map.items() if sec == sector and s in prices_dict]
+
+        if len(sector_stocks) < 3:  # Muy pocos stocks en el sector
+            return stock_mom  # Devolver momentum absoluto
+
+        sector_moms = []
+        for s in sector_stocks:
+            mom = calculate_12m_1m_momentum(prices_dict[s])
+            if not pd.isna(mom):
+                sector_moms.append(mom)
+
+        if not sector_moms:
+            return stock_mom
+
+        sector_avg_mom = np.mean(sector_moms)
+
+        # Relative momentum = stock - sector
+        relative_mom = stock_mom - sector_avg_mom
+
+        return float(relative_mom)
+
     except Exception:
         return np.nan
 

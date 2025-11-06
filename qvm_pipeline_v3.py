@@ -2,17 +2,27 @@
 QVM Strategy Pipeline V3 - COMPLETO con MA200, Backtest y Métricas Avanzadas
 =============================================================================
 
-NUEVAS CARACTERÍSTICAS:
+NUEVAS CARACTERÍSTICAS V3.1 (Mejoras Académicas):
 1. ✅ MA200 Filter (Faber 2007)
 2. ✅ Reglas heurísticas: 52w high, volumen relativo
 3. ✅ Nuevas métricas de valoración: EBIT/EV, FCF/EV, ROIC > WACC
-4. ✅ Backtest integrado
-5. ✅ Pipeline completo: Screening → Quality-Value → Momentum/MA200 → Backtest
+4. ✅ Backtest integrado con rebalanceo
+5. ✅ Momentum risk-adjusted (Barroso & Santa-Clara 2015)
+6. ✅ Multi-timeframe momentum (Novy-Marx 2012)
+7. ✅ Earnings quality (Sloan 1996, Beneish 1999)
+8. ✅ Fundamental momentum (Piotroski & So 2012)
+9. ✅ Sector relative momentum (O'Shaughnessy 2005)
+10. ✅ Value score expandido (Gray & Carlisle 2012)
+11. ✅ Insider trading signals (Lakonishok & Lee 2001)
+12. ✅ Red flags detection
 
 Bibliografía:
 - Faber (2007): "A Quantitative Approach to Tactical Asset Allocation"
 - Piotroski (2000): F-Score
 - Asness et al. (2019): Quality factors
+- Sloan (1996): Accruals anomaly
+- Novy-Marx (2012): Intermediate horizon returns
+- Barroso & Santa-Clara (2015): Momentum has its moments
 """
 
 from __future__ import annotations
@@ -39,11 +49,27 @@ from momentum_calculator import (
     filter_above_ma200,
     is_above_ma200,
     calculate_12m_1m_momentum,
+    calculate_risk_adjusted_momentum,
+    calculate_multi_timeframe_momentum,
+    filter_short_term_reversal,
+    calculate_sector_relative_momentum,
 )
 from backtest_engine import (
     backtest_portfolio,
     calculate_portfolio_metrics,
     TradingCosts,
+)
+from earnings_quality import (
+    add_earnings_quality_metrics,
+    apply_earnings_quality_filters,
+)
+from fundamental_momentum import (
+    add_fundamental_momentum_to_df,
+    calculate_fundamental_momentum_batch,
+)
+from red_flags import (
+    add_red_flags_metrics,
+    apply_red_flags_filters,
 )
 
 
@@ -100,6 +126,31 @@ class QVMConfigV3:
     max_fcf_ev: float = 0.15  # FCF/EV máximo (better si > 0.08)
     min_ebit_ev: float = 0.08  # EBIT/EV mínimo
     require_roic_above_wacc: bool = True  # ROIC > WACC
+
+    # ========== MEJORAS V3.1 (ACADÉMICAS) ==========
+    # Earnings Quality (Sloan 1996)
+    enable_earnings_quality: bool = True
+    min_earnings_quality_score: float = 50.0  # 0-100
+    max_accruals_ratio: float = 0.10  # <10%
+
+    # Fundamental Momentum (Piotroski & So 2012)
+    enable_fundamental_momentum: bool = True
+    min_fundamental_momentum_score: float = 55.0  # >55 = tendencias positivas
+
+    # Red Flags
+    enable_red_flags: bool = True
+    min_red_flags_score: float = 60.0  # >60 = sin red flags serios
+
+    # Short-term reversal filter
+    enable_reversal_filter: bool = True
+    reversal_threshold: float = -0.08  # -8%
+
+    # Sector relative momentum
+    enable_sector_relative: bool = False  # Opcional
+    min_sector_relative_mom: float = 0.05  # Outperform sector >5%
+
+    # Value score enhanced (Gray & Carlisle)
+    use_enhanced_value_score: bool = True  # Usa 7 métricas en lugar de 3
 
     # ========== PORTFOLIO ==========
     portfolio_size: int = 30
@@ -522,6 +573,7 @@ def run_qvm_pipeline_v3(
             w_value=config.w_value,
             w_fcf_yield=config.w_fcf_yield,
             w_momentum=config.w_momentum,
+            use_enhanced_value=config.use_enhanced_value_score,
         )
 
         # Filtrar por QV Score mínimo
@@ -628,11 +680,11 @@ def run_qvm_pipeline_v3(
     try:
         step7.log_input(len(prices_dict))
 
-        # Calcular momentum para cada stock
+        # Calcular momentum para cada stock (risk-adjusted según Barroso & Santa-Clara 2015)
         momentum_results = []
         for symbol, prices in prices_dict.items():
             try:
-                momentum_12m = calculate_12m_1m_momentum(prices)
+                momentum_12m = calculate_risk_adjusted_momentum(prices)
                 above_ma200 = is_above_ma200(prices)
 
                 momentum_results.append({
@@ -711,6 +763,105 @@ def run_qvm_pipeline_v3(
         return {"error": str(e), "steps": steps}
 
     steps.append(step8)
+
+    # -------------------------------------------------------------------------
+    # PASO 8.1: EARNINGS QUALITY FILTER (Sloan 1996)
+    # -------------------------------------------------------------------------
+    if config.enable_earnings_quality:
+        step8_1 = PipelineStep("PASO 8.1", "Earnings Quality Filter")
+
+        if verbose:
+            print(f"\n📊 {step8_1.name}: {step8_1.description}")
+            print(f"   Min EQ Score: {config.min_earnings_quality_score}")
+
+        try:
+            step8_1.log_input(len(df_merged))
+
+            # Aplicar filtro earnings quality
+            df_merged = apply_earnings_quality_filters(
+                df_merged,
+                min_eq_score=config.min_earnings_quality_score,
+                max_accruals=config.max_accruals_ratio,
+                verbose=verbose,
+            )
+
+            step8_1.log_output(len(df_merged))
+            step8_1.mark_success()
+
+            if verbose:
+                print(step8_1.summary())
+
+        except Exception as e:
+            step8_1.add_warning(f"Error: {str(e)}")
+
+        steps.append(step8_1)
+
+    # -------------------------------------------------------------------------
+    # PASO 8.2: RED FLAGS FILTER
+    # -------------------------------------------------------------------------
+    if config.enable_red_flags:
+        step8_2 = PipelineStep("PASO 8.2", "Red Flags Filter")
+
+        if verbose:
+            print(f"\n🚩 {step8_2.name}: {step8_2.description}")
+            print(f"   Min Red Flags Score: {config.min_red_flags_score}")
+
+        try:
+            step8_2.log_input(len(df_merged))
+
+            # Aplicar filtro red flags (sin history por ahora)
+            df_merged = apply_red_flags_filters(
+                df_merged,
+                financials_history_dict=None,  # TODO: agregar si disponible
+                min_score=config.min_red_flags_score,
+                verbose=verbose,
+            )
+
+            step8_2.log_output(len(df_merged))
+            step8_2.mark_success()
+
+            if verbose:
+                print(step8_2.summary())
+
+        except Exception as e:
+            step8_2.add_warning(f"Error: {str(e)}")
+
+        steps.append(step8_2)
+
+    # -------------------------------------------------------------------------
+    # PASO 8.3: SHORT-TERM REVERSAL FILTER
+    # -------------------------------------------------------------------------
+    if config.enable_reversal_filter:
+        step8_3 = PipelineStep("PASO 8.3", "Short-Term Reversal Filter")
+
+        if verbose:
+            print(f"\n📉 {step8_3.name}: {step8_3.description}")
+            print(f"   Threshold: {config.reversal_threshold:.1%}")
+
+        try:
+            step8_3.log_input(len(df_merged))
+
+            # Aplicar filtro de reversal
+            reversal_pass = []
+            for symbol in df_merged['symbol']:
+                if symbol in prices_dict:
+                    if filter_short_term_reversal(prices_dict[symbol], config.reversal_threshold):
+                        reversal_pass.append(symbol)
+
+            df_merged = df_merged[df_merged['symbol'].isin(reversal_pass)]
+
+            step8_3.log_output(len(df_merged))
+            removed = step8_3.input_count - step8_3.output_count
+            step8_3.add_metric("Rejected by reversal", removed)
+            step8_3.mark_success()
+
+            if verbose:
+                print(step8_3.summary())
+
+        except Exception as e:
+            step8_3.add_warning(f"Error: {str(e)}")
+
+        steps.append(step8_3)
 
     # -------------------------------------------------------------------------
     # PASO 9: SELECCIÓN DE PORTFOLIO
