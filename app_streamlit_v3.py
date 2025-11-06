@@ -304,7 +304,10 @@ with st.sidebar:
         help="Usa EV/EBITDA, EV/EBIT, EV/FCF, P/B, P/E, P/Sales, Shareholder Yield"
     )
 
-    # Opcionales (más avanzados)
+    # Opcionales (más avanzados) - Definir defaults primero
+    enable_fundamental_momentum = False
+    enable_sector_relative = False
+
     with st.expander("⚙️ Opcionales (Avanzado)"):
         enable_fundamental_momentum = st.checkbox(
             "📈 Fundamental Momentum (Piotroski & So 2012)",
