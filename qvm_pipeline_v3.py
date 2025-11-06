@@ -63,10 +63,11 @@ class QVMConfigV3:
     min_volume: int = 500_000
 
     # ========== QUALITY-VALUE WEIGHTS ==========
-    w_quality: float = 0.40
-    w_value: float = 0.35
-    w_fcf_yield: float = 0.15
-    w_momentum: float = 0.10
+    # Optimizado según análisis académico (ver ANALISIS_ACADEMICO.md)
+    w_quality: float = 0.35      # Reducido para evitar overlap con FCF
+    w_value: float = 0.40        # Aumentado (mayor peso en valoración)
+    w_fcf_yield: float = 0.10    # Reducido (overlap parcial con Piotroski CFO)
+    w_momentum: float = 0.15     # Aumentado según Jegadeesh & Titman (1993)
 
     # ========== FILTROS BÁSICOS ==========
     min_piotroski_score: int = 6
@@ -174,12 +175,84 @@ class PipelineStep:
 # NUEVAS FUNCIONES: MÉTRICAS AVANZADAS
 # ============================================================================
 
+# WACC por sector (Weighted Average Cost of Capital)
+# Basado en datos históricos de industria (Damodaran NYU Stern School)
+WACC_BY_SECTOR = {
+    # Technology & Internet
+    'Technology': 0.08,
+    'Communication Services': 0.08,
+    'Software': 0.08,
+    'Technology Hardware, Equipment & Parts': 0.09,
+
+    # Financial
+    'Financial Services': 0.10,
+    'Banks': 0.09,
+    'Insurance': 0.09,
+    'Capital Markets': 0.10,
+
+    # Energy & Utilities
+    'Energy': 0.09,
+    'Utilities': 0.07,
+    'Oil, Gas & Consumable Fuels': 0.10,
+
+    # Consumer
+    'Consumer Cyclical': 0.09,
+    'Consumer Defensive': 0.07,
+    'Consumer Discretionary': 0.09,
+    'Consumer Staples': 0.07,
+
+    # Healthcare
+    'Healthcare': 0.09,
+    'Pharmaceuticals': 0.09,
+    'Biotechnology': 0.10,
+
+    # Industrial
+    'Industrials': 0.09,
+    'Basic Materials': 0.09,
+    'Materials': 0.09,
+
+    # Real Estate
+    'Real Estate': 0.08,
+    'REITs': 0.08,
+
+    # Otros
+    'Telecommunications': 0.08,
+    'Transportation': 0.09,
+    'Aerospace & Defense': 0.08,
+}
+
+# WACC por defecto si sector no está en el diccionario
+DEFAULT_WACC = 0.09
+
+
+def get_wacc_for_sector(sector: str) -> float:
+    """
+    Retorna WACC específico del sector.
+    Si no encuentra el sector, usa WACC por defecto de 9%.
+    """
+    if pd.isna(sector) or not isinstance(sector, str):
+        return DEFAULT_WACC
+
+    # Buscar match exacto
+    if sector in WACC_BY_SECTOR:
+        return WACC_BY_SECTOR[sector]
+
+    # Buscar match parcial (por si el nombre del sector varía)
+    sector_lower = sector.lower()
+    for key, wacc in WACC_BY_SECTOR.items():
+        if key.lower() in sector_lower or sector_lower in key.lower():
+            return wacc
+
+    # Si no encuentra, usar default
+    return DEFAULT_WACC
+
+
 def calculate_advanced_valuation_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calcula métricas avanzadas de valoración:
     - EBIT/EV
     - FCF/EV
-    - ROIC vs WACC
+    - ROIC vs WACC (ahora por sector)
     """
     df = df.copy()
 
@@ -197,13 +270,17 @@ def calculate_advanced_valuation_metrics(df: pd.DataFrame) -> pd.DataFrame:
         # Aproximación con market cap
         df['fcf_ev'] = pd.to_numeric(df['fcf'], errors='coerce') / pd.to_numeric(df['market_cap'], errors='coerce').replace(0, np.nan)
 
-    # ROIC vs WACC
-    # Estimación simple de WACC: ~8-10% (costo de capital típico)
-    # En producción, calcular WACC real desde datos de deuda y equity
+    # ROIC vs WACC (ahora POR SECTOR)
     if 'roic' in df.columns:
-        estimated_wacc = 0.09  # 9% WACC promedio
-        df['roic_above_wacc'] = pd.to_numeric(df['roic'], errors='coerce') > estimated_wacc
-        df['roic_wacc_spread'] = pd.to_numeric(df['roic'], errors='coerce') - estimated_wacc
+        # Calcular WACC específico por sector
+        if 'sector' in df.columns:
+            df['wacc'] = df['sector'].apply(get_wacc_for_sector)
+        else:
+            df['wacc'] = DEFAULT_WACC
+
+        roic = pd.to_numeric(df['roic'], errors='coerce')
+        df['roic_above_wacc'] = roic > df['wacc']
+        df['roic_wacc_spread'] = roic - df['wacc']
 
     return df
 

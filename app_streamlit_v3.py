@@ -114,7 +114,7 @@ with st.sidebar:
         "📈 Quality (Piotroski)",
         min_value=0.0,
         max_value=1.0,
-        value=0.40,
+        value=0.35,  # Reducido de 0.40 para evitar overlap con FCF
         step=0.05,
         help="Peso del Piotroski Score"
     )
@@ -123,27 +123,27 @@ with st.sidebar:
         "💰 Value (Multiples)",
         min_value=0.0,
         max_value=1.0,
-        value=0.35,
+        value=0.40,  # Aumentado de 0.35 (mayor peso en valoración)
         step=0.05,
-        help="Peso de los múltiplos de valoración"
+        help="Peso de los múltiplos de valoración (EV/EBITDA, P/B, P/E)"
     )
 
     w_fcf_yield = st.slider(
         "💵 FCF Yield",
         min_value=0.0,
         max_value=1.0,
-        value=0.15,
+        value=0.10,  # Reducido de 0.15 para minimizar overlap con Piotroski
         step=0.05,
-        help="Peso del FCF Yield"
+        help="Peso del FCF Yield (tiene overlap parcial con Piotroski CFO)"
     )
 
     w_momentum = st.slider(
         "🚀 Momentum",
         min_value=0.0,
         max_value=1.0,
-        value=0.10,
+        value=0.15,  # Aumentado de 0.10 según Jegadeesh & Titman (1993)
         step=0.05,
-        help="Peso del momentum (12M-1M)"
+        help="Peso del momentum 12M-1M (Jegadeesh & Titman 1993)"
     )
 
     # Mostrar suma de pesos
