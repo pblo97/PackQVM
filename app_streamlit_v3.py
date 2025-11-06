@@ -276,6 +276,50 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("🎓 Mejoras Académicas V3.1 (NUEVO)")
+
+    st.info("Funcionalidades avanzadas basadas en literatura académica reciente")
+
+    enable_earnings_quality = st.checkbox(
+        "✅ Earnings Quality Filter (Sloan 1996)",
+        value=True,
+        help="Filtra empresas con accruals altos (posible manipulación de earnings)"
+    )
+
+    enable_red_flags = st.checkbox(
+        "🚩 Red Flags Detection",
+        value=True,
+        help="Detecta dilución excesiva, pérdidas recurrentes, etc."
+    )
+
+    enable_reversal_filter = st.checkbox(
+        "📉 Short-Term Reversal Filter (Jegadeesh 1990)",
+        value=True,
+        help="Evita stocks que cayeron >8% last week (mean reversion)"
+    )
+
+    use_enhanced_value_score = st.checkbox(
+        "💎 Enhanced Value Score (7 métricas vs 3)",
+        value=True,
+        help="Usa EV/EBITDA, EV/EBIT, EV/FCF, P/B, P/E, P/Sales, Shareholder Yield"
+    )
+
+    # Opcionales (más avanzados)
+    with st.expander("⚙️ Opcionales (Avanzado)"):
+        enable_fundamental_momentum = st.checkbox(
+            "📈 Fundamental Momentum (Piotroski & So 2012)",
+            value=False,
+            help="Requiere datos históricos multi-year (puede ser lento)"
+        )
+
+        enable_sector_relative = st.checkbox(
+            "🎯 Sector Relative Momentum",
+            value=False,
+            help="Solo selecciona stocks que outperforman su sector"
+        )
+
+    st.divider()
+
     st.subheader("📋 Portfolio")
 
     portfolio_size = st.slider(
@@ -386,6 +430,13 @@ config = QVMConfigV3(
     commission_bps=commission_bps,
     slippage_bps=slippage_bps,
     market_impact_bps=market_impact_bps,
+    # Mejoras V3.1
+    enable_earnings_quality=enable_earnings_quality,
+    enable_red_flags=enable_red_flags,
+    enable_reversal_filter=enable_reversal_filter,
+    use_enhanced_value_score=use_enhanced_value_score,
+    enable_fundamental_momentum=enable_fundamental_momentum,
+    enable_sector_relative=enable_sector_relative,
 )
 
 

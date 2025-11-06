@@ -222,6 +222,156 @@ def calculate_value_score(df: pd.DataFrame, industry_adjusted: bool = True) -> p
     return value_score.fillna(0.5)
 
 
+def calculate_value_score_enhanced(df: pd.DataFrame, industry_adjusted: bool = True) -> pd.Series:
+    """
+    Value Score EXPANDIDO con métricas adicionales (Gray & Carlisle 2012).
+
+    Métricas incluidas:
+    1. EV/EBITDA (20%) - métrica tradicional
+    2. EV/EBIT (15%) - más precisa que EBITDA (D&A puede ser manipulado)
+    3. EV/FCF (20%) - el verdadero cash disponible
+    4. P/B (15%) - book value
+    5. P/E (15%) - earnings
+    6. P/Sales (10%) - útil para growth stocks sin earnings
+    7. Shareholder Yield (5%) - dividends + buybacks
+
+    Paper: Gray & Carlisle (2012) - "Quantitative Value"
+
+    Args:
+        df: DataFrame con métricas de valoración
+        industry_adjusted: Si True, normaliza dentro de cada sector
+    """
+    scores = []
+    weights = []
+    df_temp = df.copy()
+
+    # 1. EV/EBITDA (20%)
+    if 'ev_ebitda' in df.columns:
+        ev_ebitda = pd.to_numeric(df['ev_ebitda'], errors='coerce')
+        ev_ebitda = ev_ebitda.where((ev_ebitda > 0) & (ev_ebitda < 100), np.nan)
+        df_temp['ev_ebitda_clean'] = ev_ebitda
+
+        if ev_ebitda.notna().sum() > 1:
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'ev_ebitda_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(ev_ebitda, lower_is_better=True)
+            scores.append(score)
+            weights.append(0.20)
+
+    # 2. EV/EBIT (15%) - Más preciso que EBITDA
+    if 'ebit' in df.columns and 'enterpriseValue' in df.columns:
+        ebit = pd.to_numeric(df['ebit'], errors='coerce')
+        ev = pd.to_numeric(df['enterpriseValue'], errors='coerce')
+        ev_ebit = ev / ebit.replace(0, np.nan)
+        ev_ebit = ev_ebit.where((ev_ebit > 0) & (ev_ebit < 100), np.nan)
+        df_temp['ev_ebit_clean'] = ev_ebit
+
+        if ev_ebit.notna().sum() > 1:
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'ev_ebit_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(ev_ebit, lower_is_better=True)
+            scores.append(score)
+            weights.append(0.15)
+
+    # 3. EV/FCF (20%) - El verdadero cash
+    if 'freeCashFlow' in df.columns and 'enterpriseValue' in df.columns:
+        fcf = pd.to_numeric(df['freeCashFlow'], errors='coerce')
+        ev = pd.to_numeric(df['enterpriseValue'], errors='coerce')
+        ev_fcf = ev / fcf.replace(0, np.nan)
+        ev_fcf = ev_fcf.where((ev_fcf > 0) & (ev_fcf < 100), np.nan)
+        df_temp['ev_fcf_clean'] = ev_fcf
+
+        if ev_fcf.notna().sum() > 1:
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'ev_fcf_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(ev_fcf, lower_is_better=True)
+            scores.append(score)
+            weights.append(0.20)
+
+    # 4. P/B (15%)
+    if 'pb' in df.columns:
+        pb = pd.to_numeric(df['pb'], errors='coerce')
+        pb = pb.where((pb > 0) & (pb < 50), np.nan)
+        df_temp['pb_clean'] = pb
+
+        if pb.notna().sum() > 1:
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'pb_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(pb, lower_is_better=True)
+            scores.append(score)
+            weights.append(0.15)
+
+    # 5. P/E (15%)
+    if 'pe' in df.columns:
+        pe = pd.to_numeric(df['pe'], errors='coerce')
+        pe = pe.where((pe > 0) & (pe < 100), np.nan)
+        df_temp['pe_clean'] = pe
+
+        if pe.notna().sum() > 1:
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'pe_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(pe, lower_is_better=True)
+            scores.append(score)
+            weights.append(0.15)
+
+    # 6. P/Sales (10%) - Útil para growth stocks
+    if ('marketCap' in df.columns or 'market_cap' in df.columns) and 'revenue' in df.columns:
+        market_cap = pd.to_numeric(df.get('marketCap', df.get('market_cap', 0)), errors='coerce')
+        revenue = pd.to_numeric(df['revenue'], errors='coerce')
+        p_sales = market_cap / revenue.replace(0, np.nan)
+        p_sales = p_sales.where((p_sales > 0) & (p_sales < 50), np.nan)
+        df_temp['p_sales_clean'] = p_sales
+
+        if p_sales.notna().sum() > 1:
+            if industry_adjusted and 'sector' in df.columns:
+                score = _normalize_by_sector(df_temp, 'p_sales_clean', lower_is_better=True)
+            else:
+                score = _normalize_score(p_sales, lower_is_better=True)
+            scores.append(score)
+            weights.append(0.10)
+
+    # 7. Shareholder Yield (5%) - Dividends + Buybacks
+    # Shareholder Yield = (Dividends + Buybacks) / Market Cap
+    # Higher is better (devuelve cash a shareholders)
+    shareholder_yield = pd.Series(0.0, index=df.index)
+
+    if 'dividendYield' in df.columns:
+        div_yield = pd.to_numeric(df['dividendYield'], errors='coerce').fillna(0)
+        shareholder_yield += div_yield
+
+    # Buyback yield aproximado (si está disponible)
+    if 'stockRepurchased' in df.columns and ('marketCap' in df.columns or 'market_cap' in df.columns):
+        buyback = pd.to_numeric(df['stockRepurchased'], errors='coerce').fillna(0)
+        market_cap = pd.to_numeric(df.get('marketCap', df.get('market_cap', 1)), errors='coerce')
+        buyback_yield = buyback / market_cap.replace(0, np.nan)
+        shareholder_yield += buyback_yield.fillna(0)
+
+    df_temp['shareholder_yield_clean'] = shareholder_yield
+
+    if shareholder_yield.notna().sum() > 1 and shareholder_yield.max() > 0:
+        # Higher is better (inverso de los demás)
+        score = _normalize_score(shareholder_yield, lower_is_better=False)
+        scores.append(score)
+        weights.append(0.05)
+
+    if not scores:
+        return pd.Series(0.5, index=df.index)
+
+    # Normalizar pesos
+    weights = np.array(weights)
+    weights = weights / weights.sum()
+
+    # Combinar scores
+    value_score = sum(s * w for s, w in zip(scores, weights))
+
+    return value_score.fillna(0.5)
+
+
 # ============================================================================
 # MOMENTUM SCORE (opcional)
 # ============================================================================
@@ -288,6 +438,7 @@ def calculate_quality_value_score(
     w_momentum: float = 0.15,     # Actualizado
     normalize_output: bool = True,
     industry_adjusted: bool = True,  # NUEVO: ajuste por sector
+    use_enhanced_value: bool = True,  # NUEVO: usar value score expandido
 ) -> pd.DataFrame:
     """
     Calcula Quality-Value Score compuesto SIN multicolinealidad.
@@ -320,7 +471,13 @@ def calculate_quality_value_score(
 
     # Calcular componentes
     df['quality_score_component'] = calculate_quality_score(df)
-    df['value_score_component'] = calculate_value_score(df, industry_adjusted=industry_adjusted)
+
+    # Value score: usar enhanced (7 métricas) o normal (3 métricas)
+    if use_enhanced_value:
+        df['value_score_component'] = calculate_value_score_enhanced(df, industry_adjusted=industry_adjusted)
+    else:
+        df['value_score_component'] = calculate_value_score(df, industry_adjusted=industry_adjusted)
+
     df['fcf_yield_component'] = calculate_fcf_yield_score(df)
     df['momentum_component'] = calculate_momentum_score(df)
 
@@ -360,6 +517,7 @@ def compute_quality_value_factors(
     w_fcf_yield: float = 0.10,     # Actualizado
     w_momentum: float = 0.15,      # Actualizado
     industry_adjusted: bool = True, # NUEVO
+    use_enhanced_value: bool = True, # NUEVO: usar value score expandido
 ) -> pd.DataFrame:
     """
     Función principal que combina datos del universo y fundamentales,
@@ -388,6 +546,7 @@ def compute_quality_value_factors(
         w_fcf_yield=w_fcf_yield,
         w_momentum=w_momentum,
         industry_adjusted=industry_adjusted,
+        use_enhanced_value=use_enhanced_value,
     )
 
     # Ordenar por score descendente
