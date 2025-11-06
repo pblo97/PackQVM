@@ -312,6 +312,18 @@ def apply_earnings_quality_filters(
     df_filtered = df.copy()
     initial_count = len(df_filtered)
 
+    # Calcular métricas si no existen
+    if 'earnings_quality_score' not in df_filtered.columns:
+        if verbose:
+            print("   Calculando earnings quality metrics...")
+        try:
+            df_filtered = add_earnings_quality_metrics(df_filtered, df_prev=None)
+        except Exception as e:
+            if verbose:
+                print(f"   ⚠️  Error calculando EQ metrics: {e}")
+                print(f"   ℹ️  Skipping earnings quality filter")
+            return df_filtered  # Return sin filtrar
+
     # Filtro 1: Earnings Quality Score
     if 'earnings_quality_score' in df_filtered.columns:
         df_filtered = df_filtered[df_filtered['earnings_quality_score'] >= min_eq_score]
