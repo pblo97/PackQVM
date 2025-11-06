@@ -356,14 +356,21 @@ def apply_red_flags_filters(
             print(f"   Filtro Red Flags Score >= {min_score}: -{removed} stocks")
 
     else:
-        # Sin historia, solo check aggressive capitalization
+        # Sin historia, solo check aggressive capitalization si las columnas existen
         if all(col in df_filtered.columns for col in ['capitalExpenditure', 'researchAndDevelopmentExpenses']):
-            aggressive = check_aggressive_capitalization(df_filtered)
-            df_filtered = df_filtered[~aggressive]
+            try:
+                aggressive = check_aggressive_capitalization(df_filtered)
+                df_filtered = df_filtered[~aggressive]
 
+                if verbose:
+                    removed = initial_count - len(df_filtered)
+                    print(f"   Filtro Aggressive Capitalization: -{removed} stocks")
+            except Exception as e:
+                if verbose:
+                    print(f"   ⚠️  No se pudo aplicar filtro aggressive cap: {e}")
+        else:
             if verbose:
-                removed = initial_count - len(df_filtered)
-                print(f"   Filtro Aggressive Capitalization: -{removed} stocks")
+                print(f"   ℹ️  Columnas faltantes para red flags, skipping filtro")
 
     if verbose:
         final_count = len(df_filtered)
