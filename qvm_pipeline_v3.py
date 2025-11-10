@@ -124,7 +124,7 @@ class QVMConfigV3:
     enable_breakout_filter: bool = False  # Requiere breakout
     require_breakout_confirmed: bool = False  # Breakout + volumen >1.5x
     require_breakout_strong: bool = False  # Breakout + volumen >2x
-    breakout_types: list = None  # ['52w', '3m', '20d'] o None para todos
+    breakout_types: Optional[List[str]] = None  # ['52w', '3m', '20d'] o None para todos
 
     # Volumen relativo
     min_relative_volume: float = 1.0  # Volumen actual >= promedio
