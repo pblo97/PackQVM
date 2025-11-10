@@ -125,6 +125,7 @@ class QVMConfigV3:
     require_breakout_confirmed: bool = False  # Breakout + volumen >1.5x
     require_breakout_strong: bool = False  # Breakout + volumen >2x
     breakout_types: Optional[List[str]] = None  # ['52w', '3m', '20d'] o None para todos
+    breakout_lookback_days: int = 5  # Días hacia atrás para detectar breakout (default: 5)
 
     # Volumen relativo
     min_relative_volume: float = 1.0  # Volumen actual >= promedio
@@ -420,18 +421,26 @@ def calculate_volume_metrics(prices_dict: Dict[str, pd.DataFrame]) -> pd.DataFra
     return pd.DataFrame(results)
 
 
-def detect_breakouts(prices_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+def detect_breakouts(prices_dict: Dict[str, pd.DataFrame], lookback_days: int = 5) -> pd.DataFrame:
     """
     Detecta breakouts de niveles técnicos previos.
 
-    Reglas heurísticas:
+    Reglas heurísticas MEJORADAS:
     1. Breakout de 52w high (precio > máximo 52w anterior)
     2. Breakout de resistencia 3M (precio > máximo últimos 60 días)
     3. Breakout de consolidación (precio > máximo últimos 20 días)
-    4. Breakout confirmado: breakout + volumen > promedio
+
+    Args:
+        prices_dict: Dict de DataFrames con precios
+        lookback_days: Días hacia atrás para detectar breakout (default: 5)
+                       En lugar de detectar solo el día exacto, detecta si
+                       hubo breakout en los últimos N días
 
     Returns:
         DataFrame con indicadores de breakout
+
+    NOTA: Lógica relajada para detectar breakouts recientes (últimos 5 días)
+          en lugar de solo el día exacto, lo cual es más robusto con datos EOD.
     """
     results = []
 
@@ -442,30 +451,33 @@ def detect_breakouts(prices_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         try:
             current_price = prices['close'].iloc[-1]
 
-            # Precio hace 1 día (para calcular el breakout reciente)
-            prev_price = prices['close'].iloc[-2] if len(prices) >= 2 else current_price
+            # Detectar breakouts en ventana reciente (más robusto)
+            # En lugar de: "rompió HOY", buscamos: "rompió en los últimos N días"
 
-            # Niveles de resistencia
-            if len(prices) >= 252:
-                # 52w high (excluyendo día actual)
-                high_52w_prev = prices['close'].iloc[-252:-1].max()
-                breakout_52w = current_price > high_52w_prev and prev_price <= high_52w_prev
+            # ===== BREAKOUT 52W =====
+            if len(prices) >= 252 + lookback_days:
+                # Máximo ANTES de la ventana reciente
+                high_52w_prev = prices['close'].iloc[-(252+lookback_days):-lookback_days].max()
+                # ¿El precio actual está sobre ese nivel?
+                breakout_52w = current_price > high_52w_prev
             else:
                 high_52w_prev = None
                 breakout_52w = False
 
-            if len(prices) >= 60:
-                # Resistencia 3M (60 días, excluyendo día actual)
-                high_3m = prices['close'].iloc[-60:-1].max()
-                breakout_3m = current_price > high_3m and prev_price <= high_3m
+            # ===== BREAKOUT 3M =====
+            if len(prices) >= 60 + lookback_days:
+                # Máximo ANTES de la ventana reciente
+                high_3m = prices['close'].iloc[-(60+lookback_days):-lookback_days].max()
+                breakout_3m = current_price > high_3m
             else:
                 high_3m = None
                 breakout_3m = False
 
-            if len(prices) >= 20:
-                # Consolidación (20 días, excluyendo día actual)
-                high_20d = prices['close'].iloc[-20:-1].max()
-                breakout_20d = current_price > high_20d and prev_price <= high_20d
+            # ===== BREAKOUT 20D =====
+            if len(prices) >= 20 + lookback_days:
+                # Máximo ANTES de la ventana reciente
+                high_20d = prices['close'].iloc[-(20+lookback_days):-lookback_days].max()
+                breakout_20d = current_price > high_20d
             else:
                 high_20d = None
                 breakout_20d = False
@@ -473,8 +485,8 @@ def detect_breakouts(prices_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
             # Breakout general (cualquiera de los anteriores)
             any_breakout = breakout_52w or breakout_3m or breakout_20d
 
-            # Calcular % por encima del nivel
-            if high_52w_prev:
+            # Calcular % por encima del nivel (si hay datos)
+            if high_52w_prev and high_52w_prev > 0:
                 pct_above_52w = ((current_price - high_52w_prev) / high_52w_prev) * 100
             else:
                 pct_above_52w = 0
@@ -495,7 +507,8 @@ def detect_breakouts(prices_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 def detect_volume_confirmed_breakouts(
-    prices_dict: Dict[str, pd.DataFrame]
+    prices_dict: Dict[str, pd.DataFrame],
+    lookback_days: int = 5
 ) -> pd.DataFrame:
     """
     Detecta breakouts confirmados con volumen anormal.
@@ -505,8 +518,12 @@ def detect_volume_confirmed_breakouts(
     2. Volumen del día es > promedio (idealmente >1.5x)
 
     Esta es una señal más fuerte que breakout solo.
+
+    Args:
+        prices_dict: Dict de DataFrames con precios
+        lookback_days: Días hacia atrás para detectar breakout
     """
-    breakouts_df = detect_breakouts(prices_dict)
+    breakouts_df = detect_breakouts(prices_dict, lookback_days=lookback_days)
     volume_df = calculate_volume_metrics(prices_dict)
 
     if breakouts_df.empty or volume_df.empty:
@@ -915,9 +932,29 @@ def run_qvm_pipeline_v3(
                 step8.add_metric("Rejected by 52w high", rejected)
 
         # NUEVO: Calcular breakouts y volumen
-        breakout_vol_df = detect_volume_confirmed_breakouts(prices_dict)
+        breakout_vol_df = detect_volume_confirmed_breakouts(
+            prices_dict,
+            lookback_days=config.breakout_lookback_days
+        )
 
         if not breakout_vol_df.empty:
+            # Agregar logging de breakouts detectados
+            if verbose:
+                total_with_any = breakout_vol_df['any_breakout'].sum()
+                total_52w = breakout_vol_df['breakout_52w'].sum()
+                total_3m = breakout_vol_df['breakout_3m'].sum()
+                total_20d = breakout_vol_df['breakout_20d'].sum()
+                total_confirmed = breakout_vol_df['breakout_confirmed'].sum()
+                total_strong = breakout_vol_df['breakout_strong'].sum()
+
+                print(f"   📊 Breakouts detectados (últimos {config.breakout_lookback_days} días):")
+                print(f"      - Any breakout:  {total_with_any}/{len(breakout_vol_df)} ({100*total_with_any/len(breakout_vol_df):.1f}%)")
+                print(f"      - 52w breakout:  {total_52w}/{len(breakout_vol_df)}")
+                print(f"      - 3M breakout:   {total_3m}/{len(breakout_vol_df)}")
+                print(f"      - 20D breakout:  {total_20d}/{len(breakout_vol_df)}")
+                print(f"      - Confirmed:     {total_confirmed}/{len(breakout_vol_df)}")
+                print(f"      - Strong:        {total_strong}/{len(breakout_vol_df)}")
+
             df_merged = df_merged.merge(
                 breakout_vol_df[['symbol', 'breakout_52w', 'breakout_3m', 'breakout_20d',
                                  'any_breakout', 'breakout_confirmed', 'breakout_strong',
