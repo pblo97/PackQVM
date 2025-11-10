@@ -652,11 +652,28 @@ def fetch_fundamentals_batch(symbols: List[str], use_full_statements: bool = Fal
 # -----------------------------------------------------------------------------
 # Precios diarios
 # -----------------------------------------------------------------------------
-def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True) -> pd.DataFrame:
+def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True, include_volume: bool = True) -> pd.DataFrame:
     """
-    Devuelve ['date','close'] ascendente usando historical-price-full (serietype=line)
+    Devuelve ['date','close','volume'] ascendente usando historical-price-full
+
+    Args:
+        symbol: Símbolo del stock
+        start: Fecha inicio (YYYY-MM-DD)
+        end: Fecha fin (YYYY-MM-DD)
+        use_cache: Usar caché local (default: True)
+        include_volume: Incluir columna de volumen (default: True)
+
+    Returns:
+        DataFrame con columnas ['date', 'close', 'volume'] (si include_volume=True)
+        o ['date', 'close'] (si include_volume=False)
     """
-    params = {"from": start, "to": end, "serietype": "line"}
+    # Usar serietype=line para datos más ligeros (solo close), pero sin volumen
+    # Para volumen, necesitamos el endpoint completo sin serietype
+    if include_volume:
+        params = {"from": start, "to": end}  # Sin serietype para obtener todos los campos
+    else:
+        params = {"from": start, "to": end, "serietype": "line"}
+
     ttl = 3600 if use_cache else None
 
     # probar variantes del símbolo aquí también por si acaso
@@ -668,7 +685,8 @@ def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True) -> p
             break
 
     if not hist:
-        return pd.DataFrame(columns=["date","close"])
+        cols = ["date", "close", "volume"] if include_volume else ["date", "close"]
+        return pd.DataFrame(columns=cols)
 
     df = pd.DataFrame(hist)
     if "date" in df.columns:
@@ -678,8 +696,18 @@ def fetch_prices(symbol: str, start: str, end: str, use_cache: bool = True) -> p
             if alt in df.columns:
                 df["close"] = df[alt]
                 break
+
+    # Preparar columnas a retornar
+    cols_to_return = ["date", "close"]
+    if include_volume and "volume" in df.columns:
+        cols_to_return.append("volume")
+    elif include_volume:
+        # Si no hay volumen, agregar columna con NaN
+        df["volume"] = float('nan')
+        cols_to_return.append("volume")
+
     df = df.dropna(subset=["date","close"]).sort_values("date")
-    return df[["date","close"]].reset_index(drop=True)
+    return df[cols_to_return].reset_index(drop=True)
 
 def fetch_financial_scores(symbols: Iterable[str], use_cache: bool = True) -> pd.DataFrame:
     """

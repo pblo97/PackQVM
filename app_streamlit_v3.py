@@ -80,10 +80,10 @@ with st.sidebar:
     universe_size = st.slider(
         "Tamaño del universo",
         min_value=50,
-        max_value=500,
-        value=200,
+        max_value=1000,
+        value=800,
         step=50,
-        help="Número de stocks a considerar inicialmente"
+        help="Número de stocks a considerar inicialmente (ampliado a 1000)"
     )
 
     min_market_cap = st.slider(
@@ -249,6 +249,56 @@ with st.sidebar:
         value=True,
         help="Solo empresas que crean valor (ROIC > Costo de Capital)"
     )
+
+    st.divider()
+
+    st.subheader("⚡ Breakouts y Volumen (NUEVO)")
+
+    st.info("Filtros de momentum técnico: breakouts de niveles previos confirmados con volumen")
+
+    # Breakout filters
+    enable_breakout_filter = st.checkbox(
+        "🚀 Filtro de Breakout",
+        value=False,
+        help="Requiere breakout de niveles técnicos (52w, 3M o 20D)"
+    )
+
+    require_breakout_confirmed = st.checkbox(
+        "✅ Solo Breakouts Confirmados",
+        value=False,
+        help="Breakout + volumen >1.5x promedio (señal más fuerte)",
+        disabled=not enable_breakout_filter
+    )
+
+    require_breakout_strong = st.checkbox(
+        "💪 Solo Breakouts Fuertes",
+        value=False,
+        help="Breakout + volumen >2x promedio (señal muy fuerte)",
+        disabled=not enable_breakout_filter
+    )
+
+    # Volume filters
+    enable_volume_surge_filter = st.checkbox(
+        "📊 Filtro de Surge de Volumen",
+        value=False,
+        help="Requiere volumen >2x promedio (sin breakout necesario)"
+    )
+
+    with st.expander("ℹ️ Sobre Breakouts y Volumen"):
+        st.markdown("""
+        **Tipos de Breakout:**
+        - **52w High**: Precio rompe máximo de 52 semanas
+        - **3M High**: Precio rompe máximo de 3 meses (60 días)
+        - **20D High**: Precio rompe máximo de 20 días (consolidación)
+
+        **Confirmación con Volumen:**
+        - **Confirmado**: Breakout + volumen >1.5x promedio
+        - **Fuerte**: Breakout + volumen >2x promedio
+
+        **Literatura:**
+        - George & Hwang (2004): "52-week high momentum"
+        - Lee & Swaminathan (2000): "Price momentum and trading volume"
+        """)
 
     st.divider()
 
@@ -423,6 +473,11 @@ config = QVMConfigV3(
     require_near_52w_high=require_near_52w_high,
     min_pct_from_52w_high=min_pct_from_52w_high,
     require_roic_above_wacc=require_roic_above_wacc,
+    # Breakouts y Volumen (NUEVO)
+    enable_breakout_filter=enable_breakout_filter,
+    require_breakout_confirmed=require_breakout_confirmed,
+    require_breakout_strong=require_breakout_strong,
+    enable_volume_surge_filter=enable_volume_surge_filter,
     min_ebit_ev=min_ebit_ev,
     max_fcf_ev=max_fcf_ev,
     portfolio_size=portfolio_size,

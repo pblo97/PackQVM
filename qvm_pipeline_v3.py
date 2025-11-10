@@ -84,7 +84,7 @@ class QVMConfigV3:
     """
 
     # ========== UNIVERSE ==========
-    universe_size: int = 300
+    universe_size: int = 800  # Ampliado de 300 a 800
     min_market_cap: float = 2e9
     min_volume: int = 500_000
 
@@ -119,8 +119,16 @@ class QVMConfigV3:
     require_near_52w_high: bool = False
     min_pct_from_52w_high: float = 0.80  # Precio >= 80% del 52w high
 
+    # ========== BREAKOUT FILTERS (NUEVO) ==========
+    # Filtros de breakout de niveles técnicos
+    enable_breakout_filter: bool = False  # Requiere breakout
+    require_breakout_confirmed: bool = False  # Breakout + volumen >1.5x
+    require_breakout_strong: bool = False  # Breakout + volumen >2x
+    breakout_types: list = None  # ['52w', '3m', '20d'] o None para todos
+
     # Volumen relativo
     min_relative_volume: float = 1.0  # Volumen actual >= promedio
+    enable_volume_surge_filter: bool = False  # Requiere surge de volumen >2x
 
     # ========== NUEVAS MÉTRICAS VALORACIÓN ==========
     max_fcf_ev: float = 0.15  # FCF/EV máximo (better si > 0.08)
@@ -371,13 +379,160 @@ def calculate_52w_metrics(prices_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+def calculate_volume_metrics(prices_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Calcula métricas avanzadas de volumen.
+
+    Returns:
+        DataFrame con:
+        - avg_volume_20d: Volumen promedio últimos 20 días
+        - current_volume: Volumen del día actual
+        - relative_volume: Volumen actual vs promedio (ratio)
+        - volume_surge: True si volumen > 2x promedio
+    """
+    results = []
+
+    for symbol, prices in prices_dict.items():
+        if prices is None or prices.empty:
+            continue
+
+        try:
+            # Si tenemos columna 'volume'
+            if 'volume' in prices.columns:
+                volumes = prices['volume'].iloc[-20:]  # Últimos 20 días
+
+                if len(volumes) >= 5:  # Mínimo 5 días de datos
+                    avg_volume_20d = volumes.mean()
+                    current_volume = prices['volume'].iloc[-1]
+                    relative_volume = current_volume / avg_volume_20d if avg_volume_20d > 0 else 1.0
+                    volume_surge = relative_volume > 2.0  # Surge si >2x promedio
+
+                    results.append({
+                        'symbol': symbol,
+                        'avg_volume_20d': avg_volume_20d,
+                        'current_volume': current_volume,
+                        'relative_volume': relative_volume,
+                        'volume_surge': volume_surge,
+                    })
+        except Exception:
+            continue
+
+    return pd.DataFrame(results)
+
+
+def detect_breakouts(prices_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Detecta breakouts de niveles técnicos previos.
+
+    Reglas heurísticas:
+    1. Breakout de 52w high (precio > máximo 52w anterior)
+    2. Breakout de resistencia 3M (precio > máximo últimos 60 días)
+    3. Breakout de consolidación (precio > máximo últimos 20 días)
+    4. Breakout confirmado: breakout + volumen > promedio
+
+    Returns:
+        DataFrame con indicadores de breakout
+    """
+    results = []
+
+    for symbol, prices in prices_dict.items():
+        if prices is None or prices.empty or 'close' not in prices.columns:
+            continue
+
+        try:
+            current_price = prices['close'].iloc[-1]
+
+            # Precio hace 1 día (para calcular el breakout reciente)
+            prev_price = prices['close'].iloc[-2] if len(prices) >= 2 else current_price
+
+            # Niveles de resistencia
+            if len(prices) >= 252:
+                # 52w high (excluyendo día actual)
+                high_52w_prev = prices['close'].iloc[-252:-1].max()
+                breakout_52w = current_price > high_52w_prev and prev_price <= high_52w_prev
+            else:
+                high_52w_prev = None
+                breakout_52w = False
+
+            if len(prices) >= 60:
+                # Resistencia 3M (60 días, excluyendo día actual)
+                high_3m = prices['close'].iloc[-60:-1].max()
+                breakout_3m = current_price > high_3m and prev_price <= high_3m
+            else:
+                high_3m = None
+                breakout_3m = False
+
+            if len(prices) >= 20:
+                # Consolidación (20 días, excluyendo día actual)
+                high_20d = prices['close'].iloc[-20:-1].max()
+                breakout_20d = current_price > high_20d and prev_price <= high_20d
+            else:
+                high_20d = None
+                breakout_20d = False
+
+            # Breakout general (cualquiera de los anteriores)
+            any_breakout = breakout_52w or breakout_3m or breakout_20d
+
+            # Calcular % por encima del nivel
+            if high_52w_prev:
+                pct_above_52w = ((current_price - high_52w_prev) / high_52w_prev) * 100
+            else:
+                pct_above_52w = 0
+
+            results.append({
+                'symbol': symbol,
+                'breakout_52w': breakout_52w,
+                'breakout_3m': breakout_3m,
+                'breakout_20d': breakout_20d,
+                'any_breakout': any_breakout,
+                'pct_above_52w_level': pct_above_52w,
+            })
+
+        except Exception:
+            continue
+
+    return pd.DataFrame(results)
+
+
+def detect_volume_confirmed_breakouts(
+    prices_dict: Dict[str, pd.DataFrame]
+) -> pd.DataFrame:
+    """
+    Detecta breakouts confirmados con volumen anormal.
+
+    Un breakout confirmado requiere:
+    1. Precio rompe nivel de resistencia
+    2. Volumen del día es > promedio (idealmente >1.5x)
+
+    Esta es una señal más fuerte que breakout solo.
+    """
+    breakouts_df = detect_breakouts(prices_dict)
+    volume_df = calculate_volume_metrics(prices_dict)
+
+    if breakouts_df.empty or volume_df.empty:
+        return pd.DataFrame()
+
+    # Merge ambos DataFrames
+    merged = breakouts_df.merge(volume_df, on='symbol', how='inner')
+
+    # Breakout confirmado: cualquier breakout + volumen relativo > 1.5
+    merged['breakout_confirmed'] = (
+        merged['any_breakout'] & (merged['relative_volume'] > 1.5)
+    )
+
+    # Breakout fuerte: breakout + volume surge (>2x)
+    merged['breakout_strong'] = (
+        merged['any_breakout'] & merged['volume_surge']
+    )
+
+    return merged
+
+
 def calculate_relative_volume(df: pd.DataFrame) -> pd.Series:
     """
-    Calcula volumen relativo vs promedio.
-    (En producción, esto requeriría datos intraday)
-    Por ahora retornamos placeholder.
+    DEPRECATED: Usar calculate_volume_metrics() en su lugar.
+    Mantenido por compatibilidad.
     """
-    # Placeholder: asumimos volumen normal
     return pd.Series(1.0, index=df.index, name='relative_volume')
 
 
@@ -728,12 +883,20 @@ def run_qvm_pipeline_v3(
     steps.append(step7)
 
     # -------------------------------------------------------------------------
-    # PASO 8: FILTROS 52W HIGH Y VOLUMEN RELATIVO
+    # PASO 8: FILTROS 52W HIGH, BREAKOUTS Y VOLUMEN
     # -------------------------------------------------------------------------
-    step8 = PipelineStep("PASO 8", "Filtros 52w High y Volumen")
+    step8 = PipelineStep("PASO 8", "Filtros 52w High, Breakouts y Volumen")
 
     if verbose:
         print(f"\n📊 {step8.name}: {step8.description}")
+        if config.enable_breakout_filter:
+            print("   ⚡ Breakout Filter: ENABLED")
+        if config.require_breakout_confirmed:
+            print("   ⚡ Confirmed Breakouts Only: YES (vol >1.5x)")
+        if config.require_breakout_strong:
+            print("   ⚡ Strong Breakouts Only: YES (vol >2x)")
+        if config.enable_volume_surge_filter:
+            print("   📊 Volume Surge Filter: ENABLED (>2x)")
 
     try:
         step8.log_input(len(df_merged))
@@ -744,12 +907,52 @@ def run_qvm_pipeline_v3(
         if not high52w_df.empty:
             df_merged = df_merged.merge(high52w_df, on='symbol', how='left')
 
-            # Filtro 52w high
+            # Filtro 52w high (legacy)
             if config.require_near_52w_high and 'pct_from_52w_high' in df_merged.columns:
                 before = len(df_merged)
                 df_merged = df_merged[df_merged['pct_from_52w_high'] >= config.min_pct_from_52w_high].copy()
                 rejected = before - len(df_merged)
                 step8.add_metric("Rejected by 52w high", rejected)
+
+        # NUEVO: Calcular breakouts y volumen
+        breakout_vol_df = detect_volume_confirmed_breakouts(prices_dict)
+
+        if not breakout_vol_df.empty:
+            df_merged = df_merged.merge(
+                breakout_vol_df[['symbol', 'breakout_52w', 'breakout_3m', 'breakout_20d',
+                                 'any_breakout', 'breakout_confirmed', 'breakout_strong',
+                                 'relative_volume', 'volume_surge']],
+                on='symbol',
+                how='left'
+            )
+
+            # Filtro de breakout general
+            if config.enable_breakout_filter and 'any_breakout' in df_merged.columns:
+                before = len(df_merged)
+                df_merged = df_merged[df_merged['any_breakout'] == True].copy()
+                rejected = before - len(df_merged)
+                step8.add_metric("Rejected by breakout", rejected)
+
+            # Filtro de breakout confirmado (con volumen)
+            if config.require_breakout_confirmed and 'breakout_confirmed' in df_merged.columns:
+                before = len(df_merged)
+                df_merged = df_merged[df_merged['breakout_confirmed'] == True].copy()
+                rejected = before - len(df_merged)
+                step8.add_metric("Rejected by breakout confirmation", rejected)
+
+            # Filtro de breakout fuerte (volumen >2x)
+            if config.require_breakout_strong and 'breakout_strong' in df_merged.columns:
+                before = len(df_merged)
+                df_merged = df_merged[df_merged['breakout_strong'] == True].copy()
+                rejected = before - len(df_merged)
+                step8.add_metric("Rejected by strong breakout", rejected)
+
+            # Filtro de surge de volumen
+            if config.enable_volume_surge_filter and 'volume_surge' in df_merged.columns:
+                before = len(df_merged)
+                df_merged = df_merged[df_merged['volume_surge'] == True].copy()
+                rejected = before - len(df_merged)
+                step8.add_metric("Rejected by volume surge", rejected)
 
         step8.log_output(len(df_merged))
         step8.mark_success()
