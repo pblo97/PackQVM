@@ -49,3 +49,4 @@ Thumbs.db
 # *.json
 # *.parquet
 .cache_fmp/
+ma200_validation_*.csv
