@@ -846,7 +846,9 @@ def run_qvm_pipeline_v3(
     if verbose:
         print(f"\n🚀 {step7.name}: {step7.description}")
         if config.require_above_ma200:
-            print("   MA200 Filter: ENABLED (Faber 2007)")
+            print("   MA200 Filter: ✅ ENABLED (Faber 2007)")
+        else:
+            print("   MA200 Filter: ❌ DISABLED (stocks bajo MA200 NO serán filtrados)")
         print(f"   Min Momentum 12M: {config.min_momentum_12m:.0%}")
 
     try:
@@ -872,12 +874,27 @@ def run_qvm_pipeline_v3(
         # Merge con df_with_qv
         df_merged = df_with_qv.merge(momentum_df, on='symbol', how='inner')
 
+        # Mostrar estadísticas de MA200 (siempre)
+        total_above_ma200 = df_merged['above_ma200'].sum()
+        total_below_ma200 = len(df_merged) - total_above_ma200
+        step7.add_metric("Above MA200", int(total_above_ma200))
+        step7.add_metric("Below MA200", int(total_below_ma200))
+
+        if verbose:
+            print(f"   📊 MA200 Status: {total_above_ma200} above, {total_below_ma200} below")
+
         # Filtro MA200
         if config.require_above_ma200:
             before = len(df_merged)
             df_merged = df_merged[df_merged['above_ma200'] == True].copy()
             rejected = before - len(df_merged)
             step7.add_metric("Rejected by MA200", rejected)
+            if verbose:
+                print(f"   ❌ Filtered out {rejected} stocks below MA200")
+        else:
+            if verbose and total_below_ma200 > 0:
+                print(f"   ⚠️  NOTA: {total_below_ma200} stocks están BAJO MA200 pero NO fueron filtrados")
+                print(f"      (Activa el filtro MA200 para excluirlos)")
 
         # Filtro Momentum mínimo
         before = len(df_merged)
