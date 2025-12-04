@@ -175,6 +175,9 @@ class QVMConfigV3:
     slippage_bps: int = 5
     market_impact_bps: int = 2
 
+    # ========== DATA CACHING ==========
+    use_price_cache: bool = True  # Si False, siempre descarga datos frescos
+
     def __post_init__(self):
         """Validación de configuración"""
         # Normalizar pesos
@@ -805,6 +808,8 @@ def run_qvm_pipeline_v3(
 
     if verbose:
         print(f"\n📈 {step6.name}: {step6.description}")
+        cache_status = "ENABLED" if config.use_price_cache else "DISABLED (datos frescos)"
+        print(f"   Cache: {cache_status}")
 
     try:
         step6.log_input(len(df_with_qv))
@@ -818,7 +823,7 @@ def run_qvm_pipeline_v3(
                     symbol,
                     start=config.backtest_start,
                     end=config.backtest_end,
-                    use_cache=True
+                    use_cache=config.use_price_cache
                 )
                 if prices is not None and len(prices) >= 252:
                     prices_dict[symbol] = prices
@@ -846,7 +851,9 @@ def run_qvm_pipeline_v3(
     if verbose:
         print(f"\n🚀 {step7.name}: {step7.description}")
         if config.require_above_ma200:
-            print("   MA200 Filter: ENABLED (Faber 2007)")
+            print("   ✅ MA200 Filter: ENABLED (Faber 2007)")
+        else:
+            print("   ⚠️  MA200 Filter: DISABLED")
         print(f"   Min Momentum 12M: {config.min_momentum_12m:.0%}")
 
     try:
@@ -875,22 +882,35 @@ def run_qvm_pipeline_v3(
         # Filtro MA200
         if config.require_above_ma200:
             before = len(df_merged)
+            below_ma200_count = (df_merged['above_ma200'] == False).sum()
+            # Guardar símbolos rechazados antes de filtrar
+            below_ma200_symbols = df_merged[df_merged['above_ma200'] == False]['symbol'].head(5).tolist()
             df_merged = df_merged[df_merged['above_ma200'] == True].copy()
             rejected = before - len(df_merged)
             step7.add_metric("Rejected by MA200", rejected)
+            if verbose and rejected > 0:
+                print(f"   ⚠️  Rechazados por MA200: {rejected} stocks (estaban BAJO MA200)")
+                if below_ma200_symbols:
+                    print(f"      Ejemplos: {', '.join(below_ma200_symbols[:3])}")
 
         # Filtro Momentum mínimo
         before = len(df_merged)
         df_merged = df_merged[df_merged['momentum_12m'] >= config.min_momentum_12m].copy()
         rejected = before - len(df_merged)
         step7.add_metric("Rejected by Momentum", rejected)
+        if verbose and rejected > 0:
+            print(f"   ⚠️  Rechazados por Momentum: {rejected} stocks (momentum < {config.min_momentum_12m:.0%})")
 
         step7.log_output(len(df_merged))
         step7.add_metric("Avg Momentum 12M", df_merged['momentum_12m'].mean())
+        step7.add_metric("% Above MA200", (df_merged['above_ma200'].sum() / len(df_merged) * 100) if len(df_merged) > 0 else 0)
         step7.mark_success()
 
         if verbose:
             print(step7.summary())
+            if len(df_merged) > 0:
+                above_ma200_pct = df_merged['above_ma200'].sum() / len(df_merged) * 100
+                print(f"   ✅ {df_merged['above_ma200'].sum()}/{len(df_merged)} stocks sobre MA200 ({above_ma200_pct:.0f}%)")
 
     except Exception as e:
         step7.add_warning(f"Error: {str(e)}")
