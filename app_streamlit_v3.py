@@ -441,6 +441,19 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("💾 Gestión de Datos")
+
+    use_price_cache = st.checkbox(
+        "Usar caché de precios",
+        value=True,
+        help="Si está desmarcado, descarga datos de precios frescos (más lento pero datos actualizados). ⚠️ Si ves stocks que no deberían pasar los filtros MA200, DESMARCA esta opción."
+    )
+
+    if not use_price_cache:
+        st.warning("⚠️ Cache deshabilitado: Se descargarán datos frescos (esto puede tomar más tiempo)")
+
+    st.divider()
+
     # Botón de ejecución
     run_button = st.button("🚀 Ejecutar Screening V3", type="primary", use_container_width=True)
 
@@ -488,6 +501,8 @@ config = QVMConfigV3(
     commission_bps=commission_bps,
     slippage_bps=slippage_bps,
     market_impact_bps=market_impact_bps,
+    # Gestión de Datos
+    use_price_cache=use_price_cache,
     # Mejoras V3.1
     enable_earnings_quality=enable_earnings_quality,
     enable_red_flags=enable_red_flags,
