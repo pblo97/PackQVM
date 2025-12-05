@@ -749,11 +749,21 @@ def run_qvm_pipeline_v3(
         # Filtros
         df = df[df['piotroski_score'] >= config.min_piotroski_score].copy()
 
+        # P/E: Debe ser positivo Y menor que max_pe
         if 'pe' in df.columns:
-            df = df[(df['pe'].isna()) | (df['pe'] <= config.max_pe)].copy()
+            before = len(df)
+            df = df[(df['pe'].isna()) | ((df['pe'] > 0) & (df['pe'] <= config.max_pe))].copy()
+            rejected_pe = before - len(df)
+            if verbose and rejected_pe > 0:
+                print(f"   ⚠️  Rechazados por P/E inválido: {rejected_pe} (negativo o > {config.max_pe})")
 
+        # EV/EBITDA: Debe ser positivo Y menor que max_ev_ebitda (detecta outliers extremos)
         if 'ev_ebitda' in df.columns:
-            df = df[(df['ev_ebitda'].isna()) | (df['ev_ebitda'] <= config.max_ev_ebitda)].copy()
+            before = len(df)
+            df = df[(df['ev_ebitda'].isna()) | ((df['ev_ebitda'] > 0) & (df['ev_ebitda'] <= config.max_ev_ebitda))].copy()
+            rejected_ev = before - len(df)
+            if verbose and rejected_ev > 0:
+                print(f"   ⚠️  Rechazados por EV/EBITDA inválido: {rejected_ev} (negativo o > {config.max_ev_ebitda})")
 
         if config.require_positive_fcf and 'fcf' in df.columns:
             df = df[(df['fcf'].isna()) | (df['fcf'] > 0)].copy()
@@ -936,15 +946,27 @@ def run_qvm_pipeline_v3(
         if config.require_above_ma200:
             before = len(df_merged)
             below_ma200_count = (df_merged['above_ma200'] == False).sum()
+            above_ma200_count = (df_merged['above_ma200'] == True).sum()
+
             # Guardar símbolos rechazados antes de filtrar
             below_ma200_symbols = df_merged[df_merged['above_ma200'] == False]['symbol'].head(5).tolist()
+
             df_merged = df_merged[df_merged['above_ma200'] == True].copy()
             rejected = before - len(df_merged)
             step7.add_metric("Rejected by MA200", rejected)
-            if verbose and rejected > 0:
-                print(f"   ⚠️  Rechazados por MA200: {rejected} stocks (estaban BAJO MA200)")
-                if below_ma200_symbols:
-                    print(f"      Ejemplos: {', '.join(below_ma200_symbols[:3])}")
+
+            if verbose:
+                print(f"   📊 MA200 Status: {above_ma200_count} above, {below_ma200_count} below")
+                if rejected > 0:
+                    print(f"   ⚠️  Rechazados por MA200: {rejected} stocks (estaban BAJO MA200)")
+                    if below_ma200_symbols:
+                        print(f"      Ejemplos: {', '.join(below_ma200_symbols[:3])}")
+        else:
+            if verbose:
+                above_count = (df_merged['above_ma200'] == True).sum()
+                below_count = (df_merged['above_ma200'] == False).sum()
+                print(f"   ⚠️  MA200 Filter DISABLED - Keeping all {len(df_merged)} stocks")
+                print(f"      ({above_count} above MA200, {below_count} below MA200)")
 
         # Filtro Momentum mínimo
         before = len(df_merged)
@@ -1254,6 +1276,17 @@ def run_qvm_pipeline_v3(
         step9.add_metric("Avg Piotroski", portfolio['piotroski_score'].mean())
         step9.add_metric("Avg QV Score", portfolio['qv_score'].mean())
         step9.add_metric("Avg Momentum", portfolio['momentum_12m'].mean())
+
+        # Validación crítica: Verificar MA200 si el filtro está activado
+        if config.require_above_ma200 and 'above_ma200' in portfolio.columns:
+            below_ma200_in_portfolio = portfolio[portfolio['above_ma200'] == False]
+            if len(below_ma200_in_portfolio) > 0:
+                warning_msg = f"⚠️  {len(below_ma200_in_portfolio)} stocks en portfolio están BAJO MA200!"
+                step9.add_warning(warning_msg)
+                if verbose:
+                    print(f"   {warning_msg}")
+                    print(f"      Símbolos: {below_ma200_in_portfolio['symbol'].tolist()}")
+
         step9.mark_success()
 
         if verbose:
