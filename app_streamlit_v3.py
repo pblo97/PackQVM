@@ -89,11 +89,22 @@ with st.sidebar:
     min_market_cap = st.slider(
         "Market Cap mínimo ($B)",
         min_value=0.5,
-        max_value=10.0,
-        value=2.0,
+        max_value=50.0,
+        value=5.0,
         step=0.5,
-        help="Market cap mínimo en miles de millones"
+        help="Market cap mínimo en miles de millones. Recomendado: 5B+ para evitar micro-caps"
     )
+
+    # Opción rápida: Large Cap only
+    large_cap_only = st.checkbox(
+        "🏢 Solo Large Caps ($10B+)",
+        value=False,
+        help="Filtrar solo empresas grandes (market cap >= $10B)"
+    )
+
+    if large_cap_only:
+        min_market_cap = max(min_market_cap, 10.0)
+        st.info(f"✅ Filtro Large Cap activo: Min Market Cap ajustado a ${min_market_cap:.1f}B")
 
     min_volume = st.slider(
         "Volumen diario mínimo (K)",
@@ -154,22 +165,34 @@ with st.sidebar:
 
     st.subheader("🔍 Filtros Básicos")
 
-    min_piotroski = st.slider(
-        "Piotroski Score mínimo",
-        min_value=0,
-        max_value=9,
-        value=6,
-        step=1,
-        help="Mínimo Piotroski Score (0-9). Recomendado: 6+"
-    )
+    col1, col2 = st.columns(2)
+
+    with col1:
+        min_piotroski = st.slider(
+            "Piotroski Score mínimo",
+            min_value=0,
+            max_value=9,
+            value=7,
+            step=1,
+            help="Mínimo Piotroski Score (0-9). 7+ = alta calidad"
+        )
+
+    with col2:
+        high_quality_only = st.checkbox(
+            "✨ Solo Alta Calidad",
+            value=False,
+            help="Piotroski >= 8 (empresas excelentes)"
+        )
+        if high_quality_only:
+            min_piotroski = max(min_piotroski, 8)
 
     min_qv_score = st.slider(
         "QV Score mínimo",
         min_value=0.0,
         max_value=1.0,
-        value=0.45,
+        value=0.50,
         step=0.05,
-        help="Mínimo Quality-Value Score (0-1). Recomendado: 0.5+"
+        help="Mínimo Quality-Value Score (0-1). 0.5+ recomendado"
     )
 
     max_pe = st.slider(
