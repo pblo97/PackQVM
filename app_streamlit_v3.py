@@ -559,6 +559,173 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("🤖 ML Integration (FASE 3)")
+
+    st.info("Machine Learning para ranking de stocks basado en Gu et al. (2020)")
+
+    enable_ml_ranking = st.checkbox(
+        "✅ Activar ML Ranking",
+        value=True,
+        help="Usa ML + QV score para ranking (cambia selección de stocks)"
+    )
+
+    if enable_ml_ranking:
+        ml_rank_weight = st.slider(
+            "ML Weight (%)",
+            min_value=0,
+            max_value=50,
+            value=30,
+            step=5,
+            help="% de ML en hybrid score (resto es QV score). 30% = 30% ML + 70% QV"
+        ) / 100.0
+
+        with st.expander("⚙️ Features a Usar"):
+            use_technical_features = st.checkbox(
+                "Technical Features (MA ratios, RSI, 52w)",
+                value=True,
+                help="MA ratios, RSI, distancia de 52w high/low"
+            )
+
+            use_momentum_features = st.checkbox(
+                "Momentum Features (multi-horizon returns)",
+                value=True,
+                help="Returns en 5d, 20d, 60d, 120d, 252d + aceleración"
+            )
+
+            use_volatility_features = st.checkbox(
+                "Volatility Features (realized vol, downside vol)",
+                value=True,
+                help="Volatilidad realizada, downside vol, volatility change"
+            )
+
+            use_volume_features = st.checkbox(
+                "Volume Features (turnover, volume momentum)",
+                value=True,
+                help="Volume ratio, volume momentum"
+            )
+
+    else:
+        # Defaults
+        ml_rank_weight = 0.30
+        use_technical_features = True
+        use_momentum_features = True
+        use_volatility_features = True
+        use_volume_features = True
+
+    st.divider()
+
+    st.subheader("🔄 Advanced Exits (FASE 2)")
+
+    st.info("Exits adaptativos: regime-based stops, percentile targets, time exits")
+
+    enable_advanced_exits = st.checkbox(
+        "✅ Activar Advanced Exits",
+        value=True,
+        help="Ajusta stops/targets según régimen de mercado y tiempo"
+    )
+
+    if enable_advanced_exits:
+        with st.expander("⚙️ Regime-Based Stops"):
+            use_regime_stops = st.checkbox(
+                "Regime-Based Stops (Nystrup et al. 2020)",
+                value=True,
+                help="Ajusta stops según volatilidad del mercado"
+            )
+
+            regime_lookback = st.slider(
+                "Regime Lookback (días)",
+                min_value=20,
+                max_value=120,
+                value=60,
+                step=10,
+                help="Días para detectar régimen de volatilidad",
+                disabled=not use_regime_stops
+            )
+
+            high_vol_multiplier = st.slider(
+                "High Vol Multiplier",
+                min_value=1.0,
+                max_value=2.0,
+                value=1.5,
+                step=0.1,
+                help="Multiplicador de stops en alta volatilidad (evitar whipsaws)",
+                disabled=not use_regime_stops
+            )
+
+            low_vol_multiplier = st.slider(
+                "Low Vol Multiplier",
+                min_value=0.5,
+                max_value=1.0,
+                value=0.8,
+                step=0.1,
+                help="Multiplicador de stops en baja volatilidad (proteger ganancias)",
+                disabled=not use_regime_stops
+            )
+
+        with st.expander("⚙️ Percentile Targets & Time Exits"):
+            use_percentile_targets = st.checkbox(
+                "Percentile Targets (Lopez de Prado 2020)",
+                value=True,
+                help="Target basado en distribución empírica de retornos"
+            )
+
+            target_percentile = st.slider(
+                "Target Percentile",
+                min_value=60,
+                max_value=90,
+                value=75,
+                step=5,
+                help="75 = conservador, 90 = agresivo",
+                disabled=not use_percentile_targets
+            )
+
+            use_time_exits = st.checkbox(
+                "Time-Based Exits (Harvey & Liu 2021)",
+                value=True,
+                help="Exit forzado después de X días"
+            )
+
+            max_holding_days = st.slider(
+                "Max Holding Days",
+                min_value=30,
+                max_value=180,
+                value=90,
+                step=10,
+                help="Días máximo de holding",
+                disabled=not use_time_exits
+            )
+
+            use_profit_lock = st.checkbox(
+                "Profit Lock (Trailing TP)",
+                value=True,
+                help="Activa trailing TP después de ganancia significativa"
+            )
+
+            profit_lock_threshold = st.slider(
+                "Profit Lock Threshold (%)",
+                min_value=10,
+                max_value=30,
+                value=15,
+                step=5,
+                help="Activa trailing TP a este % de ganancia",
+                disabled=not use_profit_lock
+            ) / 100.0
+
+    else:
+        # Defaults
+        use_regime_stops = True
+        regime_lookback = 60
+        high_vol_multiplier = 1.5
+        low_vol_multiplier = 0.8
+        use_percentile_targets = True
+        target_percentile = 75
+        use_time_exits = True
+        max_holding_days = 90
+        use_profit_lock = True
+        profit_lock_threshold = 0.15
+
+    st.divider()
+
     st.subheader("💾 Gestión de Datos")
 
     use_price_cache = st.checkbox(
@@ -641,6 +808,25 @@ config = QVMConfigV3(
     target_volatility=target_volatility,
     max_position_size=max_position_size,
     use_kelly=use_kelly,
+    # ML Integration (FASE 3)
+    enable_ml_ranking=enable_ml_ranking,
+    ml_rank_weight=ml_rank_weight,
+    use_technical_features=use_technical_features,
+    use_momentum_features=use_momentum_features,
+    use_volatility_features=use_volatility_features,
+    use_volume_features=use_volume_features,
+    # Advanced Exits (FASE 2)
+    enable_advanced_exits=enable_advanced_exits,
+    use_regime_stops=use_regime_stops,
+    regime_lookback=regime_lookback,
+    high_vol_multiplier=high_vol_multiplier,
+    low_vol_multiplier=low_vol_multiplier,
+    use_percentile_targets=use_percentile_targets,
+    target_percentile=target_percentile,
+    use_time_exits=use_time_exits,
+    max_holding_days=max_holding_days,
+    use_profit_lock=use_profit_lock,
+    profit_lock_threshold=profit_lock_threshold,
 )
 
 
