@@ -75,6 +75,14 @@ from risk_management import (
     RiskCalculator,
     RiskConfig,
 )
+from ml_integration import (
+    MLStockRanker,
+    MLConfig,
+)
+from advanced_exits import (
+    AdvancedExitsCalculator,
+    AdvancedExitsConfig,
+)
 
 
 # ============================================================================
@@ -201,6 +209,27 @@ class QVMConfigV3:
     target_volatility: float = 0.15  # 15% annual target
     max_position_size: float = 0.20  # Max 20%
     use_kelly: bool = False  # Kelly sizing (requires historical win rate)
+
+    # ========== ML INTEGRATION (FASE 3) ==========
+    enable_ml_ranking: bool = True  # Usar ML para ranking
+    ml_rank_weight: float = 0.30  # 30% ML, 70% QV score
+    use_technical_features: bool = True
+    use_momentum_features: bool = True
+    use_volatility_features: bool = True
+    use_volume_features: bool = True
+
+    # ========== ADVANCED EXITS (FASE 2) ==========
+    enable_advanced_exits: bool = True  # Estrategias avanzadas de exit
+    use_regime_stops: bool = True
+    regime_lookback: int = 60
+    high_vol_multiplier: float = 1.5
+    low_vol_multiplier: float = 0.8
+    use_percentile_targets: bool = True
+    target_percentile: int = 75
+    use_time_exits: bool = True
+    max_holding_days: int = 90
+    use_profit_lock: bool = True
+    profit_lock_threshold: float = 0.15
 
     def __post_init__(self):
         """Validación de configuración"""
@@ -1148,6 +1177,59 @@ def run_qvm_pipeline_v3(
         steps.append(step8_3)
 
     # -------------------------------------------------------------------------
+    # PASO 8.4: ML RANKING (FASE 3)
+    # -------------------------------------------------------------------------
+    if config.enable_ml_ranking:
+        step8_4 = PipelineStep("PASO 8.4", "ML Feature Engineering & Ranking")
+
+        if verbose:
+            print(f"\n🤖 {step8_4.name}: {step8_4.description}")
+            print(f"   ML Weight: {config.ml_rank_weight:.0%}, QV Weight: {(1-config.ml_rank_weight):.0%}")
+
+        try:
+            step8_4.log_input(len(df_merged))
+
+            # Configurar ML
+            ml_config = MLConfig(
+                use_technical_features=config.use_technical_features,
+                use_fundamental_features=True,  # Siempre usar fundamentals
+                use_momentum_features=config.use_momentum_features,
+                use_volatility_features=config.use_volatility_features,
+                use_volume_features=config.use_volume_features,
+                use_ml_ranking=True,
+                ml_rank_weight=config.ml_rank_weight,
+            )
+
+            ranker = MLStockRanker(ml_config)
+
+            # Create features and rank
+            df_merged = ranker.create_features_and_rank(
+                df_merged,
+                prices_dict
+            )
+
+            # Verificar que se crearon las columnas
+            if 'hybrid_score' in df_merged.columns:
+                step8_4.log_output(len(df_merged))
+                step8_4.add_metric("Avg ML Score", f"{df_merged['ml_score_norm'].mean():.3f}")
+                step8_4.add_metric("Avg Hybrid Score", f"{df_merged['hybrid_score'].mean():.3f}")
+                step8_4.mark_success()
+
+                if verbose:
+                    print(step8_4.summary())
+                    print(f"   📊 ML Score promedio: {df_merged['ml_score_norm'].mean():.3f}")
+                    print(f"   📊 Hybrid Score promedio: {df_merged['hybrid_score'].mean():.3f}")
+            else:
+                step8_4.add_warning("ML ranking failed, using QV score only")
+
+        except Exception as e:
+            step8_4.add_warning(f"Error: {str(e)}")
+            if verbose:
+                print(f"   ⚠️  ML ranking failed: {str(e)}")
+
+        steps.append(step8_4)
+
+    # -------------------------------------------------------------------------
     # PASO 9: SELECCIÓN DE PORTFOLIO
     # -------------------------------------------------------------------------
     step9 = PipelineStep("PASO 9", f"Selección Portfolio (Top {config.portfolio_size})")
@@ -1158,8 +1240,15 @@ def run_qvm_pipeline_v3(
     try:
         step9.log_input(len(df_merged))
 
-        # Ordenar por QV Score y tomar top N
-        portfolio = df_merged.nlargest(config.portfolio_size, 'qv_score').copy()
+        # Ordenar por Hybrid Score (ML + QV) si está disponible, sino por QV Score
+        ranking_column = 'hybrid_score' if 'hybrid_score' in df_merged.columns else 'qv_score'
+
+        if verbose and ranking_column == 'hybrid_score':
+            print(f"   ✅ Usando Hybrid Score (ML + QV) para ranking")
+        elif verbose:
+            print(f"   ⚠️  Usando QV Score (ML no disponible)")
+
+        portfolio = df_merged.nlargest(config.portfolio_size, ranking_column).copy()
 
         step9.log_output(len(portfolio))
         step9.add_metric("Avg Piotroski", portfolio['piotroski_score'].mean())
@@ -1178,14 +1267,16 @@ def run_qvm_pipeline_v3(
     steps.append(step9)
 
     # -------------------------------------------------------------------------
-    # PASO 9.5: RISK MANAGEMENT (FASE 1)
+    # PASO 9.5: RISK MANAGEMENT + ADVANCED EXITS (FASE 1 + 2)
     # -------------------------------------------------------------------------
     if config.enable_risk_management:
-        step9_5 = PipelineStep("PASO 9.5", "Risk Management (Stops, Targets, Position Sizing)")
+        step9_5 = PipelineStep("PASO 9.5", "Risk Management + Advanced Exits")
 
         if verbose:
             print(f"\n💎 {step9_5.name}: {step9_5.description}")
-            print("   Calculando stop loss, take profit y position sizing...")
+            print("   Calculando stop loss, take profit, position sizing...")
+            if config.enable_advanced_exits:
+                print("   + regime-based stops, percentile targets, time exits...")
 
         try:
             step9_5.log_input(len(portfolio))
@@ -1207,6 +1298,23 @@ def run_qvm_pipeline_v3(
 
             calculator = RiskCalculator(risk_config)
 
+            # Configurar Advanced Exits si está habilitado
+            advanced_calculator = None
+            if config.enable_advanced_exits:
+                advanced_config = AdvancedExitsConfig(
+                    use_regime_stops=config.use_regime_stops,
+                    regime_lookback=config.regime_lookback,
+                    high_vol_multiplier=config.high_vol_multiplier,
+                    low_vol_multiplier=config.low_vol_multiplier,
+                    use_percentile_targets=config.use_percentile_targets,
+                    target_percentile=config.target_percentile,
+                    use_time_exits=config.use_time_exits,
+                    max_holding_days=config.max_holding_days,
+                    use_profit_lock=config.use_profit_lock,
+                    profit_lock_threshold=config.profit_lock_threshold,
+                )
+                advanced_calculator = AdvancedExitsCalculator(advanced_config)
+
             # Calcular risk parameters para cada stock
             risk_results = []
             for _, row in portfolio.iterrows():
@@ -1218,8 +1326,9 @@ def run_qvm_pipeline_v3(
                 try:
                     prices = prices_dict[symbol]
                     entry_price = prices['close'].iloc[-1]
+                    current_price = entry_price
 
-                    # Calcular parámetros de trade
+                    # FASE 1: Calcular parámetros básicos de trade
                     trade_params = calculator.calculate_trade_parameters(
                         entry_price=entry_price,
                         prices=prices,
@@ -1229,17 +1338,70 @@ def run_qvm_pipeline_v3(
                         avg_loss=None
                     )
 
-                    risk_results.append({
+                    # Base values from FASE 1
+                    base_stop_distance = trade_params['risk_metrics']['risk_pct']
+                    base_stop = trade_params['final_stop_loss']
+                    base_target = trade_params['final_take_profit']
+
+                    # FASE 2: Calcular advanced exits si está habilitado
+                    final_stop = base_stop
+                    final_target = base_target
+                    regime = None
+                    percentile_target = None
+
+                    if advanced_calculator:
+                        try:
+                            advanced_params = advanced_calculator.calculate_advanced_parameters(
+                                entry_price=entry_price,
+                                current_price=current_price,
+                                prices=prices,
+                                base_stop_distance=base_stop_distance,
+                                base_target=base_target,
+                                days_held=0,  # Nueva posición
+                            )
+
+                            # Usar valores ajustados de advanced exits
+                            if 'recommendations' in advanced_params:
+                                final_stop = advanced_params['recommendations']['final_stop']
+                                final_target = advanced_params['recommendations']['final_target']
+
+                            # Guardar datos adicionales
+                            if 'regime' in advanced_params:
+                                regime = advanced_params['regime']['regime']
+
+                            if 'percentile_target' in advanced_params:
+                                pt = advanced_params['percentile_target']
+                                if pt.get('target_price'):
+                                    percentile_target = pt['target_price']
+
+                        except Exception as e_adv:
+                            if verbose:
+                                print(f"   ⚠️  Advanced exits failed for {symbol}: {str(e_adv)}")
+
+                    # Recalcular risk/reward con valores finales
+                    final_risk_pct = ((entry_price - final_stop) / entry_price) * 100 if final_stop < entry_price else base_stop_distance
+                    final_reward_pct = ((final_target - entry_price) / entry_price) * 100
+                    final_rr_ratio = final_reward_pct / final_risk_pct if final_risk_pct > 0 else trade_params['risk_metrics']['actual_rr_ratio']
+
+                    result_dict = {
                         'symbol': symbol,
                         'entry_price': entry_price,
-                        'stop_loss': trade_params['final_stop_loss'],
-                        'take_profit': trade_params['final_take_profit'],
+                        'stop_loss': final_stop,
+                        'take_profit': final_target,
                         'position_size_pct': trade_params['recommended_position_size'] * 100,
-                        'risk_pct': trade_params['risk_metrics']['risk_pct'],
-                        'reward_pct': trade_params['risk_metrics']['reward_pct'],
-                        'rr_ratio': trade_params['risk_metrics']['actual_rr_ratio'],
+                        'risk_pct': final_risk_pct,
+                        'reward_pct': final_reward_pct,
+                        'rr_ratio': final_rr_ratio,
                         'realized_vol': trade_params.get('realized_volatility', np.nan),
-                    })
+                    }
+
+                    # Agregar datos de advanced exits si disponibles
+                    if regime:
+                        result_dict['regime'] = regime
+                    if percentile_target:
+                        result_dict['percentile_target'] = percentile_target
+
+                    risk_results.append(result_dict)
 
                 except Exception as e:
                     if verbose:
@@ -1385,6 +1547,11 @@ def analyze_portfolio_v3(results: Dict, n_top: int = 20) -> pd.DataFrame:
 
     # Agregar columnas de risk management (FASE 1)
     for col in ['entry_price', 'stop_loss', 'take_profit', 'position_size_pct', 'risk_pct', 'reward_pct', 'rr_ratio']:
+        if col in portfolio.columns:
+            cols.append(col)
+
+    # Agregar columnas de ML y Advanced Exits (FASE 2 & 3)
+    for col in ['ml_score_norm', 'hybrid_score', 'regime', 'percentile_target']:
         if col in portfolio.columns:
             cols.append(col)
 
