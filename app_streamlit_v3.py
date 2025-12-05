@@ -872,10 +872,22 @@ if run_button or st.session_state.get('results') is not None:
         st.session_state.results = None
 
     if st.session_state.get('results') is None:
-        with st.spinner("🔄 Ejecutando Pipeline V3... (esto puede tomar varios minutos)"):
+        # Mensaje específico según cache
+        if not use_price_cache:
+            spinner_msg = "🔄 Descargando datos FRESCOS (sin cache)... ⏱️ Esto puede tomar 5-10 minutos"
+        else:
+            spinner_msg = "🔄 Ejecutando Pipeline V3... (esto puede tomar 1-2 minutos)"
+
+        with st.spinner(spinner_msg):
             try:
-                results = run_qvm_pipeline_v3(config=config, verbose=False)
+                # Mostrar progreso
+                progress_placeholder = st.empty()
+                progress_placeholder.info("⏳ Iniciando pipeline...")
+
+                results = run_qvm_pipeline_v3(config=config, verbose=True)
                 st.session_state.results = results
+
+                progress_placeholder.empty()
             except Exception as e:
                 st.error(f"❌ Error al ejecutar pipeline: {str(e)}")
                 st.exception(e)
