@@ -441,6 +441,124 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("💎 Risk Management (FASE 1)")
+
+    st.info("Sistema de stop loss, take profit y position sizing basado en literatura académica 2014-2020")
+
+    enable_risk_management = st.checkbox(
+        "✅ Activar Risk Management",
+        value=True,
+        help="Calcula stop loss, take profit y position sizing para cada stock"
+    )
+
+    if enable_risk_management:
+        with st.expander("⚙️ Configuración de Stop Loss"):
+            use_volatility_stop = st.checkbox(
+                "Volatility-Based Stop (Kaminski & Lo 2014)",
+                value=True,
+                help="Stop loss basado en volatilidad realizada (2σ = 95% CI)"
+            )
+
+            volatility_stop_confidence = st.slider(
+                "Confidence Level (σ)",
+                min_value=1.0,
+                max_value=3.0,
+                value=2.0,
+                step=0.5,
+                help="2.0 = 95% CI, 2.5 = 99% CI",
+                disabled=not use_volatility_stop
+            )
+
+            use_trailing_stop = st.checkbox(
+                "Trailing Stop (Han et al. 2016)",
+                value=True,
+                help="Stop loss dinámico que sigue al precio"
+            )
+
+            trailing_stop_method = st.selectbox(
+                "Método de Trailing Stop",
+                options=['ATR', 'FIXED', 'CHANDELIER'],
+                index=0,
+                help="ATR = basado en Average True Range, FIXED = % fijo, CHANDELIER = Chandelier Exit",
+                disabled=not use_trailing_stop
+            )
+
+            trailing_atr_multiplier = st.slider(
+                "ATR Multiplier",
+                min_value=1.5,
+                max_value=4.0,
+                value=2.5,
+                step=0.5,
+                help="Multiplicador del ATR (2-3x recomendado)",
+                disabled=not use_trailing_stop or trailing_stop_method != 'ATR'
+            )
+
+        with st.expander("⚙️ Configuración de Take Profit"):
+            use_take_profit = st.checkbox(
+                "Risk-Reward Take Profit (Harris & Yilmaz 2019)",
+                value=True,
+                help="Take profit basado en ratio risk-reward óptimo"
+            )
+
+            risk_reward_ratio = st.slider(
+                "Risk-Reward Ratio",
+                min_value=1.5,
+                max_value=4.0,
+                value=2.5,
+                step=0.5,
+                help="2.5:1 = ganas 2.5× lo que arriesgas (recomendado 2-3×)",
+                disabled=not use_take_profit
+            )
+
+        with st.expander("⚙️ Position Sizing"):
+            use_volatility_sizing = st.checkbox(
+                "Volatility-Managed Sizing (Moreira & Muir 2017)",
+                value=True,
+                help="Ajusta tamaño de posición según volatilidad (+50% Sharpe ratio)"
+            )
+
+            target_volatility = st.slider(
+                "Target Volatility (%)",
+                min_value=5,
+                max_value=25,
+                value=15,
+                step=5,
+                help="Volatilidad objetivo anual (15% recomendado)",
+                disabled=not use_volatility_sizing
+            ) / 100.0
+
+            max_position_size = st.slider(
+                "Max Position Size (%)",
+                min_value=5,
+                max_value=30,
+                value=20,
+                step=5,
+                help="Tamaño máximo por posición",
+                disabled=not use_volatility_sizing
+            ) / 100.0
+
+            use_kelly = st.checkbox(
+                "Kelly Criterion (Rotando & Thorp 2018)",
+                value=False,
+                help="Position sizing usando Kelly Criterion (requiere win rate histórico)"
+            )
+
+    else:
+        # Defaults cuando está deshabilitado
+        use_volatility_stop = True
+        volatility_stop_confidence = 2.0
+        use_trailing_stop = True
+        trailing_stop_method = 'ATR'
+        trailing_atr_multiplier = 2.5
+        use_take_profit = True
+        risk_reward_ratio = 2.5
+        use_volatility_sizing = True
+        target_volatility = 0.15
+        max_position_size = 0.20
+        use_kelly = False
+
+    st.divider()
+
     st.subheader("💾 Gestión de Datos")
 
     use_price_cache = st.checkbox(
@@ -510,6 +628,19 @@ config = QVMConfigV3(
     use_enhanced_value_score=use_enhanced_value_score,
     enable_fundamental_momentum=enable_fundamental_momentum,
     enable_sector_relative=enable_sector_relative,
+    # Risk Management (FASE 1)
+    enable_risk_management=enable_risk_management,
+    use_volatility_stop=use_volatility_stop,
+    volatility_stop_confidence=volatility_stop_confidence,
+    use_trailing_stop=use_trailing_stop,
+    trailing_stop_method=trailing_stop_method,
+    trailing_atr_multiplier=trailing_atr_multiplier,
+    use_take_profit=use_take_profit,
+    risk_reward_ratio=risk_reward_ratio,
+    use_volatility_sizing=use_volatility_sizing,
+    target_volatility=target_volatility,
+    max_position_size=max_position_size,
+    use_kelly=use_kelly,
 )
 
 
@@ -799,6 +930,16 @@ if run_button or st.session_state.get('results') is not None:
                 elif col == 'roic_above_wacc':
                     if col in display_df.columns:
                         display_df[col] = display_df[col].apply(lambda x: "✅" if x else "❌")
+                # Risk Management columns
+                elif col in ['entry_price', 'stop_loss', 'take_profit']:
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "-")
+                elif col in ['position_size_pct', 'risk_pct', 'reward_pct']:
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "-")
+                elif col == 'rr_ratio':
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}:1" if pd.notna(x) else "-")
 
             st.dataframe(
                 display_df,
@@ -822,12 +963,13 @@ if run_button or st.session_state.get('results') is not None:
         # ------------------------------------------------------------------------
         st.header("📈 Visualizaciones")
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "Score Distribution",
             "Sector Analysis",
             "Piotroski Components",
             "Valuation Metrics",
-            "Momentum & MA200"
+            "Momentum & MA200",
+            "Risk Management"
         ])
 
         with tab1:
@@ -1095,6 +1237,191 @@ if run_button or st.session_state.get('results') is not None:
                             }
                         )
                         st.plotly_chart(fig_momentum_qv, use_container_width=True)
+
+        with tab6:
+            st.subheader("💎 Risk Management Analysis (FASE 1)")
+
+            # Verificar si hay datos de risk management
+            has_risk_data = all(col in portfolio.columns for col in ['stop_loss', 'take_profit', 'position_size_pct'])
+
+            if not has_risk_data:
+                st.info("⚠️ Los datos de Risk Management no están disponibles. Activa 'Risk Management' en la barra lateral y vuelve a ejecutar.")
+            else:
+                # Resumen de métricas de risk
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    avg_position = portfolio['position_size_pct'].mean()
+                    st.metric(
+                        "Position Size Promedio",
+                        f"{avg_position:.1f}%",
+                        help="Tamaño promedio de posición recomendado"
+                    )
+
+                with col2:
+                    avg_rr = portfolio['rr_ratio'].mean()
+                    st.metric(
+                        "R:R Ratio Promedio",
+                        f"{avg_rr:.2f}:1",
+                        delta="Excelente" if avg_rr > 2.5 else ("Bueno" if avg_rr > 2.0 else "Medio")
+                    )
+
+                with col3:
+                    avg_risk = portfolio['risk_pct'].mean()
+                    st.metric(
+                        "Risk Promedio",
+                        f"{avg_risk:.2f}%",
+                        help="Pérdida potencial promedio por posición"
+                    )
+
+                with col4:
+                    avg_reward = portfolio['reward_pct'].mean()
+                    st.metric(
+                        "Reward Promedio",
+                        f"{avg_reward:.2f}%",
+                        help="Ganancia potencial promedio por posición"
+                    )
+
+                st.divider()
+
+                # Distribución de Position Size
+                st.subheader("Distribución de Position Size")
+                valid_position = portfolio[portfolio['position_size_pct'].notna()]
+                if not valid_position.empty:
+                    fig_position = px.histogram(
+                        valid_position,
+                        x='position_size_pct',
+                        nbins=20,
+                        title="Distribución de Position Size (%)",
+                        labels={'position_size_pct': 'Position Size (%)', 'count': 'Frecuencia'}
+                    )
+                    st.plotly_chart(fig_position, use_container_width=True)
+
+                # Risk-Reward Scatter
+                st.subheader("Risk vs Reward")
+                valid_rr = portfolio[portfolio['risk_pct'].notna() & portfolio['reward_pct'].notna()]
+                if not valid_rr.empty:
+                    fig_rr = px.scatter(
+                        valid_rr,
+                        x='risk_pct',
+                        y='reward_pct',
+                        size='position_size_pct',
+                        color='rr_ratio',
+                        hover_data=['symbol', 'qv_score'],
+                        title="Risk vs Reward (tamaño = position size, color = R:R ratio)",
+                        labels={
+                            'risk_pct': 'Risk (%)',
+                            'reward_pct': 'Reward (%)',
+                            'rr_ratio': 'R:R Ratio'
+                        },
+                        color_continuous_scale='RdYlGn'
+                    )
+                    # Agregar línea de referencia para R:R ratios
+                    fig_rr.add_trace(go.Scatter(
+                        x=[0, valid_rr['risk_pct'].max()],
+                        y=[0, valid_rr['risk_pct'].max() * 2.5],
+                        mode='lines',
+                        name='2.5:1 R:R',
+                        line=dict(dash='dash', color='gray')
+                    ))
+                    st.plotly_chart(fig_rr, use_container_width=True)
+
+                # Entry vs Stop/Take Profit
+                st.subheader("Entry Price vs Stop Loss & Take Profit")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    # Stop Loss levels
+                    if 'entry_price' in portfolio.columns and 'stop_loss' in portfolio.columns:
+                        valid_stops = portfolio[portfolio['entry_price'].notna() & portfolio['stop_loss'].notna()].head(10)
+                        if not valid_stops.empty:
+                            stop_data = []
+                            for _, row in valid_stops.iterrows():
+                                stop_data.append({
+                                    'Symbol': row['symbol'],
+                                    'Price': row['entry_price'],
+                                    'Type': 'Entry'
+                                })
+                                stop_data.append({
+                                    'Symbol': row['symbol'],
+                                    'Price': row['stop_loss'],
+                                    'Type': 'Stop Loss'
+                                })
+
+                            stop_df = pd.DataFrame(stop_data)
+                            fig_stops = px.bar(
+                                stop_df,
+                                x='Symbol',
+                                y='Price',
+                                color='Type',
+                                barmode='group',
+                                title="Top 10: Entry vs Stop Loss",
+                                labels={'Price': 'Price ($)'}
+                            )
+                            st.plotly_chart(fig_stops, use_container_width=True)
+
+                with col2:
+                    # Take Profit levels
+                    if 'entry_price' in portfolio.columns and 'take_profit' in portfolio.columns:
+                        valid_tp = portfolio[portfolio['entry_price'].notna() & portfolio['take_profit'].notna()].head(10)
+                        if not valid_tp.empty:
+                            tp_data = []
+                            for _, row in valid_tp.iterrows():
+                                tp_data.append({
+                                    'Symbol': row['symbol'],
+                                    'Price': row['entry_price'],
+                                    'Type': 'Entry'
+                                })
+                                tp_data.append({
+                                    'Symbol': row['symbol'],
+                                    'Price': row['take_profit'],
+                                    'Type': 'Take Profit'
+                                })
+
+                            tp_df = pd.DataFrame(tp_data)
+                            fig_tp = px.bar(
+                                tp_df,
+                                x='Symbol',
+                                y='Price',
+                                color='Type',
+                                barmode='group',
+                                title="Top 10: Entry vs Take Profit",
+                                labels={'Price': 'Price ($)'}
+                            )
+                            st.plotly_chart(fig_tp, use_container_width=True)
+
+                # Portfolio Risk Summary
+                st.subheader("📊 Portfolio Risk Summary")
+
+                if 'position_size_pct' in portfolio.columns and 'risk_pct' in portfolio.columns:
+                    # Calcular portfolio risk total
+                    total_capital = 100  # Asumiendo 100% de capital
+                    portfolio_risk = (portfolio['position_size_pct'] / 100 * portfolio['risk_pct'] / 100 * total_capital).sum()
+
+                    col1, col2, col3 = st.columns(3)
+
+                    with col1:
+                        st.metric(
+                            "Total Portfolio Risk",
+                            f"{portfolio_risk:.2f}%",
+                            help="Suma de riesgo ponderado por position size"
+                        )
+
+                    with col2:
+                        total_positions = len(portfolio[portfolio['position_size_pct'].notna()])
+                        st.metric(
+                            "Posiciones con Risk Data",
+                            total_positions
+                        )
+
+                    with col3:
+                        if total_positions > 0:
+                            avg_risk_per_position = portfolio_risk / total_positions
+                            st.metric(
+                                "Risk por Posición",
+                                f"{avg_risk_per_position:.2f}%"
+                            )
 
     else:
         st.warning("No hay stocks en el portfolio final.")

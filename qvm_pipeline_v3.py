@@ -71,6 +71,10 @@ from red_flags import (
     add_red_flags_metrics,
     apply_red_flags_filters,
 )
+from risk_management import (
+    RiskCalculator,
+    RiskConfig,
+)
 
 
 # ============================================================================
@@ -177,6 +181,26 @@ class QVMConfigV3:
 
     # ========== DATA CACHING ==========
     use_price_cache: bool = True  # Si False, siempre descarga datos frescos
+
+    # ========== RISK MANAGEMENT (FASE 1) ==========
+    enable_risk_management: bool = True  # Calcular stops, targets y position sizing
+
+    # Stop Loss
+    use_volatility_stop: bool = True
+    volatility_stop_confidence: float = 2.0  # 2σ = 95% CI
+    use_trailing_stop: bool = True
+    trailing_stop_method: str = 'ATR'  # 'ATR', 'FIXED', 'CHANDELIER'
+    trailing_atr_multiplier: float = 2.5
+
+    # Take Profit
+    use_take_profit: bool = True
+    risk_reward_ratio: float = 2.5  # 2.5:1 R:R ratio
+
+    # Position Sizing
+    use_volatility_sizing: bool = True
+    target_volatility: float = 0.15  # 15% annual target
+    max_position_size: float = 0.20  # Max 20%
+    use_kelly: bool = False  # Kelly sizing (requires historical win rate)
 
     def __post_init__(self):
         """Validación de configuración"""
@@ -1154,6 +1178,99 @@ def run_qvm_pipeline_v3(
     steps.append(step9)
 
     # -------------------------------------------------------------------------
+    # PASO 9.5: RISK MANAGEMENT (FASE 1)
+    # -------------------------------------------------------------------------
+    if config.enable_risk_management:
+        step9_5 = PipelineStep("PASO 9.5", "Risk Management (Stops, Targets, Position Sizing)")
+
+        if verbose:
+            print(f"\n💎 {step9_5.name}: {step9_5.description}")
+            print("   Calculando stop loss, take profit y position sizing...")
+
+        try:
+            step9_5.log_input(len(portfolio))
+
+            # Configurar RiskConfig desde QVMConfigV3
+            risk_config = RiskConfig(
+                use_volatility_stop=config.use_volatility_stop,
+                volatility_stop_confidence=config.volatility_stop_confidence,
+                use_trailing_stop=config.use_trailing_stop,
+                trailing_stop_method=config.trailing_stop_method,
+                trailing_atr_multiplier=config.trailing_atr_multiplier,
+                use_take_profit=config.use_take_profit,
+                risk_reward_ratio=config.risk_reward_ratio,
+                use_volatility_sizing=config.use_volatility_sizing,
+                target_volatility=config.target_volatility,
+                max_position_size=config.max_position_size,
+                use_kelly=config.use_kelly,
+            )
+
+            calculator = RiskCalculator(risk_config)
+
+            # Calcular risk parameters para cada stock
+            risk_results = []
+            for _, row in portfolio.iterrows():
+                symbol = row['symbol']
+
+                if symbol not in prices_dict:
+                    continue
+
+                try:
+                    prices = prices_dict[symbol]
+                    entry_price = prices['close'].iloc[-1]
+
+                    # Calcular parámetros de trade
+                    trade_params = calculator.calculate_trade_parameters(
+                        entry_price=entry_price,
+                        prices=prices,
+                        historical_returns=prices['close'].pct_change(),
+                        win_rate=None,  # No disponible aún
+                        avg_win=None,
+                        avg_loss=None
+                    )
+
+                    risk_results.append({
+                        'symbol': symbol,
+                        'entry_price': entry_price,
+                        'stop_loss': trade_params['final_stop_loss'],
+                        'take_profit': trade_params['final_take_profit'],
+                        'position_size_pct': trade_params['recommended_position_size'] * 100,
+                        'risk_pct': trade_params['risk_metrics']['risk_pct'],
+                        'reward_pct': trade_params['risk_metrics']['reward_pct'],
+                        'rr_ratio': trade_params['risk_metrics']['actual_rr_ratio'],
+                        'realized_vol': trade_params.get('realized_volatility', np.nan),
+                    })
+
+                except Exception as e:
+                    if verbose:
+                        print(f"   ⚠️  Error calculando risk para {symbol}: {str(e)}")
+                    continue
+
+            # Merge risk results con portfolio
+            if risk_results:
+                risk_df = pd.DataFrame(risk_results)
+                portfolio = portfolio.merge(risk_df, on='symbol', how='left')
+
+                step9_5.log_output(len(risk_df))
+                step9_5.add_metric("Avg Position Size", f"{risk_df['position_size_pct'].mean():.1f}%")
+                step9_5.add_metric("Avg R:R Ratio", f"{risk_df['rr_ratio'].mean():.2f}:1")
+                step9_5.add_metric("Avg Risk", f"{risk_df['risk_pct'].mean():.2f}%")
+                step9_5.mark_success()
+
+                if verbose:
+                    print(step9_5.summary())
+                    print(f"   📊 Position Size promedio: {risk_df['position_size_pct'].mean():.1f}%")
+                    print(f"   📊 R:R Ratio promedio: {risk_df['rr_ratio'].mean():.2f}:1")
+                    print(f"   📊 Risk promedio: {risk_df['risk_pct'].mean():.2f}%")
+            else:
+                step9_5.add_warning("No se pudieron calcular parámetros de risk")
+
+        except Exception as e:
+            step9_5.add_warning(f"Error: {str(e)}")
+
+        steps.append(step9_5)
+
+    # -------------------------------------------------------------------------
     # PASO 10: BACKTEST (OPCIONAL)
     # -------------------------------------------------------------------------
     backtest_results = None
@@ -1263,6 +1380,11 @@ def analyze_portfolio_v3(results: Dict, n_top: int = 20) -> pd.DataFrame:
 
     # Agregar columnas opcionales
     for col in ['ev_ebitda', 'pe', 'pb', 'ebit_ev', 'fcf_ev', 'roic_above_wacc', 'pct_from_52w_high']:
+        if col in portfolio.columns:
+            cols.append(col)
+
+    # Agregar columnas de risk management (FASE 1)
+    for col in ['entry_price', 'stop_loss', 'take_profit', 'position_size_pct', 'risk_pct', 'reward_pct', 'rr_ratio']:
         if col in portfolio.columns:
             cols.append(col)
 
